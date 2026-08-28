@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>NoName Agent Harness — 上下文是资产</title>
-<meta name="description" content="NoName Agent Harness：一个把上下文当作资产的 agent harness。四条原则，一份宣言。" />
+<meta name="description" content="NoName Agent Harness：一个把上下文当作资产的 agent harness。一份关于长期接续的宣言。" />
 <style>
 :root{
   --bg:#0b0d10;
@@ -108,14 +108,14 @@ footer .paths{margin-top:18px;font-family:var(--mono);font-size:12.5px;letter-sp
   <h1 class="brand">NoName<br><span class="dim">Agent Harness</span></h1>
   <p class="ledger"><span id="ledger-text"></span><span class="cursor"></span></p>
   <p class="oneline">「<span class="q">上下文是资产</span>，不是消耗品。」</p>
-  <p class="sub">agent 与你的关系不是一次次会议话，而是一本持续复利的账本。这里的每一个项目，都会让下一个项目的起点更高。</p>
+  <p class="sub">agent 与你的关系不是一次次会话，而是一本持续复利的账本。这里的每一个项目，都会让下一个项目的起点更高。</p>
 </header>
 
 <section data-reveal>
   <div class="sec-head"><span class="sec-num">序</span><h2 class="sec-title">问题的起点</h2></div>
   <div class="sec-body">
     <p>Transformer 的上下文窗口是有限的，但人的长期工作不是。今天的 agent 工具把每一次会话当作一次性消耗品：上下文被填满、被截断、被遗忘；你在不同工具、不同模型、不同插件之间迁移，但真正属于「你」的那部分——目标、判断、品味——每一次都要从头再来。</p>
-    <p>NoName 的答案不是「更长的上下文」，而是换一个问题：<strong>如果上下文不是消耗品，而是资产，会怎样？</strong> 资产可以被版本化、被组合、被移植、被复利。下面的四条原则，是同一个主张的四个推论。</p>
+    <p>NoName 的答案不是「更长的上下文」，而是换一个问题：<strong>如果上下文不是消耗品，而是资产，会怎样？</strong> 资产可以被版本化、被组合、被移植、被复利。下面的四条愿景原则，是同一个主张的四个推论；更细的工程契约见项目文档。</p>
   </div>
 </section>
 
@@ -155,7 +155,8 @@ footer .paths{margin-top:18px;font-family:var(--mono);font-size:12.5px;letter-sp
   <div class="sec-head"><span class="sec-num">核心</span><h2 class="sec-title">证据、记忆与上下文投影</h2></div>
   <div class="layers">
     <div class="layer"><span class="lname">法典 / Canon</span><p class="ldesc">项目目标、约束、非妥协项、决策与理由。变化慢，像宪法；模型提议，你批准。</p></div>
-    <div class="layer"><span class="lname">任务态 / Task</span><p class="ldesc">当前目标、开放问题、阻塞、下一步。变化快，每次压缩重写。</p></div>
+    <div class="layer"><span class="lname">任务态 / Task</span><p class="ldesc">当前目标、开放问题、阻塞、下一步。随工作推进更新，接续前可以复核。</p></div>
+    <div class="layer"><span class="lname">现场 / Evidence</span><p class="ldesc">最近的 diff、命令、测试、错误与尝试。高频更新，系统只增不改地记录。</p></div>
     <div class="layer"><span class="lname">指针 / Provenance</span><p class="ldesc">指向档案、文件与 git 版本，而不是复制内容。被压缩掉的细节，永远可回溯。</p></div>
     <div class="layer taste"><span class="lname">品味 / Taste</span><p class="ldesc">自述品味与采纳品味分开记录：态度、例子与判断可以影响排序和表达，但不改写事实，也不冒充生成质量。</p></div>
   </div>
@@ -193,8 +194,8 @@ footer .paths{margin-top:18px;font-family:var(--mono);font-size:12.5px;letter-sp
 </section>
 
 <footer data-reveal>
-  <p>当前状态：概念与设计阶段 · 未实现。<br>This is a manifesto, not a demo.</p>
-  <p class="paths">docs/vision.md · docs/architecture.md · site/index.html</p>
+  <p>当前状态：概念设计与本地最小原型阶段 · 完整 runtime 尚未实现。<br>This is a manifesto and a careful first prototype.</p>
+  <p class="paths">docs/vision.md · docs/architecture.md · docs/prototype.md · site/index.html</p>
 </footer>
 
 </div>

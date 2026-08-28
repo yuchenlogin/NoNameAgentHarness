@@ -42,7 +42,9 @@ Capability Layer
 - `model.requested / model.chunk / model.completed / model.failed`
 - `tool.requested / tool.approved / tool.completed / tool.failed`
 - `artifact.changed`
+- `workspace.snapshot`
 - `memory.proposed / memory.reviewed / memory.superseded`
+- `attention.requested / handoff.next_step_suggested`
 - `taste.card.generated / taste.reviewed`
 - `session.compacted / session.forked / session.completed`
 
@@ -133,6 +135,18 @@ IDLE
 Router 决定：继续当前上下文、fork、压缩后重生、切换 recipe、派生子 agent。它输出带理由的决定，不直接修改长期记忆。
 
 Context Assembler 输入：任务、模型 capability、token 预算、法典投影、任务态、证据引用、品味投影、工具 schema、注入。输出必须被完整记录，以满足可回放。
+
+### 7.1 State Curator：状态整理器
+
+状态整理器是一个独立的角色，不等同于执行任务的 worker。它消费 session event 和 artifact 指针，负责：
+
+1. 按时间尺度和作用域整理高层、中层候选；
+2. 记录来源、置信度、冲突和“为什么值得升级”；
+3. 在发现旧状态与新证据不一致时提出冲突，而不是静默覆盖；
+4. 只在需要用户判断时发出轻量注意力请求；
+5. 生成版本 diff，等待用户或独立审核者批准。
+
+整理器可以由模型实现，但“提案”和“批准”必须是两个可审计的动作。当前本地原型用结构化事件提示替代模型整理，先验证这条契约。
 
 ## 8. Plugin Runtime
 
