@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
 from .handoff import infer_next_steps
-from .models import EvidenceInput, Event
+from .models import EvidenceInput, Event, ModelProfile
 from .workspace import git_snapshot
 
 
@@ -1249,6 +1249,23 @@ class HarnessStore:
             )
         return self.get_proposal(proposal_id)
 
+    @staticmethod
+    def _low_limit_for_model(model: "ModelProfile", default: int) -> int:
+        """Tighten the low evidence window for a constrained target model.
+
+        Budget posture is the primary dial.  A very small declared context
+        window tightens further, but the window never drops below a floor that
+        keeps a handoff meaningful (a few recent events plus the snapshot).
+        """
+
+        floor = 3
+        by_budget = {"low": max(floor, default // 4), "medium": default, "high": default * 2}
+        limit = by_budget[model.budget]
+        window = model.capability.context_window
+        if window is not None and window < 16_000:
+            limit = max(floor, min(limit, limit // 2))
+        return limit
+
     def active_state(
         self, layer: str | None = None, as_of: str | None = None
     ) -> list[dict[str, Any]]:
@@ -1263,11 +1280,28 @@ class HarnessStore:
         *,
         session_id: str | None = None,
         low_limit: int = 20,
+        model: "ModelProfile | None" = None,
+        task_type: str | None = None,
     ) -> dict[str, Any]:
         if not task.strip():
             raise ValueError("task cannot be empty")
         if low_limit < 1:
             raise ValueError("low_limit must be positive")
+        # Projecting for a specific model never changes the facts -- reviewed
+        # canon, task state, taste and provenance are identical for every
+        # target.  The model's capability only biases the *low evidence
+        # window*: a smaller budget or context window tightens how much recent
+        # work evidence is carried, nothing else.
+        if model is not None:
+            low_limit = self._low_limit_for_model(model, low_limit)
+        # Resolve the role chain for this task type.  It is advisory in the
+        # prototype -- recorded for audit, surfaced in assembly metadata -- but
+        # resolving it here keeps routing explainable from the start.
+        recipe_description = None
+        if task_type is not None:
+            from .recipes import resolve_recipe
+
+            recipe_description = resolve_recipe(task_type).describe()
         project = self.project()
         snapshot_event: Event | None = None
         if session_id is not None:
@@ -1359,6 +1393,19 @@ class HarnessStore:
                 "model_independent": True,
                 "low_event_limit": low_limit,
                 "workspace_snapshot_included": snapshot_event is not None,
+                # The package is always model-independent in its facts; this
+                # only records which target's budget shaped the evidence window,
+                # so a handoff remains auditable.
+                "projected_for_model": (
+                    {
+                        "id": model.id,
+                        "budget": model.budget,
+                        "context_window": model.capability.context_window,
+                    }
+                    if model is not None
+                    else None
+                ),
+                "recipe": recipe_description,
             },
             "layers": {
                 "high": active_high,
@@ -1415,6 +1462,10 @@ class HarnessStore:
                 {
                     "package_id": package_id,
                     "task": task,
+                    "task_type": task_type,
+                    "recipe_id": recipe_description["id"] if recipe_description else None,
+                    "model_id": model.id if model is not None else None,
+                    "low_event_limit": low_limit,
                     "source_event_ids": source_event_ids,
                 },
                 occurred_at=created_at,

@@ -10,7 +10,8 @@ from typing import Any, Sequence
 
 from .context import render_markdown
 from .curator import CuratorService
-from .models import EvidenceInput
+from .models import EvidenceInput, ModelCapability, ModelProfile
+from .recipes import DEFAULT_RECIPES, resolve_recipe
 from .taste import TasteService
 from .store import HarnessStore, WorkspaceBoundaryError
 
@@ -106,6 +107,13 @@ def build_parser() -> argparse.ArgumentParser:
     package.add_argument("--out")
     package.add_argument("--format", choices=["json", "markdown"], default="markdown")
     package.add_argument("--overwrite", action="store_true")
+    package.add_argument("--task-type", choices=sorted(DEFAULT_RECIPES.keys()), dest="task_type",
+                         help="task type used to resolve an advisory model recipe")
+    package.add_argument("--model-id", dest="model_id", help="target model id to project the package for")
+    package.add_argument("--budget", choices=["low", "medium", "high"], default="medium",
+                         help="budget posture of the target model")
+    package.add_argument("--context-window", type=int, dest="context_window",
+                         help="usable context window (tokens) of the target model")
 
     taste_add = sub.add_parser("taste-add", parents=[_db_parent()], help="record an authored taste (active immediately)")
     taste_add.add_argument("--content", required=True, help="JSON taste content (examples and judgements, not adjectives)")
@@ -127,6 +135,9 @@ def build_parser() -> argparse.ArgumentParser:
     taste_review.add_argument("--reviewer", required=True, dest="reviewer_id")
     taste_review.add_argument("--content", dest="edited_content")
     taste_review.add_argument("--reason")
+
+    recipes = sub.add_parser("recipes", parents=[_db_parent()], help="show default model recipes by task type")
+    recipes.add_argument("--task-type", choices=sorted(DEFAULT_RECIPES.keys()), dest="task_type")
 
     inbox = sub.add_parser("inbox", parents=[_db_parent()], help="show the review inbox (pending canon, task and taste)")
 
@@ -238,10 +249,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                     destination = store.validate_output_path(Path(args.out))
                     if destination.exists() and not args.overwrite:
                         raise FileExistsError(f"refusing to overwrite existing file: {destination}")
+                model_profile = None
+                if args.model_id:
+                    model_profile = ModelProfile(
+                        id=args.model_id,
+                        capability=ModelCapability(context_window=args.context_window),
+                        budget=args.budget,
+                    )
                 package_value = store.assemble_context_package(
                     args.task,
                     session_id=args.session,
                     low_limit=args.low_limit,
+                    model=model_profile,
+                    task_type=args.task_type,
                 )
                 if args.format == "json":
                     rendered = json.dumps(package_value, ensure_ascii=False, indent=2) + "\n"
@@ -287,6 +307,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         reason=args.reason,
                     )
                 )
+            elif args.command == "recipes":
+                if args.task_type:
+                    _print(resolve_recipe(args.task_type).describe())
+                else:
+                    _print({key: recipe.describe() for key, recipe in DEFAULT_RECIPES.items()})
             elif args.command == "inbox":
                 _print(store.review_inbox())
             elif args.command == "taste":
