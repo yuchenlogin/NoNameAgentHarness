@@ -2,6 +2,29 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.10.0] - 2026-09-29
+
+### Features
+
+- 插件运行时保守契约落地（架构 §9，schema 不变，仍为 v6）：新增 `noname_harness/plugins.py`——`PluginManifest`（id / version / capabilities / max_permission / 接口兼容范围 / 迁移 / 是否请求全局作用域）、`Plugin`（manifest + build 工厂）、`PluginRuntime`（load / unload / loaded_plugins）。
+- 内核不可谈判：插件贡献的工具必须走 ToolRegistry 审批门，无侧通道；manifest 先验证再加载；插件工具不得超过 manifest 声明的 `max_permission`；默认非全局作用域，未显式请求不得使用 global，不偷偷注册进程级全局状态。
+- 可逆生命周期与原子性：卸载回收插件全部贡献；加载（注册 + `plugin.loaded` 账本记录）整体原子，失败回滚全部贡献并恢复被遮蔽的原工具（`register` 返回被取代工具对象，rollback 重新注册而非仅 unregister），记 `plugin.load_failed`；`build()` 记 `plugin.build_started` / `plugin.build_failed`，异常归一化为 `PluginError`。
+- 工具实例代（generation）：每次注册换代，审批令牌绑定签发时的代；重注册 / 遮蔽 / unload 后旧令牌自动失效——令牌不比它授权的确切工具活得更久。
+- 只做能力结晶的加载 / 校验 / 生命周期 / 审计接缝，不做插件市场。
+- 修复品味卡片复核队列在秒级时间戳下的非确定排序：改用 rowid 决胜。
+
+### Design Rationale
+
+- **为什么令牌必须绑定工具实例代**：令牌若只绑定名字，unload 之后同名新实例就能用旧令牌执行——授权就比它授权的确切工具活得久。把令牌绑定到签发时的代，让授权严格等于「这一次、这个工具、这组参数」；工具实例一换，旧授权自然作废，无需额外的吊销逻辑，事件流里每一次批准都指向唯一确定的对象。
+- **为什么失败回滚必须恢复原工具而非仅 unregister**：插件可以合法遮蔽宿主工具。若遮蔽完成后另一部分加载失败，仅 unregister 会把宿主原工具永久删除，并把 tombstone 顶到更高水位——宿主状态被一场失败的加载永久改写。原子加载 + 回滚时恢复原工具，让失败从不留下僵尸，也从不破坏宿主既有状态：加载要么整体成立，要么像没发生过。
+
+### Notes & Caveats
+
+- 不做插件市场，不做动态工作流合成；插件只是被验证过的能力结晶的加载接缝。
+- `build()` 是任意代码：宿主不得向插件传递 registry / store 句柄，插件的一切贡献必须经 manifest 声明与 ToolRegistry 审批门。
+- 新增 13 个插件测试，总数到 153。
+
+
 ## [0.9.0] - 2026-09-29
 
 ### Features

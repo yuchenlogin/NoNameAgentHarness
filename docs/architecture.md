@@ -195,6 +195,8 @@ NoName 借鉴 DeepSeek Harness 的「一切能力都可替换」和事件溯源�
 
 参考：[DeepSeek Harness architecture](https://github.com/deepseek-ai/DeepSeek-Harness/blob/HEAD/docs/architecture.md)。
 
+**原型落地状态**：插件运行时契约已落地（`PluginManifest` / `Plugin` / `PluginRuntime`，见 `noname_harness/plugins.py`）。插件贡献的工具强制走 ToolRegistry 审批门，不得超过 manifest 声明的 `max_permission`，默认非全局作用域；加载整体原子，失败回滚全部贡献并恢复被遮蔽的原工具；工具实例代（generation）让审批令牌不超出它授权的确切工具寿命。本层只做能力结晶的加载、校验、生命周期与审计接缝，不做插件市场。
+
 ## 10. 用户审核是产品体验的一部分
 
 记忆污染不是弹窗可以解决的技术问题，而是用户是否理解「批准意味着什么」的问题。界面必须明确说明：
