@@ -189,6 +189,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _print(proposal)
             elif args.command == "review":
                 edited = _json_value(args.edited_content) if args.edited_content else None
+                # valid bounds only make sense when a revision is written;
+                # silently dropping them on reject/defer would mislead the user.
+                if args.action in {"reject", "defer"} and (
+                    args.valid_from is not None or args.valid_to is not None
+                ):
+                    raise ValueError(
+                        f"--valid-from/--valid-to do not apply to action '{args.action}'"
+                    )
                 _print(
                     store.review_proposal(
                         args.proposal_id,

@@ -165,6 +165,6 @@ def test_schema_v3_to_v4_adds_bitemporal_columns(tmp_path):
         version = store._connection.execute(
             "SELECT value FROM harness_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
-        assert version == "4"
+        assert version == "5"
     finally:
         store.close()

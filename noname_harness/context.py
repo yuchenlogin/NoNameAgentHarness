@@ -119,11 +119,21 @@ def render_markdown(package: dict[str, Any]) -> str:
             label = "Authored · your own words" if track == "authored" else "Adopted · chosen from model moments"
             lines.extend([f"### {label}", ""])
             for item in items:
-                lines.append(f"- {_inline(item['content'])}")
+                # Taste content is rendered inside a fenced block, never as
+                # inline markdown.  Even though JSON encoding already flattens
+                # newlines, a fence makes it impossible for taste text to ever
+                # be reinterpreted as document structure (headings, lists,
+                # code-fence boundaries) -- the fact/attitude boundary holds in
+                # the rendered layer too, not only in the data model.
+                content_text = _inline(item["content"])
+                fence = _fence_for(content_text)
                 lines.append(
-                    f"  (scope `{item['scope']}`, status `{item['status']}`, "
-                    f"taste `{item['id']}`)"
+                    f"- scope `{item['scope']}`, status `{item['status']}`, "
+                    f"taste `{item['id']}`:"
                 )
+                lines.append(f"  {fence}json")
+                lines.append(f"  {content_text}")
+                lines.append(f"  {fence}")
             lines.append("")
     else:
         lines.append("_No active taste yet._")

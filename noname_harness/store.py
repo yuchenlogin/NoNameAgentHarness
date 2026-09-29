@@ -23,13 +23,35 @@ from .models import EvidenceInput, Event
 from .workspace import git_snapshot
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 VALID_LAYERS = {"high", "mid"}
 VALID_REVIEW_ACTIONS = {"accept", "reject", "edit", "defer", "retire"}
 VALID_TASTE_TRACKS = {"authored", "adopted"}
 VALID_TASTE_SCOPES = {"user", "project"}
 VALID_TASTE_STATUSES = {"candidate", "active", "paused", "retired"}
 VALID_TASTE_ACTIONS = {"adopt", "edit", "pause", "resume", "retire"}
+
+# INSERT-boundary guards for supersede chains, shared by the initial schema and
+# the v4 -> v5 migration so both paths stay byte-for-byte identical.
+_SUPERSEDE_GUARD_SQL = """
+CREATE TRIGGER IF NOT EXISTS taste_records_supersede_guard
+BEFORE INSERT ON taste_records
+WHEN NEW.supersedes_id IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'supersede target must be an existing, different taste record')
+    WHERE NEW.supersedes_id = NEW.id
+       OR NOT EXISTS (SELECT 1 FROM taste_records WHERE id = NEW.supersedes_id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS state_revisions_supersede_guard
+BEFORE INSERT ON state_revisions
+WHEN NEW.supersedes_id IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'supersede target must be an existing, different state revision')
+    WHERE NEW.supersedes_id = NEW.id
+       OR NOT EXISTS (SELECT 1 FROM state_revisions WHERE id = NEW.supersedes_id);
+END;
+"""
 
 
 class WorkspaceBoundaryError(ValueError):
@@ -338,6 +360,7 @@ class HarnessStore:
         """
         with self._connection:
             self._connection.executescript(schema)
+            self._connection.executescript(_SUPERSEDE_GUARD_SQL)
             try:
                 self._connection.execute(
                     "CREATE VIRTUAL TABLE IF NOT EXISTS event_search USING fts5("
@@ -398,6 +421,13 @@ class HarnessStore:
                             "ALTER TABLE state_revisions ADD COLUMN valid_to TEXT"
                         )
                     current_version = 4
+                if current_version == 4:
+                    # v5 hardens the supersede INSERT boundary for existing
+                    # databases.  Fresh databases get the same triggers from the
+                    # shared schema via CREATE TRIGGER IF NOT EXISTS, so this
+                    # step only needs to run them idempotently.
+                    self._connection.executescript(_SUPERSEDE_GUARD_SQL)
+                    current_version = 5
                 if current_version != SCHEMA_VERSION:  # pragma: no cover - defensive
                     raise RuntimeError(
                         f"Unsupported schema version {current_version}; expected {SCHEMA_VERSION}"
@@ -1280,6 +1310,10 @@ class HarnessStore:
             [item["event_id"] for item in low]
             + [event_id for item in active_high + mid_state for event_id in item["source_event_ids"]]
             + [event_id for item in pending for event_id in item["source_event_ids"]]
+            # An adopted taste cites the "model moment" that justified it; those
+            # source events must be part of the package provenance too, or a
+            # taste could point at evidence the package cannot account for.
+            + [event_id for item in taste_projection for event_id in item["source_event_ids"]]
         ))
         evidence_ids = list(dict.fromkeys(
             evidence["id"]

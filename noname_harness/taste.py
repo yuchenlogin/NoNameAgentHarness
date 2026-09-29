@@ -64,6 +64,8 @@ class TasteService:
         """
 
         self._validate(scope=scope, track="authored")
+        if content is None or (isinstance(content, (str, dict, list)) and not content):
+            raise ValueError("authored taste content cannot be empty")
         if source_event_ids:
             self.store.check_event_ids(source_event_ids)
         return self._insert_taste(
@@ -167,6 +169,27 @@ class TasteService:
         review_id = _id("trv")
         reviewed_at = _now()
         with self.store.transaction() as connection:
+            # Re-check under the write lock.  The pre-transaction validation is
+            # a fast path for clear errors, but two concurrent reviewers could
+            # both pass it; BEGIN IMMEDIATE serialises them here, and the loser
+            # must see that the head moved (a child now exists) and abort
+            # rather than fork the lineage.
+            still_head = connection.execute(
+                "SELECT 1 FROM taste_records WHERE supersedes_id = ? LIMIT 1",
+                (taste_id,),
+            ).fetchone()
+            if still_head is not None:
+                raise ValueError(
+                    f"taste record {taste_id} was superseded concurrently; "
+                    "review the current head"
+                )
+            current = connection.execute(
+                "SELECT status FROM taste_records WHERE id = ?", (taste_id,)
+            ).fetchone()
+            if current is None or current["status"] != row["status"]:
+                raise ValueError(
+                    f"taste record {taste_id} changed status concurrently; re-read and retry"
+                )
             connection.execute(
                 "INSERT INTO taste_reviews "
                 "(id, taste_id, action, reviewer_id, edited_content_json, reason, reviewed_at) "
@@ -227,9 +250,16 @@ class TasteService:
     # ------------------------------------------------------------------
     def get(self, taste_id: str) -> dict[str, Any]:
         row = self._get_row(taste_id)
+        # Reviews are written against the version they acted on, so the full
+        # decision history of a taste lives across its supersedes chain.  Walk
+        # it so a reviewer sees the lineage's whole audit trail, not just the
+        # latest version's single review.
+        lineage_ids = self._lineage_ids(row)
+        placeholders = ",".join("?" for _ in lineage_ids)
         reviews = self.store.query(
-            "SELECT * FROM taste_reviews WHERE taste_id = ? ORDER BY reviewed_at, rowid",
-            (taste_id,),
+            f"SELECT * FROM taste_reviews WHERE taste_id IN ({placeholders}) "
+            "ORDER BY reviewed_at, rowid",
+            tuple(lineage_ids),
         )
         return {
             "id": row["id"],
@@ -359,6 +389,25 @@ class TasteService:
         if row is None:
             raise KeyError(f"unknown taste record: {taste_id}")
         return row
+
+    def _lineage_ids(self, row: Any) -> list[str]:
+        """Return this record's id plus all its ancestors', oldest first."""
+
+        ids = [row["id"]]
+        current = row
+        seen = {row["id"]}
+        while current["supersedes_id"] is not None:
+            parent = self.store.query_one(
+                "SELECT * FROM taste_records WHERE id = ?",
+                (current["supersedes_id"],),
+            )
+            if parent is None or parent["id"] in seen:  # pragma: no cover - guarded by trigger
+                break
+            seen.add(parent["id"])
+            ids.append(parent["id"])
+            current = parent
+        ids.reverse()
+        return ids
 
     def _has_child(self, taste_id: str) -> bool:
         """Return whether any record supersedes ``taste_id`` (i.e. it is not a head)."""
