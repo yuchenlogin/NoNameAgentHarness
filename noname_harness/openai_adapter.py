@@ -44,17 +44,46 @@ _ENV_KEY = "OPENAI_API_KEY"
 _ENV_BASE_URL = "OPENAI_BASE_URL"
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects: following one would forward the Authorization bearer
+    token to whatever host the redirect points at -- a silent credential
+    exfiltration primitive.  A redirect is surfaced as an error instead."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
+
+
 def _http_transport(url: str, headers: dict[str, str], body: bytes, timeout: float) -> tuple[int, bytes]:
-    """The default real transport: a single POST via urllib (stdlib only)."""
+    """The default real transport: a single POST via urllib (stdlib only).
+
+    Redirects are refused (never followed) so the API key can only ever go to
+    the configured endpoint.  Timeouts and connection failures are classified
+    distinctly: a true timeout is retryable; a connection/DNS/TLS failure is
+    not.
+    """
+
+    import socket
 
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    opener = urllib.request.build_opener(_NoRedirectHandler())
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with opener.open(request, timeout=timeout) as response:
             return response.status, response.read()
     except urllib.error.HTTPError as exc:
+        # A redirect with no handler surfaces as an HTTPError 3xx here.
+        if 300 <= exc.code < 400:
+            raise ModelAdapterError(
+                "invalid_request",
+                f"endpoint redirected ({exc.code}); redirects are refused to protect the API key",
+            ) from exc
         return exc.code, exc.read()
+    except (socket.timeout, TimeoutError) as exc:
+        raise ModelAdapterError("timeout", f"request timed out after {timeout}s") from exc
     except urllib.error.URLError as exc:
-        raise ModelAdapterError("timeout", f"network error: {exc.reason}") from exc
+        # DNS / connection-refused / TLS failures are not retryable timeouts.
+        raise ModelAdapterError(
+            "overloaded", f"cannot reach the endpoint: {type(exc.reason).__name__}"
+        ) from exc
 
 
 @dataclass
@@ -72,6 +101,8 @@ class OpenAIAdapter:
     transport: Transport = _http_transport
     base_url: str | None = None
     api_key: str | None = None
+    # Opt-in escape hatch for plaintext HTTP (e.g. a local model server).
+    allow_insecure: bool = False
 
     def id(self) -> str:
         return self.model_id
@@ -89,6 +120,16 @@ class OpenAIAdapter:
 
     def _endpoint(self) -> str:
         base = (self.base_url or os.environ.get(_ENV_BASE_URL) or _DEFAULT_BASE_URL).rstrip("/")
+        # The base URL is a trust boundary: the bearer key is sent to whatever
+        # host it names, so plaintext HTTP is refused unless explicitly opted
+        # in (e.g. a local model server).  This blocks credential exfiltration
+        # via a poisoned OPENAI_BASE_URL pointing at an attacker endpoint.
+        if base.startswith("http://") and not self.allow_insecure:
+            raise ModelAdapterError(
+                "auth",
+                "refusing plaintext HTTP base URL (would send the API key "
+                "unencrypted); pass allow_insecure=True for a local endpoint",
+            )
         return f"{base}/chat/completions"
 
     def _headers(self) -> dict[str, str]:
@@ -161,12 +202,7 @@ class OpenAIAdapter:
         message = choices[0].get("message", {})
         usage = data.get("usage", {})
         tool_calls = tuple(
-            {
-                "name": call.get("function", {}).get("name"),
-                "arguments": json.loads(call.get("function", {}).get("arguments", "{}") or "{}"),
-                "id": call.get("id"),
-            }
-            for call in message.get("tool_calls", []) or []
+            self._map_tool_call(call, data) for call in message.get("tool_calls", []) or []
         )
         return ModelResponse(
             text=message.get("content") or "",
@@ -179,12 +215,48 @@ class OpenAIAdapter:
             vendor_ref={"status": 200, "id": data.get("id"), "usage": usage},
         )
 
+    def _map_tool_call(self, call: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+        """Map one vendor tool call, normalising malformed arguments.
+
+        A vendor (or OpenAI-compatible server) may return ``arguments`` as a
+        dict instead of a string, or as truncated/invalid JSON mid-generation.
+        Neither may escape as a raw TypeError/JSONDecodeError outside the
+        ModelAdapterError contract.
+        """
+
+        function = call.get("function", {})
+        arguments = function.get("arguments", "{}")
+        if isinstance(arguments, dict):
+            parsed = arguments
+        else:
+            try:
+                parsed = json.loads(arguments or "{}")
+            except (ValueError, TypeError) as exc:
+                raise ModelAdapterError(
+                    "unknown",
+                    "vendor returned malformed tool-call arguments",
+                    vendor_ref={"id": data.get("id")},
+                ) from exc
+        return {
+            "name": function.get("name"),
+            "arguments": parsed,
+            "id": call.get("id"),
+        }
+
     def _classify_http_error(self, status: int, raw: bytes) -> ModelAdapterError:
+        # vendor_ref is a *reference*, never the body: an error body can contain
+        # anything (including, for a 401, the bearer key itself, or attacker
+        # content from a hostile endpoint), and it would be persisted verbatim
+        # into the append-only ledger.  Only status and a vendor error id are
+        # kept -- enough to audit, nothing that can leak.
         ref: dict[str, Any] = {"status": status}
         try:
-            ref["body"] = json.loads(raw.decode("utf-8"))
+            body = json.loads(raw.decode("utf-8"))
+            error = body.get("error") if isinstance(body, dict) else None
+            if isinstance(error, dict) and error.get("code"):
+                ref["error_code"] = str(error["code"])[:100]
         except (ValueError, UnicodeDecodeError):
-            ref["body"] = raw[:200].decode("utf-8", errors="replace")
+            pass
         if status in {401, 403}:
             return ModelAdapterError("auth", f"vendor auth failed ({status})", vendor_ref=ref)
         if status == 429:
@@ -232,43 +304,16 @@ def _json_schema_type(type_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def openai_adapter_plugin(**adapter_kwargs: Any) -> Any:
-    """Build a Plugin that contributes an OpenAI-compatible adapter.
-
-    The plugin contributes no tools; it provides a *model capability*.  Its
-    manifest declares the capability, and its build() returns the adapter
-    wrapped so the PluginRuntime can load and audit it.  (Model adapters plug
-    in as plugins; the kernel's ToolRegistry is for tools, not models, so the
-    contribution is the adapter object itself, returned via build() for the
-    caller to use after load().)
-    """
-
-    from .plugins import Plugin, PluginManifest
-
-    adapter = OpenAIAdapter(**adapter_kwargs)
-
-    def build() -> list:
-        # The plugin contributes no ToolRegistry tools; the loaded plugin's
-        # adapter is obtained via the returned build product (see load_adapter).
-        return []
-
-    return Plugin(
-        manifest=PluginManifest(
-            id=f"model-openai-{adapter.model_id}",
-            version="1.0.0",
-            capabilities=(f"model:{adapter.model_id}", "model-adapter"),
-            max_permission="read",
-        ),
-        build=build,
-    )
-
-
 def load_openai_adapter(runtime: Any, **adapter_kwargs: Any) -> OpenAIAdapter:
-    """Load the OpenAI adapter plugin through a PluginRuntime and return the adapter.
+    """Load the OpenAI adapter through a PluginRuntime and return it.
 
-    This keeps the kernel's rule -- a vendor capability crystallises into a
-    plugin that is validated and audited on load -- while returning the adapter
-    for the caller to drive an AgentLoop.
+    A vendor capability crystallises into a plugin: the manifest is validated
+    and the load audited (``plugin.loaded``) before the adapter is handed back.
+    The manifest honestly declares the plugin's real side effects --
+    ``network-egress`` (outbound HTTPS) and ``billing`` (metered) -- because
+    ``max_permission`` covers only contributed tools, and this plugin
+    contributes none.  ``build()`` returns the adapter itself so the caller can
+    drive an AgentLoop with it.
     """
 
     adapter = OpenAIAdapter(**adapter_kwargs)
@@ -281,6 +326,7 @@ def load_openai_adapter(runtime: Any, **adapter_kwargs: Any) -> OpenAIAdapter:
             version="1.0.0",
             capabilities=(f"model:{adapter.model_id}", "model-adapter"),
             max_permission="read",
+            side_effects=("network-egress", "billing"),
         ),
         build=lambda: [],
     )

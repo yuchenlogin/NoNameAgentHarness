@@ -55,6 +55,12 @@ class PluginManifest:
     migrations: tuple[int, ...] = ()
     # Whether the plugin requests global visibility for its tools.
     requests_global_scope: bool = False
+    # Side effects the plugin may have beyond ToolRegistry tools -- e.g.
+    # "network-egress", "billing".  A model-adapter plugin contributes no tools
+    # but performs network egress and metered billing; it MUST declare that
+    # here so the manifest is honest and the plugin.loaded ledger event records
+    # the true posture (max_permission covers only contributed tools).
+    side_effects: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.id.strip():
@@ -148,6 +154,7 @@ class PluginRuntime:
                     "capabilities": list(manifest.capabilities),
                     "tools": registered,
                     "max_permission": manifest.max_permission,
+                    "side_effects": list(manifest.side_effects),
                 },
             )
         except Exception:

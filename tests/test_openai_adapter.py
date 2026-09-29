@@ -161,3 +161,75 @@ def test_loads_as_a_plugin(tmp_path, monkeypatch):
         )
     finally:
         store.close()
+
+
+# --- 对抗性审查（REJECT）发现的回归 ---
+
+def test_error_vendor_ref_never_contains_body_or_key(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-SECRET-abc")
+    def transport(url, headers, body, timeout):
+        return 401, json.dumps({"error": {"message": "invalid key: Bearer sk-SECRET-abc", "code": "bad_key"}}).encode()
+    adapter = OpenAIAdapter(transport=transport)
+    with pytest.raises(ModelAdapterError) as exc_info:
+        adapter.complete(_req())
+    # vendor_ref carries only status + error code, never the body or the key.
+    assert "sk-SECRET" not in str(exc_info.value.vendor_ref)
+    assert "body" not in exc_info.value.vendor_ref
+    assert exc_info.value.vendor_ref["status"] == 401
+
+
+def test_plaintext_http_base_url_refused_by_default(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    adapter = OpenAIAdapter(base_url="http://attacker.example/v1", transport=replay_transport())
+    with pytest.raises(ModelAdapterError) as exc_info:
+        adapter.complete(_req())
+    assert exc_info.value.error_class == "auth"
+    assert "plaintext HTTP" in str(exc_info.value)
+
+
+def test_allow_insecure_opt_in_permits_local_http(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    adapter = OpenAIAdapter(
+        base_url="http://localhost:11434/v1",
+        allow_insecure=True,
+        transport=replay_transport(payload=ok_payload(text="local")),
+    )
+    assert adapter.complete(_req()).text == "local"
+
+
+def test_dict_arguments_passed_through(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    tool_calls = [{"id": "c", "type": "function", "function": {"name": "t", "arguments": {"q": "x"}}}]
+    adapter = OpenAIAdapter(transport=replay_transport(payload=ok_payload(text="", tool_calls=tool_calls)))
+    assert adapter.complete(_req()).tool_calls[0]["arguments"] == {"q": "x"}
+
+
+def test_invalid_json_arguments_normalized(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    tool_calls = [{"id": "c", "type": "function", "function": {"name": "t", "arguments": "{invalid json"}}]
+    adapter = OpenAIAdapter(transport=replay_transport(payload=ok_payload(text="", tool_calls=tool_calls)))
+    with pytest.raises(ModelAdapterError) as exc_info:
+        adapter.complete(_req())
+    assert "malformed tool-call arguments" in str(exc_info.value)
+
+
+def test_plugin_manifest_declares_side_effects(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    root = tmp_path / "project"
+    root.mkdir()
+    store = HarnessStore(root / ".noname" / "harness.db")
+    store.initialize_project(root, "p")
+    try:
+        runtime = PluginRuntime(store, ToolRegistry(store))
+        load_openai_adapter(runtime, model_id="gpt-4o")
+        event = next(e for e in store.list_events("system", limit=50) if e.event_type == "plugin.loaded")
+        assert set(event.payload["side_effects"]) == {"network-egress", "billing"}
+    finally:
+        store.close()
+
+
+def test_default_transport_refuses_redirect(monkeypatch):
+    # The default _http_transport must not follow redirects (key forwarding).
+    from noname_harness.openai_adapter import _NoRedirectHandler
+    handler = _NoRedirectHandler()
+    assert handler.redirect_request(None, None, None, None, None, None) is None
