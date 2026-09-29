@@ -5,6 +5,7 @@ from .curator import CuratorService
 from .taste import TasteService
 from .taste_cards import TasteCardService
 from .plugins import Plugin, PluginContribution, PluginError, PluginManifest, PluginRuntime
+from .sandbox import Sandbox, SandboxError
 from .recipes import Recipe, RoleSpec, resolve_recipe
 from .agent_loop import AgentLoop, AgentLoopError, LoopResult, SessionDriver
 from .tools import (
@@ -33,6 +34,8 @@ __all__ = [
     "PluginManifest",
     "PluginRuntime",
     "PluginError",
+    "Sandbox",
+    "SandboxError",
     "ModelCapability",
     "ModelProfile",
     "Recipe",
