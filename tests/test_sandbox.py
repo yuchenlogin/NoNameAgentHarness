@@ -114,7 +114,9 @@ def test_non_allowlisted_command_is_refused_before_running(tmp_path):
 def test_command_timeout_is_enforced(tmp_path):
     store, _ = make_store(tmp_path)
     try:
-        sandbox = Sandbox(store, command_timeout=1)
+        # Interpreters are opt-in (they weaken the boundary to approval-only);
+        # a deployment that enables them still gets real timeout enforcement.
+        sandbox = Sandbox(store, allowed_commands=("python3",), command_timeout=1)
         started = time.monotonic()
         with pytest.raises(SandboxError):
             sandbox.run_command(
@@ -132,11 +134,10 @@ def test_command_timeout_is_enforced(tmp_path):
 def test_command_failure_is_captured_not_raised(tmp_path):
     store, _ = make_store(tmp_path)
     try:
+        # git is allow-listed by default; a failing git command returns non-zero.
         sandbox = Sandbox(store)
-        result = sandbox.run_command(
-            ["python3", "-c", "import sys; sys.exit(3)"], session_id="s"
-        )
-        assert result["returncode"] == 3
+        result = sandbox.run_command(["git", "status", "--porcelain=v"], session_id="s")
+        assert result["returncode"] != 0
     finally:
         store.close()
 
@@ -192,5 +193,123 @@ def test_sandbox_tools_confined_even_through_registry(tmp_path):
                 "sandbox.write_file", {"path": "../evil.txt", "content": "x"},
                 session_id="s", approval_token=token,
             )
+    finally:
+        store.close()
+
+
+# --- 对抗性审查发现的回归 ---
+
+def test_interpreters_not_in_default_allowlist(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        sandbox = Sandbox(store)
+        # An interpreter in the default allow-list would be arbitrary code
+        # execution with the harness's full privileges -- it must be opt-in.
+        for interpreter in ("python3", "python", "pytest", "sh", "bash", "node"):
+            with pytest.raises(SandboxError):
+                sandbox.run_command([interpreter, "-c", "x"], session_id="s")
+    finally:
+        store.close()
+
+
+def test_command_with_path_separator_is_refused(tmp_path):
+    store, root = make_store(tmp_path)
+    try:
+        sandbox = Sandbox(store)
+        # A workspace-local fake 'git' must not run under the trusted name.
+        fake = root / "git"
+        fake.write_text("#!/bin/sh\necho PWNED\n")
+        fake.chmod(0o755)
+        for cmd in ("./git", "/usr/bin/git", "sub/dir/git"):
+            with pytest.raises(SandboxError):
+                sandbox.run_command([cmd, "status"], session_id="s")
+    finally:
+        store.close()
+
+
+def test_write_refuses_symlinked_final_component(tmp_path):
+    store, root = make_store(tmp_path)
+    try:
+        # A static symlink to an outside file is already refused at validation
+        # (resolve escapes the workspace).  O_NOFOLLOW is the second barrier for
+        # the TOCTOU window where the swap happens *after* validation.
+        sandbox = Sandbox(store)
+        outside = tmp_path / "outside.txt"
+        outside.write_text("original")
+        link = root / "link.txt"
+        link.symlink_to(outside)
+        with pytest.raises((WorkspaceBoundaryError, SandboxError)):
+            sandbox.write_file("link.txt", "PWNED", session_id="s")
+        assert outside.read_text() == "original"
+
+        # Directly exercise the O_NOFOLLOW write: a symlink pointing *inside*
+        # the workspace (passes validation) is still refused at open time.
+        target_inside = root / "real.txt"
+        target_inside.write_text("real")
+        inside_link = root / "inside_link.txt"
+        inside_link.symlink_to(target_inside)
+        with pytest.raises(SandboxError):
+            sandbox._write_text_nofollow(inside_link, "PWNED")
+        assert target_inside.read_text() == "real"
+    finally:
+        store.close()
+
+
+def test_db_journal_and_hardlink_protected(tmp_path):
+    store, root = make_store(tmp_path)
+    try:
+        sandbox = Sandbox(store)
+        db = root / ".noname" / "harness.db"
+        # -journal sidecar refused by name.
+        with pytest.raises(WorkspaceBoundaryError):
+            sandbox.write_file(str(db) + "-journal", "x", session_id="s")
+        # A hardlink to the database is refused by inode, not name.
+        hardlink = root / "innocent.txt"
+        import os
+        os.link(db, hardlink)
+        with pytest.raises(WorkspaceBoundaryError):
+            sandbox.write_file("innocent.txt", "corrupt", session_id="s")
+    finally:
+        store.close()
+
+
+def test_binary_file_read_does_not_crash_and_is_evidence(tmp_path):
+    store, root = make_store(tmp_path)
+    try:
+        sandbox = Sandbox(store)
+        (root / "bin.dat").write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe binary \x00")
+        result = sandbox.read_file("bin.dat", session_id="s")
+        assert result["encoding"] == "hex"
+        # The binary content is in the ledger (as hex), not a silent gap.
+        event = next(e for e in store.list_events("s", limit=10) if e.event_type == "file.read")
+        assert event.payload["encoding"] == "hex"
+        evidence = store.evidence_for_event(event.id)[0]["content"]
+        assert "89504e47" in evidence  # PNG magic in hex
+        assert store.verify_integrity()["ok"] is True
+    finally:
+        store.close()
+
+
+def test_truncation_is_marked_in_payload(tmp_path):
+    store, root = make_store(tmp_path)
+    try:
+        sandbox = Sandbox(store, max_output_chars=100)
+        (root / "big.txt").write_text("x" * 5000)
+        sandbox.read_file("big.txt", session_id="s")
+        event = next(e for e in store.list_events("s", limit=10) if e.event_type == "file.read")
+        assert event.payload["truncated"] is True
+        assert event.payload["evidence_chars"] == 100
+    finally:
+        store.close()
+
+
+def test_nonzero_exit_records_tool_failed(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        sandbox = Sandbox(store)
+        result = sandbox.run_command(["git", "definitely-not-a-command"], session_id="s")
+        assert result["returncode"] != 0
+        event = next(e for e in store.list_events("s", limit=10) if e.event_type.startswith("tool."))
+        assert event.event_type == "tool.failed"
     finally:
         store.close()

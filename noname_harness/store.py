@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import math
 import sqlite3
 import uuid
@@ -556,18 +557,30 @@ class HarnessStore:
 
         destination = self.validate_workspace_path(path)
         database = self.db_path.expanduser().resolve()
-        # Refuse the database and its WAL-mode sidecar files: writing to
-        # harness.db-wal / harness.db-shm would corrupt the live database.
-        db_name = database.name
-        if destination == database or (
-            destination.parent == database.parent
-            and destination.name in {db_name, f"{db_name}-wal", f"{db_name}-shm"}
-        ):
+        # Refuse the database and its sidecar files, robustly:
+        #  * name match (case-insensitive) covers db, -wal, -shm and -journal;
+        #  * inode match (os.path.samefile) covers a hardlink to the database,
+        #    which a name check cannot see.
+        db_name = database.name.lower()
+        sidecar_names = {db_name, f"{db_name}-wal", f"{db_name}-shm", f"{db_name}-journal"}
+        if destination.parent == database.parent and destination.name.lower() in sidecar_names:
             raise WorkspaceBoundaryError(
                 "refusing to use the harness database or its sidecar files as an output file"
             )
-        if destination.exists() and destination.is_dir():
-            raise ValueError("context package output path must be a file")
+        if destination.exists():
+            try:
+                if database.exists() and os.path.samefile(destination, database):
+                    raise WorkspaceBoundaryError(
+                        "refusing to write through a hardlink to the harness database"
+                    )
+            except OSError:
+                # A samefile comparison failure (e.g. dangling path) must not
+                # silently allow the write; refuse defensively.
+                raise WorkspaceBoundaryError(
+                    f"cannot verify output path is not the database: {destination}"
+                )
+            if destination.is_dir():
+                raise ValueError("context package output path must be a file")
         return destination
 
     def append_event(
