@@ -2,6 +2,28 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.17.0] - 2026-09-29
+
+### Features
+
+- 语义检索落地（memory-model §6，经一轮对抗性审查——CONTESTED 后修复——schema 到 v7）：新增 `noname_harness/embeddings.py`——`EmbeddingFn` 协议（text→vector，可注入）、确定性无网络的 `local_hash_embedding`（hashing-trick 计数向量器，词元 + 字符 3-gram，L2 归一化）、纯 Python `cosine_similarity`。真实 embedding 服务按同一协议以插件注入，内核不依赖任何外部服务。
+- schema v7：新增 `event_embeddings` 表——可重建向量投影，永远不是事实来源（可删可重建，无 append-only 触发器；含 `model_id` 列，跨空间/维度查询响亮拒绝）。
+- `store.build_embedding_index`（分页全量索引，不静默截断，embedding 可注入）与 `store.search_events_semantic`（三阶段：余弦相似度 + session 过滤 + 相似度地板召回 → 相似度 + 新鲜度 + `event_id` tie-break 重排 → 带 `ref_id` 构造）。FTS5 仍是默认检索，向量是可选语义增强；品味检索与事实检索分开，语义检索只作用事件/证据事实层。
+- 审查加固：去符号 trick 改纯计数向量器（余弦恒非负、词面排序正确）；`local_hash_embedding` 明确标注为词面/lexical 非语义；`_searchable_text` 与 FTS 索引文本统一（含 `event_type` / `artifact_uri`）；投影存 `model_id` 防跨空间查询；tie-break 用 `event_id`；防御性 `ALTER` 兼容旧表。
+- CLI：`embed` 构建向量投影、`search --semantic` 语义召回。
+
+### Design Rationale
+
+- **为什么向量索引是可重建投影而非事实来源**：embedding 只是「哪些记录可能相关」的召回索引，可删可重建，事件/证据才是事实；这与「证据不可丢、记忆可投影」一致——投影丢了随时能从事实层重建，反过来则不行。品味检索与事实检索分开，保证态度不会被误当事实。
+- **为什么 embedding 必须可注入、默认嵌入要诚实标注为词面非语义**：`local_hash_embedding` 只衡量词面重叠（无法识别真正的语义转述），它的价值是让管线在无外部服务时可离线、确定性验证；真实语义必须靠插件注入的 embedding。把默认说成「语义」会误导使用者对召回质量的预期，诚实标注是契约的一部分。
+
+### Notes & Caveats
+
+- `local_hash_embedding` 是词面/lexical 重叠而非语义（CJK 靠字符 3-gram）；真实 embedding 服务待以插件注入。
+- 语义检索是 O(N) 暴力余弦扫描，本地规模可接受，非 ANN。
+- 新增 15 个测试，总数到 275。
+- schema 从 v6 到 v7（新增 `event_embeddings` 投影表）。
+
 
 ## [0.16.0] - 2026-09-29
 
