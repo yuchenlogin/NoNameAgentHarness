@@ -2,6 +2,28 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.7.0] - 2026-09-29
+
+### Features
+
+- 工具注册表内核（schema 不变，仍为 v5）：`noname_harness/tools.py` 将 `ToolSchema`（模型可见面：name / description / input_schema）与 `Tool`（宿主执行面：callable / permission / approval / scope / session_id）严格分离，`visible_tools` 只向模型暴露契约。执行管线为 `validate → approval → execute → log → return`。
+- 审批是账本支撑的一次性令牌而非布尔：`grant_approval`（授权方路径）铸造令牌并记 `tool.approval_granted`，绑定（工具名, arguments 的 sha256, approver, session_id）、单次使用；执行时验证并消费，记 `tool.approved` 引用既有授权。未消费令牌可从账本重建（跨重启持久），已消费令牌跨重启仍拒绝。执行器不给自己打分。
+- 结构性护栏：`register` 拒绝非精确 `Tool` 实例（防子类化覆写审批门）；遮蔽单调性（不得降低 permission、不得丢弃 approval、宽作用域不得遮蔽窄作用域）；tombstone 记录每个名字史上最强门，`unregister → re-register` 也不能降级；destructive 工具必须 `approval=always`。
+- 作用域真实生效：session 工具绑定 `session_id`，其它 session 不可见、不可调；删去了无强制力的 agent 作用域，诚实保留 global / session 两级。
+- 账本完整与最小披露：审批前只存 arguments 哈希，不把模型可控内容落盘；validation 失败、执行失败都入账；记录真实 `elapsed_ms`；执行失败把令牌放回 live set——授权是 per-completed-call 而非 per-attempt，瞬时错误不吞授权。
+
+### Design Rationale
+
+- **为什么审批必须是账本支撑的令牌而非布尔**：自证布尔意味着任何能调用 request 的代码都能授权，执行器还自己写 approved——账本记录的是调用方的断言而非事实，可以被伪造。令牌把授权变成可验证的持久证据：绑定到确切的参数哈希与 session、单次使用、可从账本重建，审批不再依赖「调用方说自己被批准了」，而是账本上确实存在过一笔由授权方写下的 `tool.approval_granted`。
+- **为什么要单调性 + tombstone**：审批门不只是「调用时拦截」，还要防「注册时降级」。如果同名注册或 unregister 后重注册可以削弱门，攻击面就从「能不能绕过审批」变成「能不能抢先注册一个同名弱门工具」——物理门退化为命名竞争。单调性与 tombstone 让「一个名字曾达到的门强度只升不降」成为结构事实，降级在注册层就被拒绝。
+
+### Notes & Caveats
+
+- 本层只执行宿主显式注册的 callable，不含真实 shell / 网络 / 文件副作用——执行世界（沙箱、超时、并发）属下一阶段。
+- agent 作用域被删除，因为原型层没有对它的强制力；保留它只会制造「有作用域」的假象。
+- 新增 27 个工具测试，总数到 106。
+
+
 ## [0.6.0] - 2026-09-29
 
 ### Features

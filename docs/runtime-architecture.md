@@ -111,6 +111,17 @@ validate → policy → approval → execute → normalize → log → present
 
 工具注册有作用域：global、agent、session。局部工具可以遮蔽全局工具，但必须在账本中可见。工具卸载后所有监听、定时器和资源都要释放。
 
+### 原型落地状态
+
+`noname_harness/tools.py` 已实现本节核心（schema v5）：
+
+- 模型可见面（`ToolSchema`）与宿主执行面（`Tool`）已分离，`visible_tools` 只暴露契约；
+- 审批为账本支撑的一次性令牌：`grant_approval` 铸造并记 `tool.approval_granted`，绑定参数哈希与 session、单次使用，未消费令牌可从账本重建；
+- 遮蔽单调性 + tombstone：同名注册与 unregister 后重注册都不能削弱审批门；
+- 作用域保留 global / session 两级，agent 因原型层无强制力暂移除；
+- 落地管线为 `validate → approval → execute → log → return`（policy / normalize / present 在原型层尚无对应物）；
+- 执行世界（真实副作用、沙箱、超时、并发）属下一阶段。
+
 ## 6. Agent Loop
 
 Agent loop 建议采用显式状态机：
