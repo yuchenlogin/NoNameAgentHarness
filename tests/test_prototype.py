@@ -379,7 +379,7 @@ def test_schema_v1_is_migrated_through_the_chain_to_latest(tmp_path):
         ).fetchone()["value"]
         assert "proposal_reason" in columns
         # A v1 database is upgraded step by step to the current version.
-        assert version == "3"
+        assert version == "4"
         # The taste layer introduced by v3 exists after the migration.
         taste_tables = {
             row["name"]

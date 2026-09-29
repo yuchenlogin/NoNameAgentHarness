@@ -77,6 +77,8 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--reviewer", required=True, dest="reviewer_id")
     review.add_argument("--content", dest="edited_content")
     review.add_argument("--reason")
+    review.add_argument("--valid-from", dest="valid_from", help="when the fact becomes true in the world (ISO time)")
+    review.add_argument("--valid-to", dest="valid_to", help="when the fact stops being true in the world (ISO time)")
 
     state = sub.add_parser("state", parents=[_db_parent()], help="show accepted durable state")
     state.add_argument("--layer", choices=["high", "mid"])
@@ -125,6 +127,8 @@ def build_parser() -> argparse.ArgumentParser:
     taste_review.add_argument("--reviewer", required=True, dest="reviewer_id")
     taste_review.add_argument("--content", dest="edited_content")
     taste_review.add_argument("--reason")
+
+    inbox = sub.add_parser("inbox", parents=[_db_parent()], help="show the review inbox (pending canon, task and taste)")
 
     taste_list = sub.add_parser("taste", parents=[_db_parent()], help="list taste records")
     taste_list.add_argument("--status", choices=["active", "candidate"], default="active")
@@ -192,6 +196,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         args.reviewer_id,
                         edited_content=edited,
                         reason=args.reason,
+                        valid_from=args.valid_from,
+                        valid_to=args.valid_to,
                     )
                 )
             elif args.command == "state":
@@ -273,6 +279,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         reason=args.reason,
                     )
                 )
+            elif args.command == "inbox":
+                _print(store.review_inbox())
             elif args.command == "taste":
                 service = TasteService(store)
                 if args.status == "active":

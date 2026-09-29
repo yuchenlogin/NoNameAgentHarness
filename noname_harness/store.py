@@ -23,7 +23,7 @@ from .models import EvidenceInput, Event
 from .workspace import git_snapshot
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 VALID_LAYERS = {"high", "mid"}
 VALID_REVIEW_ACTIONS = {"accept", "reject", "edit", "defer", "retire"}
 VALID_TASTE_TRACKS = {"authored", "adopted"}
@@ -159,6 +159,8 @@ class HarnessStore:
             origin_proposal_id TEXT REFERENCES state_proposals(id),
             supersedes_id TEXT REFERENCES state_revisions(id),
             approved_by TEXT NOT NULL,
+            valid_from TEXT,
+            valid_to TEXT,
             created_at TEXT NOT NULL
         );
 
@@ -346,6 +348,24 @@ class HarnessStore:
                     # CREATE TABLE IF NOT EXISTS, so the version bump itself is
                     # the only durable change required here.
                     current_version = 3
+                if current_version == 3:
+                    # v4 adds bitemporal validity to durable state revisions:
+                    # valid_from / valid_to record when a fact is true in the
+                    # real world, while created_at keeps when the system
+                    # learned it.  Existing rows stay valid with NULL bounds.
+                    columns = {
+                        row["name"]
+                        for row in self._connection.execute("PRAGMA table_info(state_revisions)")
+                    }
+                    if "valid_from" not in columns:
+                        self._connection.execute(
+                            "ALTER TABLE state_revisions ADD COLUMN valid_from TEXT"
+                        )
+                    if "valid_to" not in columns:
+                        self._connection.execute(
+                            "ALTER TABLE state_revisions ADD COLUMN valid_to TEXT"
+                        )
+                    current_version = 4
                 if current_version != SCHEMA_VERSION:  # pragma: no cover - defensive
                     raise RuntimeError(
                         f"Unsupported schema version {current_version}; expected {SCHEMA_VERSION}"
@@ -772,6 +792,8 @@ class HarnessStore:
                 "origin_proposal_id": row["origin_proposal_id"],
                 "supersedes_id": row["supersedes_id"],
                 "approved_by": row["approved_by"],
+                "valid_from": row["valid_from"],
+                "valid_to": row["valid_to"],
                 "created_at": row["created_at"],
             }
             for row in latest.values()
@@ -899,6 +921,70 @@ class HarnessStore:
             return proposals
         return [item for item in proposals if not item["reviews"] or item["reviews"][-1]["action"] == "defer"]
 
+    def review_inbox(self) -> dict[str, Any]:
+        """Aggregate everything waiting for a human decision into one inbox.
+
+        This is the projection behind the ledger's review inbox: a small,
+        high-value to-do list rather than a raw event dump.  It joins pending
+        durable-state proposals (canon and task state) with pending adopted
+        taste candidates, and annotates each entry with its impact scope,
+        source events and conflicts so a reviewer can judge, not just click.
+
+        The inbox is derived from append-only tables and can be rebuilt at
+        any time; it never stores facts of its own.
+        """
+
+        from .taste import TasteService
+
+        canon_items = []
+        for proposal in self.list_proposals(pending_only=True):
+            impact = "project canon (long-term)" if proposal["layer"] == "high" else "current task state"
+            canon_items.append(
+                {
+                    "kind": "state_proposal",
+                    "id": proposal["id"],
+                    "layer": proposal["layer"],
+                    "logical_key": proposal["logical_key"],
+                    "summary": proposal["content"],
+                    "impact": impact,
+                    "proposed_by": proposal["proposed_by"],
+                    "confidence": proposal["confidence"],
+                    "reason": proposal["reason"],
+                    "source_event_ids": proposal["source_event_ids"],
+                    "conflict_with_ids": proposal["conflict_with_ids"],
+                    "created_at": proposal["created_at"],
+                }
+            )
+
+        taste_items = []
+        for record in TasteService(self).pending():
+            taste_items.append(
+                {
+                    "kind": "taste_candidate",
+                    "id": record["id"],
+                    "track": record["track"],
+                    "scope": record["scope"],
+                    "summary": record["content"],
+                    "impact": f"taste ({record['scope']} scope, attitude only)",
+                    "proposed_by": record["actor_id"],
+                    "reason": record["reason"],
+                    "source_event_ids": record["source_event_ids"],
+                    "created_at": record["recorded_at"],
+                }
+            )
+
+        return {
+            "canon_pending": [item for item in canon_items if item["layer"] == "high"],
+            "task_pending": [item for item in canon_items if item["layer"] == "mid"],
+            "taste_pending": taste_items,
+            "counts": {
+                "canon": sum(1 for item in canon_items if item["layer"] == "high"),
+                "task": sum(1 for item in canon_items if item["layer"] == "mid"),
+                "taste": len(taste_items),
+                "total": len(canon_items) + len(taste_items),
+            },
+        }
+
     def _latest_revision(self, layer: str, logical_key: str) -> dict[str, Any] | None:
         return next(
             (
@@ -917,6 +1003,8 @@ class HarnessStore:
         *,
         edited_content: Any | None = None,
         reason: str | None = None,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
     ) -> dict[str, Any]:
         if action not in VALID_REVIEW_ACTIONS:
             raise ValueError(f"invalid review action: {action}")
@@ -925,6 +1013,8 @@ class HarnessStore:
         proposal = self.get_proposal(proposal_id)
         if action == "edit" and edited_content is None:
             raise ValueError("edited_content is required for edit")
+        if valid_from is not None and valid_to is not None and valid_to < valid_from:
+            raise ValueError("valid_to cannot precede valid_from")
         review_id = _id("rev")
         reviewed_at = _now()
         content = edited_content if action == "edit" else proposal["content"]
@@ -955,8 +1045,8 @@ class HarnessStore:
                 connection.execute(
                     "INSERT INTO state_revisions "
                     "(id, layer, logical_key, kind, content_json, status, source_event_ids_json, "
-                    "origin_proposal_id, supersedes_id, approved_by, created_at) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "origin_proposal_id, supersedes_id, approved_by, valid_from, valid_to, created_at) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         revision_id,
                         proposal["layer"],
@@ -968,6 +1058,8 @@ class HarnessStore:
                         proposal_id,
                         supersedes_id,
                         reviewer_id,
+                        valid_from,
+                        valid_to,
                         reviewed_at,
                     ),
                 )
