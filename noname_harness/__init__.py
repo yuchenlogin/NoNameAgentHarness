@@ -3,6 +3,7 @@
 from .models import EvidenceInput, Event
 from .curator import CuratorService
 from .taste import TasteService
+from .agent_loop import AgentLoop, AgentLoopError, LoopResult, SessionDriver
 from .tools import (
     ApprovalToken,
     Tool,
@@ -17,7 +18,11 @@ from .context import render_markdown
 from .store import HarnessStore, WorkspaceBoundaryError
 
 __all__ = [
+    "AgentLoop",
+    "AgentLoopError",
     "CuratorService",
+    "LoopResult",
+    "SessionDriver",
     "TasteService",
     "ApprovalToken",
     "Tool",
