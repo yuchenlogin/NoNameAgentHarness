@@ -298,6 +298,7 @@ class HarnessStore:
             event_id TEXT PRIMARY KEY REFERENCES session_events(id),
             dimensions INTEGER NOT NULL,
             vector_json TEXT NOT NULL,
+            model_id TEXT NOT NULL DEFAULT 'local_hash',
             embedded_at TEXT NOT NULL
         );
 
@@ -454,6 +455,17 @@ class HarnessStore:
             except sqlite3.OperationalError:
                 # FTS5 is an acceleration index, never the source of truth.
                 self._fts_available = False
+            # event_embeddings is a rebuildable projection, so an idempotent
+            # ALTER to add a missing model_id column is safe for databases that
+            # created the table before the column existed.
+            embedding_columns = {
+                row["name"]
+                for row in self._connection.execute("PRAGMA table_info(event_embeddings)")
+            }
+            if embedding_columns and "model_id" not in embedding_columns:
+                self._connection.execute(
+                    "ALTER TABLE event_embeddings ADD COLUMN model_id TEXT NOT NULL DEFAULT 'local_hash'"
+                )
             current = self._connection.execute(
                 "SELECT value FROM harness_meta WHERE key = 'schema_version'"
             ).fetchone()
@@ -1012,10 +1024,17 @@ class HarnessStore:
     # ------------------------------------------------------------------
 
     def _searchable_text(self, event: Event) -> str:
-        """The text an event is embedded/searched by (payload + evidence)."""
+        """The text an event is embedded/searched by.
 
-        parts = [_json(event.payload)]
+        This MUST mirror what the FTS index covers (event_type, payload,
+        evidence content, evidence artifact_uri) so the keyword and vector
+        recall paths project the *same* text and their results are comparable.
+        """
+
+        parts = [event.event_type, _json(event.payload)]
         for evidence in self.evidence_for_event(event.id):
+            if evidence["artifact_uri"]:
+                parts.append(evidence["artifact_uri"])
             parts.append(evidence["content"])
         return "\n".join(parts)
 
@@ -1036,10 +1055,18 @@ class HarnessStore:
         from .embeddings import local_hash_embedding
 
         embed = embedding_fn or local_hash_embedding
-        events = self.list_events(session_id=session_id, limit=100000)
-        # Events come newest-first; embed oldest-first for a stable index.
+        model_id = getattr(embedding_fn, "model_id", None) or (
+            "local_hash" if embedding_fn is None or embedding_fn is local_hash_embedding
+            else getattr(embedding_fn, "__name__", "custom")
+        )
+        # Paginate in chunks so a huge store is fully indexed -- never silently
+        # truncated by a hard-coded limit.  Events are fetched newest-first per
+        # page; embedding proceeds oldest-first within each page.
+        page_size = 5000
+        offset = 0
         count = 0
         dimensions = 0
+        now = _now()
         with self._transaction() as connection:
             if session_id is None:
                 connection.execute("DELETE FROM event_embeddings")
@@ -1049,17 +1076,32 @@ class HarnessStore:
                     "(SELECT id FROM session_events WHERE session_id = ?)",
                     (session_id,),
                 )
-            now = _now()
-            for event in reversed(events):
-                vector = embed(self._searchable_text(event))
-                dimensions = len(vector)
-                connection.execute(
-                    "INSERT INTO event_embeddings(event_id, dimensions, vector_json, embedded_at) "
-                    "VALUES(?, ?, ?, ?)",
-                    (event.id, dimensions, _json(vector), now),
-                )
-                count += 1
-        return {"embedded": count, "dimensions": dimensions}
+            while True:
+                page = self._connection.execute(
+                    "SELECT * FROM session_events "
+                    + ("WHERE session_id = ? " if session_id is not None else "")
+                    + "ORDER BY rowid LIMIT ? OFFSET ?",
+                    ((session_id,) if session_id is not None else ()) + (page_size, offset),
+                ).fetchall()
+                if not page:
+                    break
+                for row in page:
+                    event = Event(
+                        row["id"], row["session_id"], row["seq"], row["event_type"],
+                        _decode(row["payload_json"]), row["occurred_at"], row["content_hash"],
+                    )
+                    vector = embed(self._searchable_text(event))
+                    dimensions = len(vector)
+                    connection.execute(
+                        "INSERT INTO event_embeddings(event_id, dimensions, vector_json, model_id, embedded_at) "
+                        "VALUES(?, ?, ?, ?, ?)",
+                        (event.id, dimensions, _json(vector), model_id, now),
+                    )
+                    count += 1
+                offset += len(page)
+                if len(page) < page_size:
+                    break
+        return {"embedded": count, "dimensions": dimensions, "model_id": model_id}
 
     def search_events_semantic(
         self,
@@ -1088,7 +1130,26 @@ class HarnessStore:
         if limit < 1:
             raise ValueError("limit must be positive")
         embed = embedding_fn or local_hash_embedding
+        model_id = getattr(embedding_fn, "model_id", None) or (
+            "local_hash" if embedding_fn is None or embedding_fn is local_hash_embedding
+            else getattr(embedding_fn, "__name__", "custom")
+        )
         query_vector = embed(query)
+
+        # Refuse to query across embedding spaces: a vector built by one
+        # embedding function is meaningless against an index built by another.
+        index_models = {
+            row["model_id"]
+            for row in self._connection.execute(
+                "SELECT DISTINCT model_id FROM event_embeddings"
+            ).fetchall()
+        }
+        if index_models and model_id not in index_models:
+            raise ValueError(
+                f"query embedding '{model_id}' does not match the index "
+                f"(built with {sorted(index_models)}); rebuild the index with the "
+                "same embedding function"
+            )
 
         clauses = []
         args: list[Any] = []
@@ -1105,12 +1166,18 @@ class HarnessStore:
         scored = []
         for row in rows:
             vector = _decode(row["vector_json"])
+            if len(vector) != len(query_vector):
+                raise ValueError(
+                    "query vector dimension does not match the index; rebuild "
+                    "the index with the same embedding function"
+                )
             similarity = cosine_similarity(query_vector, vector)
             if similarity < min_similarity:
                 continue
             scored.append((similarity, row))
-        # Rerank: similarity first, then recency as a tie-break.
-        scored.sort(key=lambda item: (item[0], item[1]["occurred_at"], item[1]["seq"]), reverse=True)
+        # Rerank: similarity first, then recency, then a deterministic unique
+        # tie-break (event_id) so ordering is meaningful across sessions.
+        scored.sort(key=lambda item: (item[0], item[1]["occurred_at"], item[1]["id"]), reverse=True)
         return [
             {
                 "event": Event(

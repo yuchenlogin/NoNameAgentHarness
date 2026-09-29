@@ -21,11 +21,6 @@ from typing import Callable, Protocol, Sequence
 EmbeddingFn = Callable[[str], list[float]]
 
 
-class EmbeddingProtocol(Protocol):
-    def __call__(self, text: str) -> list[float]:
-        ...
-
-
 def cosine_similarity(first: Sequence[float], second: Sequence[float]) -> float:
     """Cosine similarity in pure Python (no numpy dependency)."""
 
@@ -65,11 +60,17 @@ def _token_shingles(text: str) -> list[str]:
 
 
 def local_hash_embedding(text: str, *, dimensions: int = DEFAULT_DIMENSIONS) -> list[float]:
-    """A deterministic hashing-trick embedding (L2-normalised).
+    """A deterministic local embedding for verifying the recall pipeline.
 
-    Identical text always yields the identical vector, and lexically similar
-    text yields high cosine similarity -- so the semantic-recall pipeline is
-    reproducible without any network or model download.
+    This is a LEXICAL-OVERLAP measure, NOT a semantic model: it counts token
+    and character-3-gram shingle occurrences into hash buckets and
+    L2-normalises.  It captures *lexical* similarity only -- genuine
+    paraphrases ("数据库查询超时" vs "DB latency") score ~0.  Use it to exercise
+    and verify the recall pipeline deterministically with zero network; plug a
+    real embedding service into the same protocol for true semantic recall.
+
+    A plain count vector (no sign trick) is used so lexical overlap ranks
+    correctly and cosine is always non-negative.
     """
 
     if dimensions < 8:
@@ -78,9 +79,7 @@ def local_hash_embedding(text: str, *, dimensions: int = DEFAULT_DIMENSIONS) -> 
     for shingle in _token_shingles(text):
         digest = hashlib.sha256(shingle.encode("utf-8")).digest()
         bucket = int.from_bytes(digest[:4], "big") % dimensions
-        # Sign from another byte so similar shingles spread across the space.
-        sign = 1.0 if digest[4] % 2 == 0 else -1.0
-        vector[bucket] += sign
+        vector[bucket] += 1.0
     norm = math.sqrt(sum(value * value for value in vector))
     if norm == 0.0:
         return vector

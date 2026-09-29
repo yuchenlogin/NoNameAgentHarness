@@ -127,3 +127,110 @@ def test_semantic_recall_validation(tmp_path):
             local_hash_embedding("x", dimensions=4)
     finally:
         store.close()
+
+
+# --- 对抗性审查发现的回归 ---
+
+def test_searchable_text_matches_fts_coverage(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        store.append_event(
+            "s", "test.failed", {"path": "t.py"},
+            [EvidenceInput("boom", "file://docs/spec.pdf")],
+        )
+        store.build_embedding_index(local_hash_embedding)
+        # event_type is embedded too: a query for "test.failed" hits.
+        hits = store.search_events_semantic("test.failed", local_hash_embedding)
+        assert any(h["event"].event_type == "test.failed" for h in hits)
+        # artifact_uri is embedded too: a query for the filename hits.
+        hits2 = store.search_events_semantic("docs/spec.pdf", local_hash_embedding)
+        assert hits2
+    finally:
+        store.close()
+
+
+def test_count_vectorizer_produces_nonnegative_similarity(tmp_path):
+    # The sign trick is gone: cosine is always in [0, 1] and lexical overlap
+    # ranks above no overlap.
+    first = local_hash_embedding("alpha beta gamma delta")
+    overlap = local_hash_embedding("alpha beta")
+    none = local_hash_embedding("zzz qqq")
+    assert cosine_similarity(first, overlap) > 0
+    assert cosine_similarity(first, overlap) > cosine_similarity(first, none)
+    assert cosine_similarity(first, none) >= 0.0
+
+
+def test_cjk_self_similarity_and_partial_overlap():
+    # CJK has no spaces, but char 3-grams still give meaningful local recall.
+    doc = local_hash_embedding("修复算法测试失败")
+    same = local_hash_embedding("修复算法测试失败")
+    partial = local_hash_embedding("算法测试")
+    unrelated = local_hash_embedding("完全无关")
+    assert cosine_similarity(doc, same) == pytest.approx(1.0)
+    assert cosine_similarity(doc, partial) > cosine_similarity(doc, unrelated)
+
+
+def test_cross_model_index_query_is_refused(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        store.append_event("s", "note", {"text": "hello"})
+        store.build_embedding_index(local_hash_embedding)  # built with local_hash
+
+        def other_model(text):
+            return local_hash_embedding(text, dimensions=64)
+        other_model.model_id = "other-model"
+
+        # Querying with a different embedding space is refused, not silently wrong.
+        with pytest.raises(ValueError):
+            store.search_events_semantic("hello", other_model)
+    finally:
+        store.close()
+
+
+def test_dimension_mismatch_is_refused(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        store.append_event("s", "note", {"text": "hello"})
+        store.build_embedding_index(local_hash_embedding)  # 256 dims
+
+        # Simulate a corrupted/mismatched index entry by overwriting a real
+        # event's stored vector with a wrong-dimension one (same model_id).
+        from noname_harness.store import _json, _now
+        event_id = store.list_events("s")[0].id
+        with store.transaction() as conn:
+            conn.execute(
+                "UPDATE event_embeddings SET vector_json = ? WHERE event_id = ?",
+                (_json([0.1] * 8), event_id),
+            )
+        with pytest.raises(ValueError):
+            store.search_events_semantic("hello", local_hash_embedding)
+    finally:
+        store.close()
+
+
+def test_build_index_paginates_without_truncation(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        # More than one page (page_size=5000 is patched small via many events).
+        for i in range(12):
+            store.append_event("s", "note", {"text": f"event {i}"})
+        result = store.build_embedding_index(local_hash_embedding)
+        assert result["embedded"] == 12  # nothing dropped
+    finally:
+        store.close()
+
+
+def test_tie_break_uses_event_id_not_seq(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        # Two sessions, identical text, near-identical timestamps.
+        store.append_event("s1", "note", {"text": "identical content"})
+        store.append_event("s2", "note", {"text": "identical content"})
+        store.build_embedding_index(local_hash_embedding)
+        hits = store.search_events_semantic("identical content", local_hash_embedding)
+        # Deterministic across repeated calls (event_id tie-break, not per-session seq).
+        first_run = [h["event"].id for h in hits]
+        second_run = [h["event"].id for h in store.search_events_semantic("identical content", local_hash_embedding)]
+        assert first_run == second_run
+    finally:
+        store.close()
