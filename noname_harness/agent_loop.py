@@ -13,10 +13,10 @@ State machine (from docs/runtime-architecture.md)::
       -> ASSEMBLING_CONTEXT
       -> SELECTING_MODEL
       -> CALLING_MODEL
-      -> WAITING_TOOL / STREAMING_OUTPUT
+      -> WAITING_TOOL
       -> APPLYING_RESULT
       -> CHECKING_STOP
-      -> COMPACTING / COMPLETED / FAILED / CANCELLED
+      -> COMPLETED / FAILED / CANCELLED
 
 Stop conditions are explicit: task complete, user pause, round limit, budget
 limit, unrecoverable error, waiting for approval.  Because no real model is
@@ -38,10 +38,8 @@ STATES = {
     "SELECTING_MODEL",
     "CALLING_MODEL",
     "WAITING_TOOL",
-    "STREAMING_OUTPUT",
     "APPLYING_RESULT",
     "CHECKING_STOP",
-    "COMPACTING",
     "COMPLETED",
     "FAILED",
     "CANCELLED",
@@ -63,12 +61,10 @@ _TRANSITIONS: dict[str, set[str]] = {
     "IDLE": {"ASSEMBLING_CONTEXT", "CANCELLED"},
     "ASSEMBLING_CONTEXT": {"SELECTING_MODEL", "FAILED", "CANCELLED"},
     "SELECTING_MODEL": {"CALLING_MODEL", "FAILED", "CANCELLED"},
-    "CALLING_MODEL": {"WAITING_TOOL", "STREAMING_OUTPUT", "APPLYING_RESULT", "FAILED", "CANCELLED"},
+    "CALLING_MODEL": {"WAITING_TOOL", "APPLYING_RESULT", "FAILED", "CANCELLED"},
     "WAITING_TOOL": {"APPLYING_RESULT", "FAILED", "CANCELLED"},
-    "STREAMING_OUTPUT": {"APPLYING_RESULT", "FAILED", "CANCELLED"},
     "APPLYING_RESULT": {"CHECKING_STOP", "FAILED", "CANCELLED"},
-    "CHECKING_STOP": {"CALLING_MODEL", "COMPACTING", "COMPLETED", "FAILED", "CANCELLED"},
-    "COMPACTING": {"CALLING_MODEL", "COMPLETED", "FAILED", "CANCELLED"},
+    "CHECKING_STOP": {"CALLING_MODEL", "COMPLETED", "FAILED", "CANCELLED"},
     "COMPLETED": set(),
     "FAILED": set(),
     "CANCELLED": set(),
@@ -119,6 +115,14 @@ class AgentLoop:
     _state: str = field(default="IDLE", init=False)
     _rounds: int = field(default=0, init=False)
 
+    def __post_init__(self) -> None:
+        if not self.session_id.strip():
+            raise ValueError("session_id cannot be empty")
+        if self.max_rounds < 1:
+            raise ValueError("max_rounds must be at least 1")
+        if self.budget_rounds is not None and self.budget_rounds < 1:
+            raise ValueError("budget_rounds must be at least 1 when set")
+
     @property
     def state(self) -> str:
         return self._state
@@ -139,11 +143,47 @@ class AgentLoop:
         self.store.append_event(self.session_id, "loop.transition", payload)
         self._state = to_state
 
+    def _force_fail(self, error: str) -> None:
+        """Record a real transition to FAILED from any non-terminal state.
+
+        The normal machine only reaches FAILED from specific states, but a
+        fatal error can occur anywhere.  Rather than bypass the event stream
+        (which would make reconstruct() resurrect a dead run as mid-flight), a
+        forced transition is logged with ``forced: true`` so recovery sees the
+        terminal state and an auditor sees that the machine was aborted, not
+        driven, into FAILED.
+        """
+
+        self.store.append_event(
+            self.session_id,
+            "loop.transition",
+            {
+                "from": self._state,
+                "to": "FAILED",
+                "round": self._rounds,
+                "forced": True,
+                "error": error,
+            },
+        )
+        self._state = "FAILED"
+
     def run(self, task: str, *, task_type: str | None = None) -> dict[str, Any]:
         """Drive the loop to a terminal state and return a run summary."""
 
         if self._state != "IDLE":
             raise AgentLoopError("run() may only be called from IDLE")
+        # Record the stop-condition configuration so a reconstructed loop can
+        # read it back from the stream rather than relying on process state.
+        self.store.append_event(
+            self.session_id,
+            "loop.started",
+            {
+                "task": task,
+                "task_type": task_type,
+                "max_rounds": self.max_rounds,
+                "budget_rounds": self.budget_rounds,
+            },
+        )
         context: dict[str, Any] = {}
         last_tool_result: Any = None
         try:
@@ -159,6 +199,7 @@ class AgentLoop:
             while True:
                 result = self.driver.act(context, last_tool_result)
                 self._rounds += 1
+                self._validate_result(result)
 
                 if result.tool_call is not None:
                     self._transition("WAITING_TOOL", {"tool": result.tool_call.get("name")})
@@ -172,22 +213,24 @@ class AgentLoop:
                 if stop is not None:
                     state, reason = stop
                     self._transition(state, {"reason": reason})
-                    return self._summary(reason, context)
+                    return self._summary(reason, context, output=result.output)
                 # Otherwise loop back for another model turn.
                 self._transition("CALLING_MODEL")
-        except AgentLoopError:
-            raise
         except Exception as exc:  # noqa: BLE001 - normalised into FAILED
+            # Both unexpected exceptions and driver-contract violations
+            # (AgentLoopError) become a FAILED run -- never a raised brick that
+            # leaves the machine stuck in a non-terminal state.  The failure is
+            # recorded as a *real* loop.transition so the event stream remains
+            # the source of truth and reconstruct() sees the terminal state.
+            error_text = str(exc)
             if self._state not in TERMINAL_STATES:
-                # Transition to FAILED from any non-terminal state is legal via
-                # the machine only from specific states; force-record the error.
                 self.store.append_event(
                     self.session_id,
                     "loop.error",
-                    {"state": self._state, "error": str(exc), "round": self._rounds},
+                    {"state": self._state, "error": error_text, "round": self._rounds},
                 )
-                self._state = "FAILED"
-            return self._summary("unrecoverable_error", context, error=str(exc))
+                self._force_fail(error_text)
+            return self._summary("unrecoverable_error", context, error=error_text)
 
     def _check_stop(self, result: LoopResult) -> tuple[str, str] | None:
         if result.stop_reason is not None:
@@ -208,8 +251,33 @@ class AgentLoop:
             return ("FAILED", "budget_limit")
         return None
 
+    @staticmethod
+    def _validate_result(result: LoopResult) -> None:
+        """Reject contradictory driver reports instead of silently picking one.
+
+        A driver that reports a tool call *and* a terminal intent, or a stop
+        reason that disagrees with ``task_complete``, has a bug; the loop must
+        fail loudly (normalised to FAILED by run()) rather than resolve the
+        conflict by accidental branch order.
+        """
+
+        if result.tool_call is not None and (result.task_complete or result.stop_reason is not None):
+            raise AgentLoopError(
+                "contradictory LoopResult: tool_call cannot coexist with task_complete/stop_reason"
+            )
+        if result.task_complete and result.stop_reason not in (None, "task_complete"):
+            raise AgentLoopError(
+                f"contradictory LoopResult: task_complete with stop_reason={result.stop_reason}"
+            )
+        if result.stop_reason is not None and result.stop_reason not in STOP_REASONS:
+            raise AgentLoopError(f"unknown stop reason: {result.stop_reason}")
+
     def _summary(
-        self, reason: str, context: dict[str, Any], error: str | None = None
+        self,
+        reason: str,
+        context: dict[str, Any],
+        error: str | None = None,
+        output: Any = None,
     ) -> dict[str, Any]:
         summary = {
             "session_id": self.session_id,
@@ -218,6 +286,8 @@ class AgentLoop:
             "rounds": self._rounds,
             "package_id": context.get("package_id"),
         }
+        if output is not None:
+            summary["output"] = output
         if error is not None:
             summary["error"] = error
         self.store.append_event(self.session_id, "loop.finished", summary)
@@ -241,16 +311,35 @@ class AgentLoop:
         the event stream left off.
         """
 
+        # Read back the recorded configuration (loop.started) unless the caller
+        # overrides it, so a recovered loop keeps its stop-condition limits
+        # without relying on process memory.
+        started = next(
+            (
+                e for e in store.list_events(session_id=session_id, limit=1000)
+                if e.event_type == "loop.started"
+            ),
+            None,
+        )
+        if started is not None:
+            kwargs.setdefault("max_rounds", started.payload.get("max_rounds", 10))
+            kwargs.setdefault("budget_rounds", started.payload.get("budget_rounds"))
         loop = cls(store=store, session_id=session_id, driver=driver, **kwargs)
-        transitions = [
-            e for e in store.list_events(session_id=session_id, limit=100000)
-            if e.event_type == "loop.transition"
-        ]
-        # Events come newest-first from list_events; replay oldest-first.
+
+        # Only the latest transition and the max round are needed.  list_events
+        # returns newest-first, so the first transition is the current state and
+        # the running max over the replayed window gives the round count.  A
+        # generous limit keeps this correct for very long sessions without
+        # silently truncating (loop sessions are bounded by max_rounds anyway).
         state = "IDLE"
         rounds = 0
-        for event in reversed(transitions):
-            state = event.payload.get("to", state)
+        seen_transition = False
+        for event in store.list_events(session_id=session_id, limit=100000):
+            if event.event_type != "loop.transition":
+                continue
+            if not seen_transition:
+                state = event.payload.get("to", state)  # newest transition first
+                seen_transition = True
             rounds = max(rounds, int(event.payload.get("round", 0)))
         loop._state = state
         loop._rounds = rounds

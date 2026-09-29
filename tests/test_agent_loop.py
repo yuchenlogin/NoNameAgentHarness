@@ -183,3 +183,103 @@ def test_context_package_is_assembled_and_linked(tmp_path):
         assert package["assembly"]["recipe"]["id"] == "code-change-balanced"
     finally:
         store.close()
+
+
+# --- 对抗性审查发现的回归 ---
+
+def test_crash_then_reconstruct_sees_failed_not_zombie(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        class Boom:
+            def act(self, context, last_tool_result=None):
+                raise RuntimeError("boom")
+        loop = AgentLoop(store=store, session_id="s", driver=Boom())
+        summary = loop.run("t")
+        assert summary["final_state"] == "FAILED"
+        # Recovery must see the terminal FAILED state, not resurrect mid-flight.
+        recovered = AgentLoop.reconstruct(store, "s", ScriptedDriver([]))
+        assert recovered.state == "FAILED"
+        # The forced transition is auditable in the stream.
+        forced = [
+            e for e in store.list_events("s", limit=100)
+            if e.event_type == "loop.transition" and e.payload.get("forced")
+        ]
+        assert forced and forced[0].payload["to"] == "FAILED"
+    finally:
+        store.close()
+
+
+def test_unknown_stop_reason_normalizes_to_failed_not_brick(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        driver = ScriptedDriver([LoopResult(stop_reason="typo-reason")])
+        loop = AgentLoop(store=store, session_id="s", driver=driver)
+        summary = loop.run("t")
+        # A driver contract violation becomes FAILED, never a raised brick.
+        assert summary["final_state"] == "FAILED"
+        assert summary["stop_reason"] == "unrecoverable_error"
+        assert "typo-reason" in summary["error"]
+        # The loop reached a terminal state and can be inspected.
+        recovered = AgentLoop.reconstruct(store, "s", ScriptedDriver([]))
+        assert recovered.state == "FAILED"
+    finally:
+        store.close()
+
+
+def test_contradictory_tool_call_and_complete_is_rejected(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        driver = ScriptedDriver([LoopResult(tool_call={"name": "x", "result": 1}, task_complete=True)])
+        loop = AgentLoop(store=store, session_id="s", driver=driver)
+        summary = loop.run("t")
+        assert summary["final_state"] == "FAILED"
+        assert "contradictory" in summary["error"]
+    finally:
+        store.close()
+
+
+def test_contradictory_complete_and_pause_is_rejected(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        driver = ScriptedDriver([LoopResult(task_complete=True, stop_reason="user_pause")])
+        loop = AgentLoop(store=store, session_id="s", driver=driver)
+        summary = loop.run("t")
+        assert summary["final_state"] == "FAILED"
+        assert "contradictory" in summary["error"]
+    finally:
+        store.close()
+
+
+def test_max_rounds_must_be_at_least_one(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        with pytest.raises(ValueError):
+            AgentLoop(store=store, session_id="s", driver=ScriptedDriver([]), max_rounds=0)
+        with pytest.raises(ValueError):
+            AgentLoop(store=store, session_id="s", driver=ScriptedDriver([]), budget_rounds=0)
+    finally:
+        store.close()
+
+
+def test_reconstruct_reads_back_limits(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        driver = ScriptedDriver([LoopResult(output="x"), LoopResult(task_complete=True)])
+        loop = AgentLoop(store=store, session_id="s", driver=driver, max_rounds=7, budget_rounds=5)
+        loop.run("t")
+        recovered = AgentLoop.reconstruct(store, "s", ScriptedDriver([]))
+        assert recovered.max_rounds == 7
+        assert recovered.budget_rounds == 5
+    finally:
+        store.close()
+
+
+def test_summary_carries_final_output(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        driver = ScriptedDriver([LoopResult(output="the answer", task_complete=True)])
+        loop = AgentLoop(store=store, session_id="s", driver=driver)
+        summary = loop.run("t")
+        assert summary["output"] == "the answer"
+    finally:
+        store.close()
