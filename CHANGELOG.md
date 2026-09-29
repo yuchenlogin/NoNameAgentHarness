@@ -3,6 +3,26 @@
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
 
+## [0.16.0] - 2026-09-29
+
+### Features
+
+- 第二个真实供应商适配器落地，协议通用性实证（runtime-arch §3，经一轮对抗性审查——CONTESTED 后修复——schema 不变，仍为 v6）：新增 `noname_harness/anthropic_adapter.py`（`AnthropicAdapter` + `load_anthropic_adapter`），与 OpenAI 同一 `ModelAdapter` 契约，只写 Messages API 差异（端点 `/messages`、`x-api-key` + `anthropic-version` 头、`system` 顶层字段、content 块数组、`tool_use` 块、`stop_reason`、usage 字段名）。同一 `AdapterDriver` + `AgentLoop` 仅替换适配器实例，OpenAI 与 Anthropic 在完整多轮工具循环（请求工具 → 回传 `tool_result`/`tool` 消息 → 回答）下都工作，业务逻辑零改动。
+- 共享凭证安全基类 `noname_harness/vendor_http.py`：无重定向 handler、HTTPS base URL 校验（`allow_insecure` 仅本地 opt-in）、安全 `vendor_ref`（错误体永不落盘、usage 白名单、`error_code` 限 snake_case 枚举防凭证回显）、按因错误分类、`json_schema_type`/`word_count_cost` 共享助手；`openai_adapter` 重构为复用同一基类。
+- 审查加固：`role="tool"` 映射为 user + `tool_result` 块（带 `tool_use_id`，真实 API 多轮 tool loop 需要；`AdapterDriver` 用 `_last_tool_call_id` 穿线关联）；`_map_response` 对非 dict data/usage 守卫（不崩 `AttributeError`）；`finish_reason` 归一化（`tool_use`→`tool_calls` 等）；`tool_use.input` 1MB 上限；`stream` 发全部并行 tool_call；`max_output_tokens=0` 用 `is not None`。
+
+### Design Rationale
+
+- **为什么要复刻第二个供应商验证通用性**：协议若只能服务一家供应商，就是失败的抽象——差异没有被收敛成能力，只是换了个名字的内置耦合。同一 driver + loop 仅替换适配器实例即可驱动两家，证明业务逻辑只按 capability 选模型、换供应商不换事实来源；「内核不依赖任何供应商」从设计意图变为已验证事实。
+- **为什么凭证安全要抽共享基类而非复制**：重定向拒绝、HTTPS 校验、`vendor_ref` 白名单、错误分类是硬赢的保障，复制会让两处实现各自漂移——Anthropic 初版就漏了 OpenAI 已修的 1MB 上限。集中一处，加固一次两家同时受益，保障不随供应商漂移。
+
+### Notes & Caveats
+
+- `tool_result` 关联靠 driver 的 `_last_tool_call_id`（单 tool_call/轮，并行调用尚不支持）。
+- `estimate_cost` 字段诚实命名 `estimated_input_words`，仍是词数估算非真实 token 计数。
+- 真实网络调用仍未在测试启用（replay 验证契约）。
+- 新增 19 个测试，总数到 260。
+
 ## [0.15.0] - 2026-09-29
 
 ### Features

@@ -68,6 +68,8 @@ Capability Layer
 
 第一个真实供应商适配器已落地：`noname_harness/openai_adapter.py`（`OpenAIAdapter` + `load_openai_adapter`），支持 OpenAI 兼容端点。要点：传输层可注入（默认真实 urllib POST，测试用确定性 replay 传输，无网络/key 即可验证请求构建、错误分类、`vendor_ref`）；base URL scheme 归一化强制 HTTPS（`allow_insecure` 仅本地 opt-in）；拒绝一切重定向（防 302 转发 Bearer key）；`vendor_ref` 全路径白名单——只存 `{status, id, error_code, token usage}`，错误体永不落盘、永不放 bytes；错误按因分类（true timeout 可重试，DNS/连接/TLS 不可重试）；`PluginManifest.side_effects` 声明 `(network-egress, billing)` 记 `plugin.loaded` 审计。该适配器经插件加载、驱动 Agent Loop 完成端到端验证（replay 无网络），「能力结晶成插件」从原则变为已验证事实。
 
+第二个真实供应商适配器已落地：`noname_harness/anthropic_adapter.py`（`AnthropicAdapter` + `load_anthropic_adapter`），与 OpenAI 同一契约，只写 Messages API 差异（`/messages` 端点、`x-api-key` + `anthropic-version` 头、`system` 顶层字段、content 块数组、`tool_use` 块、`stop_reason`、usage 字段名）。两家适配器共用 `noname_harness/vendor_http.py` 凭证安全基类（无重定向、HTTPS 校验、`vendor_ref` 白名单、错误分类、成本/JSON Schema 助手），硬赢的保障集中一处不随供应商漂移。协议通用性已实证：同一 `AdapterDriver` + `AgentLoop` 仅替换适配器实例，即可驱动两家完成完整多轮工具循环（请求工具 → 回传结果 → 回答），业务逻辑零改动。跨供应商映射要点：`role="tool"` 映射为 user + `tool_result` 块（带 `tool_use_id`，driver 以 `_last_tool_call_id` 穿线关联）；`finish_reason` 归一化（`tool_use`→`tool_calls` 等）；`error_code` 限 snake_case 枚举白名单，防凭证随错误体回显。
+
 ## 4. Model Recipe
 
 一个 recipe 是角色组合，不是模型列表：
