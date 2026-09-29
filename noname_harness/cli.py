@@ -13,6 +13,7 @@ from .curator import CuratorService
 from .models import EvidenceInput, ModelCapability, ModelProfile
 from .recipes import DEFAULT_RECIPES, resolve_recipe
 from .router import Router
+from .ledger_view import build_ledger_model, render_ledger_html
 from .taste import TasteService
 from .taste_cards import TasteCardService
 from .store import HarnessStore, WorkspaceBoundaryError
@@ -92,6 +93,12 @@ def build_parser() -> argparse.ArgumentParser:
     ledger = sub.add_parser("ledger", parents=[_db_parent()], help="show recent events")
     ledger.add_argument("--session")
     ledger.add_argument("--limit", type=int, default=50)
+
+    ledger_html = sub.add_parser("ledger-html", parents=[_db_parent()], help="render the interactive ledger as an offline HTML page")
+    ledger_html.add_argument("--session")
+    ledger_html.add_argument("--limit", type=int, default=200)
+    ledger_html.add_argument("--out", required=True, help="output HTML file (inside the workspace)")
+    ledger_html.add_argument("--overwrite", action="store_true")
 
     search = sub.add_parser("search", parents=[_db_parent()], help="search event/evidence text")
     search.add_argument("query")
@@ -262,6 +269,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _print(store.list_proposals(pending_only=not args.all))
             elif args.command == "ledger":
                 _print([_event_dict(event) for event in store.list_events(args.session, args.limit)])
+            elif args.command == "ledger-html":
+                model = build_ledger_model(store, session_id=args.session, limit=args.limit)
+                html_text = render_ledger_html(model)
+                destination = store.validate_output_path(args.out)
+                if destination.exists() and not args.overwrite:
+                    raise FileExistsError(f"refusing to overwrite existing file: {destination}")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(html_text, encoding="utf-8")
+                _print({"path": str(destination), "events": model["counts"]["events"]})
             elif args.command == "search":
                 if args.semantic:
                     from .embeddings import local_hash_embedding
