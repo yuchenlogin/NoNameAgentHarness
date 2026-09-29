@@ -1,0 +1,44 @@
+# Changelog
+
+> 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
+
+## [0.4.0] - 2026-09-29
+
+### Features
+
+- 双时序（schema v4）：`state_revisions` 新增 `valid_from` / `valid_to`，把「事实在世界上何时为真」（valid time）与「系统何时知道」（recorded time）分成两个独立维度；`recorded_at` 仍由系统自动写入，valid 边界由审核人在 `review` 时通过 `--valid-from` / `--valid-to` 显式声明。
+- `retire` 即版本化失效：让一条状态失效是写入新的 revision 并可附带 `--valid-to` 记录它在世界上何时停止为真，而不是删除历史。
+- 审核收件箱：新增 `store.review_inbox()` 投影与 CLI `inbox` 命令，把待审法典候选（高层）、任务态候选（中层）和品味候选收拢成一张待办清单，每条附影响范围、来源事件、冲突引用和提出理由。
+
+### Design Rationale
+
+- **为什么区分 valid 与 recorded**：一条状态「何时成立」和「系统何时得知」经常不同步——一个约束可能上周就生效，今天才被记录；一个任务态可能昨天就已过时，今天才被失效。只记录 recorded time 会把这两个问题混为一谈，导致回放历史时无法回答「当时的世界是什么样」。valid time 是人对事实的判断，所以必须由审核人显式声明，系统不猜测。
+- **为什么收件箱是投影而非存储**：待审事项的全部信息（候选、来源、冲突、理由）已经存在于 append-only 表中；再存一份收件箱状态只会引入双写和一致性问题。收件箱完全由投影派生，可随时重建、可替换实现，自身不成为事实来源。这也让 docs/ledger.md 的「审核收件箱」从设计变成了同一份基座上的真实命令。
+
+### Notes & Caveats
+
+- schema 已到 v4；迁移链 v1→v2→v3→v4 每步幂等，每步有对应测试，旧库打开时自动逐级迁移。
+- `valid_from` / `valid_to` 是可选项：未声明时只表示「valid time 未知」，不影响既有行为；`valid_to` 早于 `valid_from` 会被存储层拒绝。
+- 收件箱是只读聚合视图，批量处理策略（低风险同质候选才可批量）尚未实现，当前全部逐条审核。
+
+## [0.3.0] - 2026-09-29
+
+### Features
+
+- 品味双轨层（schema v3）：新增 `noname_harness/taste.py`（TasteService）与 `taste_records` / `taste_reviews` 两张 append-only、版本化、带 supersedes 链的表。
+- 两条来源轨道：Authored（自述）写下即确认、立即激活，权威最高；Adopted（采纳）必须引用至少一个来源事件，始终以 `candidate` 进入，经显式 `adopt` 审核才激活。
+- 品味生命周期：`adopt / edit / pause / resume / retire`，每次审核写入不可变的审核记录，`edit` 产生取代旧版本的新记录。
+- 上下文包新增独立 `preference` section：标注 `influence: soft` 及约束说明，provenance 单独记录 `taste_ids`；品味不进入高、中、低任何事实层。
+- CLI 新增 `taste-add` / `taste-propose` / `taste-review` / `taste` 四个命令。
+
+### Design Rationale
+
+- **为什么品味必须独立成区**：品味影响的是态度——方案排序、表达风格、取舍偏好——而不是事实。把它混入事实层会让「我喜欢什么」和「什么是真的」在下游模型眼里变得不可区分，溯源也会断。独立 section 加显式 soft influence 标注，让新会话能正确加权：可以参考，但绝不当证据，也绝不降低验证标准。
+- **为什么 adopted 必须显式审核**：模型表现出的倾向只是观察，不是用户的立场。未经确认的倾向永远停留在 `candidate`，不能进入活跃品味层；只有用户显式 `adopt` 后它才生效，且永远标记为 `adopted`，不能伪装成用户自述。这条门槛保证品味层的每一条活跃记录都有明确的责任人。
+- **为什么品味层复用 append-only 与版本化**：纠正品味和纠正事实一样，应该是「写入新版本取代旧版本」，而不是抹掉历史。supersedes 链让品味的演进本身成为可回看的证据——这正是品味卡和未来复核体验的数据基础。
+
+### Notes & Caveats
+
+- 品味卡片、聚类、视觉生成仍未做：当前是纯文字记录的双轨 MVP，docs/taste-cards.md 描述的卡片与复核体验依赖后续的聚类与图像能力。
+- schema 迁移 v2→v3 为新增两张表，幂等且可测；不触及既有事件、证据与状态表。
+- authored 品味的来源事件为可选（用户本人即来源），但附上来历事件可让溯源更完整；adopted 的来源事件为强制。

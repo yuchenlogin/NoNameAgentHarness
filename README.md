@@ -14,7 +14,7 @@
 | [docs/runtime-architecture.md](docs/runtime-architecture.md) | 工程骨架：模型适配器、模型配方、工具注册表、会话日志、agent loop、插件运行时 |
 | [docs/ledger.md](docs/ledger.md) | 交互式账本：时间线、因果图、状态 diff 和审核收件箱 |
 | [docs/taste-cards.md](docs/taste-cards.md) | 品味双轨与多模态卡片：Authored Taste、Adopted Taste、复核与视觉风险 |
-| [docs/prototype.md](docs/prototype.md) | 本地最小原型：SQLite 事件/证据、分层状态、候选审核与接续包 |
+| [docs/prototype.md](docs/prototype.md) | 本地最小原型：SQLite 事件/证据、分层状态、候选审核、品味双轨、双时序与接续包 |
 | [site/index.html](site/index.html) | 产品介绍页（manifesto）。单文件、无依赖，双击即可在浏览器打开 |
 
 ## 原则速览
@@ -32,6 +32,8 @@
 原型使用 Python 标准库和 SQLite，不调用外部模型。它把一次真实的“算法改进后测试失败，再由新会话接手”的流程拆成：
 
 `append-only 事件/证据 → 高、中层候选审核 → 分层上下文包 → 新会话接管`
+
+在这条主线之外，品味双轨（自述即激活、采纳需显式审核）与双时序审核收件箱已作为同一基座上的 MVP 落地：品味只进入接续包的独立 preference section，收件箱是聚合投影而非存储。两者都不改变「本地最小原型」的定位。
 
 快速初始化：
 
