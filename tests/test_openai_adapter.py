@@ -130,7 +130,7 @@ def test_capability_and_cost_estimate():
     assert cap.tool_calling is True
     assert cap.context_window == 128_000
     cost = adapter.estimate_cost(_req("one two three"))
-    assert cost["input_tokens"] == 3
+    assert cost["estimated_input_words"] == 3
 
 
 def test_stream_matches_complete(monkeypatch):

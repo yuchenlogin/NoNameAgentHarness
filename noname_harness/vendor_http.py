@@ -17,7 +17,12 @@ import urllib.request
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
+import re
+
 from .adapters import ModelAdapterError
+
+# snake_case identifier shape for a trusted error enum token.
+_ERROR_CODE_SHAPE = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
 
 # A transport maps (url, headers, body_bytes, timeout) -> (status, response_bytes).
 Transport = Callable[[str, dict[str, str], bytes, float], tuple[int, bytes]]
@@ -106,12 +111,16 @@ def safe_error_ref(status: int, raw: bytes) -> dict[str, Any]:
     try:
         body = json.loads(raw.decode("utf-8"))
         error = body.get("error") if isinstance(body, dict) else None
+        code: Any = None
         if isinstance(error, dict):
             code = error.get("code") or error.get("type")
-            if code:
-                ref["error_code"] = str(code)[:100]
-        elif isinstance(body, dict) and body.get("type"):
-            ref["error_code"] = str(body["type"])[:100]
+        elif isinstance(body, dict):
+            code = body.get("type")
+        # An error_code is attacker-controlled text; only keep it if it looks
+        # like a known enum token (snake_case identifier), never free text that
+        # could carry a credential or attacker content into the ledger.
+        if isinstance(code, str) and _ERROR_CODE_SHAPE.match(code):
+            ref["error_code"] = code
     except (ValueError, UnicodeDecodeError):
         pass
     return ref
@@ -123,6 +132,31 @@ def safe_usage_ref(usage: Any) -> dict[str, int]:
     if not isinstance(usage, dict):
         return {}
     return {key: usage[key] for key in _USAGE_FIELDS if isinstance(usage.get(key), int)}
+
+
+def json_schema_type(type_name: str) -> str:
+    """Map a harness input-schema type name to a JSON-schema type."""
+
+    return {
+        "string": "string",
+        "number": "number",
+        "integer": "integer",
+        "boolean": "boolean",
+        "object": "object",
+        "array": "array",
+    }.get(type_name, "string")
+
+
+def word_count_cost(model_id: str, request: Any, currency: str = "usd") -> dict[str, Any]:
+    """A shared, honest cost estimate from word count (not real tokens)."""
+
+    input_words = sum(len(m.content.split()) for m in request.messages)
+    return {
+        "model_id": model_id,
+        "estimated_input_words": input_words,
+        "currency": currency,
+        "note": "estimate from word count, not real tokens; real cost from vendor usage in vendor_ref",
+    }
 
 
 def classify_http_status(status: int, raw: bytes) -> ModelAdapterError:

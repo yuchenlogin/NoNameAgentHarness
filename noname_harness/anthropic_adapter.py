@@ -36,6 +36,14 @@ _ENV_KEY = "ANTHROPIC_API_KEY"
 _ENV_BASE_URL = "ANTHROPIC_BASE_URL"
 _API_VERSION = "2023-06-01"
 
+# Anthropic stop_reason -> vendor-neutral finish_reason.
+_FINISH_REASON_MAP = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "tool_use": "tool_calls",
+    "max_tokens": "length",
+}
+
 
 @dataclass
 class AnthropicAdapter:
@@ -87,12 +95,29 @@ class AnthropicAdapter:
         for message in request.messages:
             if message.role == "system":
                 continue
-            role = "user" if message.role in {"user", "tool"} else "assistant"
-            messages.append({"role": role, "content": message.content})
+            if message.role == "tool":
+                # A tool result must be a tool_result content block inside a user
+                # message, carrying the tool_use_id it answers -- a bare user
+                # message is rejected by the real API (and breaks role
+                # alternation).  The id is threaded via message.name.
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": message.name or "unknown",
+                                "content": message.content,
+                            }
+                        ],
+                    }
+                )
+            else:
+                messages.append({"role": message.role, "content": message.content})
         payload: dict[str, Any] = {
             "model": self.model_id,
             "messages": messages,
-            "max_tokens": request.max_output_tokens or self.max_output_tokens,
+            "max_tokens": (request.max_output_tokens if request.max_output_tokens is not None else self.max_output_tokens),
         }
         if system_parts:
             payload["system"] = "\n".join(system_parts)
@@ -139,28 +164,32 @@ class AnthropicAdapter:
         return self._map_response(data, raw)
 
     def _map_response(self, data: dict[str, Any], raw: bytes) -> ModelResponse:
+        # Malformed (but valid-JSON) responses must fail inside the
+        # ModelAdapterError contract, not crash with AttributeError.
+        if not isinstance(data, dict):
+            raise ModelAdapterError(
+                "unknown",
+                "vendor returned a non-object response",
+                vendor_ref={"status": 200, "bytes": len(raw)},
+            )
         # Anthropic returns content as a list of blocks (text + tool_use).
         blocks = data.get("content") or []
         if not isinstance(blocks, list):
             raise ModelAdapterError(
                 "unknown", "vendor returned malformed content blocks", vendor_ref={"id": data.get("id")}
             )
-        text_parts = [b.get("text", "") for b in blocks if b.get("type") == "text"]
+        text_parts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
         tool_calls = tuple(
-            {
-                "name": b.get("name"),
-                "arguments": b.get("input") if isinstance(b.get("input"), dict) else {},
-                "id": b.get("id"),
-            }
+            self._map_tool_use(b, data)
             for b in blocks
-            if b.get("type") == "tool_use"
+            if isinstance(b, dict) and b.get("type") == "tool_use"
         )
-        usage = data.get("usage", {})
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
         return ModelResponse(
             text="\n".join(part for part in text_parts if part),
             tool_calls=tool_calls,
             model_id=data.get("model", self.model_id),
-            finish_reason=data.get("stop_reason") or "stop",
+            finish_reason=_FINISH_REASON_MAP.get(data.get("stop_reason"), "stop"),
             input_tokens=usage.get("input_tokens"),
             output_tokens=usage.get("output_tokens"),
             vendor_ref={
@@ -175,11 +204,29 @@ class AnthropicAdapter:
             },
         )
 
+    def _map_tool_use(self, block: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+        """Map one tool_use block, capping the input size (DoS guard)."""
+
+        input_value = block.get("input") if isinstance(block.get("input"), dict) else {}
+        import json as _json
+
+        if len(_json.dumps(input_value)) > 1_000_000:
+            raise ModelAdapterError(
+                "unknown",
+                "vendor tool_use input exceeds the 1MB limit",
+                vendor_ref={"id": data.get("id")},
+            )
+        return {
+            "name": block.get("name"),
+            "arguments": input_value,
+            "id": block.get("id"),
+        }
+
     def stream(self, request: ModelRequest) -> Iterator[StreamEvent]:
         response = self.complete(request)
-        if response.tool_calls:
-            yield StreamEvent(kind="tool_call", payload=response.tool_calls[0])
-        elif response.text:
+        for call in response.tool_calls:
+            yield StreamEvent(kind="tool_call", payload=call)
+        if not response.tool_calls and response.text:
             yield StreamEvent(kind="text_delta", text=response.text)
         yield StreamEvent(kind="completed", payload=response)
 

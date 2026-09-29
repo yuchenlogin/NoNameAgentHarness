@@ -234,6 +234,10 @@ class AdapterDriver:
         # Optional registry used to rehydrate approval token ids coming back
         # from the model into the exact ApprovalToken objects the gate honours.
         self.tool_registry = tool_registry
+        # The id of the tool call the model last requested, so the tool result
+        # can be correlated back to it on the next turn (required by APIs like
+        # Anthropic's tool_result block).
+        self._last_tool_call_id: str | None = None
 
     def act(self, context: dict[str, Any], last_tool_result: Any = None) -> Any:
         from .agent_loop import LoopResult
@@ -291,6 +295,7 @@ class AdapterDriver:
                 raise AgentLoopError(
                     "adapter supplied an unknown or consumed approval token id"
                 )
+        self._last_tool_call_id = call.get("id")
         return {
             "name": name,
             "arguments": arguments,
@@ -329,7 +334,9 @@ class AdapterDriver:
                 ModelMessage(
                     role="tool",
                     content=json.dumps(last_tool_result, ensure_ascii=False, default=str),
-                    name="last_tool_result",
+                    # Correlate the result to the tool call that produced it;
+                    # adapters that need a tool_use_id (Anthropic) use this name.
+                    name=self._last_tool_call_id or "last_tool_result",
                 )
             )
         # Surface the model-visible tool contracts (never the implementations).

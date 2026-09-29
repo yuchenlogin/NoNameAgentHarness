@@ -33,14 +33,16 @@ from .adapters import (
     StreamEvent,
 )
 from .models import ModelCapability
+from .vendor_http import _NoRedirectHandler  # re-exported for backwards-compatible imports
 from .vendor_http import (
     Transport,
     classify_http_status,
     classify_transport_error,
+    json_schema_type,
     safe_usage_ref,
     secure_transport,
     validate_base_url,
-    _NoRedirectHandler,
+    word_count_cost,
 )
 
 # A transport maps (url, headers, body_bytes, timeout) -> (status, response_bytes).
@@ -116,7 +118,7 @@ class OpenAIAdapter:
                         "parameters": {
                             "type": "object",
                             "properties": {
-                                name: {"type": _json_schema_type(t)}
+                                name: {"type": json_schema_type(t)}
                                 for name, t in tool.get("input_schema", {}).items()
                             },
                             "required": list(tool.get("input_schema", {}).keys()),
@@ -239,31 +241,14 @@ class OpenAIAdapter:
         # streaming is a vendor concern layered on the same contract; the
         # deterministic reference keeps stream == complete for auditability.
         response = self.complete(request)
-        if response.tool_calls:
-            yield StreamEvent(kind="tool_call", payload=response.tool_calls[0])
-        elif response.text:
+        for call in response.tool_calls:
+            yield StreamEvent(kind="tool_call", payload=call)
+        if not response.tool_calls and response.text:
             yield StreamEvent(kind="text_delta", text=response.text)
         yield StreamEvent(kind="completed", payload=response)
 
     def estimate_cost(self, request: ModelRequest) -> dict[str, Any]:
-        input_tokens = sum(len(m.content.split()) for m in request.messages)
-        return {
-            "model_id": self.model_id,
-            "input_tokens": input_tokens,
-            "currency": "usd",
-            "note": "estimate from word count; real cost from vendor usage in vendor_ref",
-        }
-
-
-def _json_schema_type(type_name: str) -> str:
-    return {
-        "string": "string",
-        "number": "number",
-        "integer": "integer",
-        "boolean": "boolean",
-        "object": "object",
-        "array": "array",
-    }.get(type_name, "string")
+        return word_count_cost(self.model_id, request)
 
 
 # ---------------------------------------------------------------------------
