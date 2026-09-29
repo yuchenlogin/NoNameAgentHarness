@@ -179,6 +179,13 @@ class AgentLoop:
 
         if self._state != "IDLE":
             raise AgentLoopError("run() may only be called from IDLE")
+        # If the driver records model.* events (e.g. an AdapterDriver) but was
+        # not given a store/session, inject the loop's own so every model call
+        # is audited without the caller wiring it twice.
+        if getattr(self.driver, "store", None) is None and hasattr(self.driver, "store"):
+            self.driver.store = self.store
+        if getattr(self.driver, "session_id", None) is None and hasattr(self.driver, "session_id"):
+            self.driver.session_id = self.session_id
         # Record the stop-condition configuration so a reconstructed loop can
         # read it back from the stream rather than relying on process state.
         self.store.append_event(

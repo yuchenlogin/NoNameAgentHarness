@@ -266,3 +266,46 @@ def test_parallel_tool_calls_are_rejected_loudly(tmp_path):
         assert "one tool call per turn" in summary["error"]
     finally:
         store.close()
+
+
+# --- 交付审计发现：model.* 事件覆盖 ---
+
+def test_model_calls_are_audited_in_ledger(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        adapter = LocalEchoAdapter(responder=lambda req: "answer")
+        driver = AdapterDriver(adapter)
+        loop = AgentLoop(store=store, session_id="s", driver=driver)
+        loop.run("task", task_type="question")
+        types = [e.event_type for e in store.list_events("s", limit=50)]
+        assert "model.requested" in types
+        assert "model.completed" in types
+        completed = next(e for e in store.list_events("s", limit=50) if e.event_type == "model.completed")
+        assert completed.payload["model_id"] == "local-echo"
+        assert "vendor_ref" in completed.payload
+    finally:
+        store.close()
+
+
+def test_model_failure_is_audited_with_classification(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        def boom(request):
+            raise ModelAdapterError("rate_limit", "slow down", vendor_ref={"status": 429})
+        driver = AdapterDriver(LocalEchoAdapter(responder=boom))
+        loop = AgentLoop(store=store, session_id="s", driver=driver)
+        loop.run("task")
+        failed = next(e for e in store.list_events("s", limit=50) if e.event_type == "model.failed")
+        assert failed.payload["error_class"] == "rate_limit"
+        assert failed.payload["retryable"] is True
+        assert failed.payload["vendor_ref"] == {"status": 429}
+    finally:
+        store.close()
+
+
+def test_driver_without_store_stays_audit_free(tmp_path):
+    # A driver used standalone (no store) must not require one.
+    adapter = LocalEchoAdapter(responder=lambda req: "x")
+    driver = AdapterDriver(adapter)  # no store
+    result = driver.act({"task": "t", "layers": {}})
+    assert result.task_complete is True

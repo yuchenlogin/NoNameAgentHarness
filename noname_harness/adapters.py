@@ -228,12 +228,20 @@ class AdapterDriver:
         *,
         system_prompt: str | None = None,
         tool_registry: Any = None,
+        store: Any = None,
+        session_id: str | None = None,
     ):
         self.adapter = adapter
         self.system_prompt = system_prompt
         # Optional registry used to rehydrate approval token ids coming back
         # from the model into the exact ApprovalToken objects the gate honours.
         self.tool_registry = tool_registry
+        # Optional store + session for recording model.* ledger events.  When
+        # present, every model call is audited (model.requested/completed/failed),
+        # closing the "model-visible content is reconstructible from the log"
+        # coverage gap for the most core behaviour of all.
+        self.store = store
+        self.session_id = session_id
         # The id of the tool call the model last requested, so the tool result
         # can be correlated back to it on the next turn (required by APIs like
         # Anthropic's tool_result block).
@@ -243,7 +251,7 @@ class AdapterDriver:
         from .agent_loop import LoopResult
 
         request = self._build_request(context, last_tool_result)
-        response = self.adapter.complete(request)
+        response = self._complete_with_audit(request)
         if response.tool_calls:
             if len(response.tool_calls) > 1:
                 # The loop is single-call-per-turn; parallel calls would be
@@ -301,6 +309,60 @@ class AdapterDriver:
             "arguments": arguments,
             "approval_token": approval_token,
         }
+
+    def _complete_with_audit(self, request: ModelRequest) -> ModelResponse:
+        """Call the adapter, recording model.* ledger events when a store is set.
+
+        This is the audit coverage for the most core behaviour: every model
+        call produces model.requested (with the vendor-neutral request shape,
+        never credentials) and either model.completed (with vendor_ref) or
+        model.failed (with error classification).  Without a store the driver
+        stays audit-free, as before.
+        """
+
+        if self.store is None or self.session_id is None:
+            return self.adapter.complete(request)
+
+        from .adapters import ModelAdapterError as _MAE
+
+        model_id = self.adapter.id()
+        self.store.append_event(
+            self.session_id,
+            "model.requested",
+            {
+                "model_id": model_id,
+                "message_count": len(request.messages),
+                "tool_count": len(request.tools),
+                "max_output_tokens": request.max_output_tokens,
+            },
+        )
+        try:
+            response = self.adapter.complete(request)
+        except _MAE as exc:
+            self.store.append_event(
+                self.session_id,
+                "model.failed",
+                {
+                    "model_id": model_id,
+                    "error_class": exc.error_class,
+                    "retryable": exc.retryable,
+                    "vendor_ref": exc.vendor_ref,
+                },
+            )
+            raise
+        self.store.append_event(
+            self.session_id,
+            "model.completed",
+            {
+                "model_id": response.model_id,
+                "finish_reason": response.finish_reason,
+                "tool_call_count": len(response.tool_calls),
+                "input_tokens": response.input_tokens,
+                "output_tokens": response.output_tokens,
+                "vendor_ref": response.vendor_ref,
+            },
+        )
+        return response
 
     def _build_request(
         self, context: dict[str, Any], last_tool_result: Any
