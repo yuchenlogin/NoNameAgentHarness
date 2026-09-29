@@ -186,19 +186,22 @@ def test_concurrent_reviews_do_not_fork_the_lineage(tmp_path):
     finally:
         store.close()
 
-    results = {"ok": 0, "rejected": 0}
+    results = {"ok": 0, "value_error": 0, "other": []}
     lock = threading.Lock()
 
     def reviewer():
-        nonlocal results
         try:
             with HarnessStore(db_path) as s:
                 TasteService(s).review(taste_id, "pause", "reviewer")
             with lock:
                 results["ok"] += 1
-        except (ValueError, sqlite3.OperationalError):
+        except ValueError:
+            # The designed serialisation path: the loser sees the head moved.
             with lock:
-                results["rejected"] += 1
+                results["value_error"] += 1
+        except Exception as exc:  # noqa: BLE001 - recorded to assert none occur
+            with lock:
+                results["other"].append(type(exc).__name__)
 
     threads = [threading.Thread(target=reviewer) for _ in range(4)]
     for t in threads:
@@ -206,8 +209,12 @@ def test_concurrent_reviews_do_not_fork_the_lineage(tmp_path):
     for t in threads:
         t.join()
 
-    # Exactly one review wins; the lineage has a single head, no fork.
+    # Exactly one review wins; every loser takes the *designed* ValueError path
+    # (not an IntegrityError crash from the unique index, which would mean the
+    # in-transaction re-check was absent).  No thread raises anything else.
     assert results["ok"] == 1
+    assert results["other"] == []
+    assert results["value_error"] == 3
     with HarnessStore(db_path) as s:
         heads = s.query(
             "SELECT id FROM taste_records WHERE id NOT IN "

@@ -11,6 +11,12 @@ def _inline(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
+def _single_line(text: str) -> str:
+    """Collapse whitespace/newlines so free text stays on one markdown line."""
+
+    return " ".join(str(text).split())
+
+
 def _fence_for(content: str) -> str:
     """Choose a Markdown fence longer than any backtick run in ``content``."""
 
@@ -32,7 +38,10 @@ def render_markdown(package: dict[str, Any]) -> str:
         "",
         f"- Project: `{project['name']}`",
         f"- Workspace: `{project['workspace_root']}`",
-        f"- Task: {package['task']}",
+        # The task is caller-supplied free text; collapse any newlines so it
+        # can never inject markdown structure (headings, lists) into the
+        # document header.  It is metadata, not content the model should parse.
+        f"- Task: {_single_line(package['task'])}",
         f"- Package: `{package['package_id']}`",
         "",
         "## High layer · stable project state",

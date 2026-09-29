@@ -188,7 +188,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 _print(proposal)
             elif args.command == "review":
-                edited = _json_value(args.edited_content) if args.edited_content else None
+                edited = _json_value(args.edited_content) if args.edited_content is not None else None
                 # valid bounds only make sense when a revision is written;
                 # silently dropping them on reject/defer would mislead the user.
                 if args.action in {"reject", "defer"} and (
@@ -277,7 +277,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             elif args.command == "taste-review":
                 service = TasteService(store)
-                edited = _json_value(args.edited_content) if args.edited_content else None
+                edited = _json_value(args.edited_content) if args.edited_content is not None else None
                 _print(
                     service.review(
                         args.taste_id,

@@ -64,7 +64,12 @@ class TasteService:
         """
 
         self._validate(scope=scope, track="authored")
-        if content is None or (isinstance(content, (str, dict, list)) and not content):
+        # Reject every falsy JSON value (None, "", 0, 0.0, False, {}, []) -- an
+        # "authored" attitude must be a substantive example or judgement, never
+        # an empty or degenerate value that would render as a meaningless
+        # preference.  Non-JSON primitives that are truthy (e.g. a bare number)
+        # are still better expressed as a structured judgement, but are stored.
+        if not content:
             raise ValueError("authored taste content cannot be empty")
         if source_event_ids:
             self.store.check_event_ids(source_event_ids)
@@ -96,6 +101,8 @@ class TasteService:
         """
 
         self._validate(scope=scope, track="adopted")
+        if not content:
+            raise ValueError("adopted taste content cannot be empty")
         if not source_event_ids:
             raise ValueError("adopted taste must cite at least one source event")
         self.store.check_event_ids(source_event_ids)
@@ -401,8 +408,21 @@ class TasteService:
                 "SELECT * FROM taste_records WHERE id = ?",
                 (current["supersedes_id"],),
             )
-            if parent is None or parent["id"] in seen:  # pragma: no cover - guarded by trigger
-                break
+            # The INSERT guard and unique-child index make a missing parent or a
+            # cycle structurally impossible on any database written since v5.
+            # If one is ever seen (a pre-v5 file, or manual tampering), the
+            # worst possible response is to silently truncate the audit trail --
+            # evidence must never quietly disappear.  Fail loudly instead.
+            if parent is None:
+                raise RuntimeError(
+                    f"taste lineage is broken: {current['id']} supersedes missing "
+                    f"record {current['supersedes_id']}"
+                )
+            if parent["id"] in seen:
+                raise RuntimeError(
+                    f"taste lineage contains a cycle at {parent['id']}; "
+                    "the database needs repair before it can be projected"
+                )
             seen.add(parent["id"])
             ids.append(parent["id"])
             current = parent

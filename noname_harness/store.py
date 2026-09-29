@@ -1158,6 +1158,24 @@ class HarnessStore:
         supersedes_id: str | None = None
         revision_status: str | None = None
         with self._transaction() as connection:
+            # Serialise concurrent reviewers under the write lock.  BEGIN
+            # IMMEDIATE takes the write lock before this re-read, so a reviewer
+            # always sees the latest committed decisions.  Repeating the *same*
+            # terminal action (accept/reject) on an already-decided proposal is
+            # rejected as a no-op conflict rather than silently re-written; the
+            # legitimate lifecycle transition accept -> retire stays allowed.
+            prior_actions = {
+                row["action"]
+                for row in connection.execute(
+                    "SELECT action FROM proposal_reviews WHERE proposal_id = ?",
+                    (proposal_id,),
+                ).fetchall()
+            }
+            if action in {"accept", "reject"} and prior_actions & {"accept", "reject"}:
+                raise ValueError(
+                    f"proposal {proposal_id} already has a decision "
+                    f"({sorted(prior_actions)}); refusing to overwrite it with '{action}'"
+                )
             connection.execute(
                 "INSERT INTO proposal_reviews "
                 "(id, proposal_id, action, reviewer_id, edited_content_json, reason, reviewed_at) "
@@ -1175,11 +1193,16 @@ class HarnessStore:
             if action in {"accept", "edit", "retire"}:
                 previous = self._latest_revision(proposal["layer"], proposal["logical_key"])
                 status = "retired" if action == "retire" else "active"
-                # Retiring invalidates a fact: unless the reviewer said when it
-                # stopped being true, close its valid interval at the review
-                # moment so as-of queries learn it is no longer current.
-                if action == "retire" and valid_to is None:
-                    valid_to = reviewed_at
+                if action == "retire":
+                    # Retiring invalidates a fact: close its valid interval at
+                    # the review moment (unless the reviewer said when it
+                    # stopped being true), and inherit the predecessor's
+                    # valid_from so the retired revision still records when the
+                    # fact had been true.  An explicit --valid-from wins.
+                    if valid_to is None:
+                        valid_to = reviewed_at
+                    if valid_from is None and previous is not None:
+                        valid_from = previous["valid_from"]
                 revision_id = _id("stt")
                 supersedes_id = previous["id"] if previous else None
                 revision_status = status
