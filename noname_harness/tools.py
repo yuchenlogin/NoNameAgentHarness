@@ -2,52 +2,53 @@
 
 A tool has two faces that never mix:
 
-- the **model-visible surface** (name, description, input schema, output
-  contract) -- what a model is allowed to see and request;
-- the **host execution surface** (the callable, timeout, permission level,
-  approval policy) -- what the host will actually do, and under what guard.
+- the **model-visible surface** (name, description, input schema) -- what a
+  model is allowed to see and request;
+- the **host execution surface** (the callable, permission level, approval
+  policy, scope) -- what the host will actually do, and under what guard.
 
-The execution pipeline is fixed and non-negotiable::
+The pipeline is::
 
-    validate -> policy -> approval -> execute -> normalize -> log -> present
+    validate -> approval -> execute -> log -> return
 
-Approval is a physical gate, not a suggestion: a tool whose policy requires
-approval *cannot* execute until approval is granted in the ledger.  This is
-enforced in code ("physically impossible to run unapproved"), never delegated
-to a model's discretion.
+**Approval is a physical gate backed by the ledger, not a caller-supplied
+boolean.**  A gated tool cannot execute until a one-time approval token is
+presented.  Tokens are minted by :meth:`ToolRegistry.grant_approval` -- the
+*approver's* path, which writes ``tool.approval_granted`` -- and are bound to
+``(tool name, canonical hash of arguments, approver)`` and single-use.  The
+executor never marks its own homework: it verifies the token against the
+in-memory grant set (itself derived from ledger events) and records
+``tool.approved`` only as a *reference* to a prior grant.
 
-Tools register under a scope (``global`` / ``agent`` / ``session``).  A
-narrower scope may shadow a wider one, but the shadowing is always recorded in
-the ledger.  Unloading a tool must release everything it holds.
+Two further hard rules make the gate structural rather than advisory:
+
+- **Monotonic shadowing**: a same-name registration may never weaken the
+  permission or approval requirement of the tool it shadows, and a narrower
+  scope may not be shadowed by a wider one.
+- **No subclassing for registration**: only exact :class:`Tool` instances can
+  be registered, so the approval gate cannot be overridden away.
 
 This module is the contract and pipeline skeleton.  It executes only the
-callables a host explicitly registers; it provides no network, shell or file
+callables a host explicitly registers and provides no shell, network or file
 side effects of its own (those belong to the Execution World layer, validated
 separately).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
 
-from .store import HarnessStore, _id, _json, _now
+from .store import HarnessStore
 
 VALID_TOOL_SCOPES = {"global", "agent", "session"}
-# Permission levels, ordered by risk.  A tool's level decides whether approval
-# is mandatory before execution.
 PERMISSION_LEVELS = {"read", "write", "destructive"}
-# Approval policies.
-#   "never"    -- safe to run without approval (read-only by contract);
-#   "always"   -- must be approved every single time before running;
-#   "on_write" -- approved unless the tool is read-level (default for write+).
-VALID_APPROVAL_POLICIES = {"never", "always", "on_write"}
-
-# A type the registry uses to reject obviously invalid tool input before any
-# host code runs.  It is deliberately small: the contract layer validates shape,
-# not semantics.
-_JSON_SCALARS = (str, int, float, bool, type(None))
+# Ordered weakest -> strongest so shadowing monotonicity can be enforced.
+_PERMISSION_RANK = {"read": 0, "write": 1, "destructive": 2}
+VALID_APPROVAL_POLICIES = {"never", "always"}
+_SCOPE_RANK = {"global": 0, "agent": 1, "session": 2}
 
 
 class ToolError(Exception):
@@ -55,15 +56,15 @@ class ToolError(Exception):
 
 
 class ToolValidationError(ToolError):
-    """Input failed schema validation before policy/approval/execution."""
+    """Input failed schema validation before approval/execution."""
 
 
 class ToolApprovalRequired(ToolError):
-    """The tool cannot execute until approval is granted."""
+    """The tool cannot execute until a valid approval token is presented."""
 
 
-class ToolPermissionError(ToolError):
-    """The tool's permission level forbids the requested operation."""
+class ToolShadowingError(ToolError):
+    """A registration tried to weaken or mis-scope an existing tool."""
 
 
 @dataclass(frozen=True)
@@ -72,10 +73,7 @@ class ToolSchema:
 
     name: str
     description: str
-    # A JSON-schema-ish mapping of parameter name -> expected json type name
-    # ("string", "number", "integer", "boolean", "object", "array").
     input_schema: dict[str, str]
-    output_contract: str = "json"
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -86,14 +84,20 @@ class ToolSchema:
 
 @dataclass(frozen=True)
 class Tool:
-    """A registered tool: model-visible surface plus host execution surface."""
+    """A registered tool: model-visible surface plus host execution surface.
+
+    ``approval`` is binary: ``never`` (read-only by contract, runs freely) or
+    ``always`` (must be approved for every call).  ``permission`` describes the
+    risk level; a destructive tool must always require approval.
+    """
 
     schema: ToolSchema
     execute: Callable[[dict[str, Any]], Any]
     permission: str = "read"
-    approval: str = "on_write"
-    timeout_seconds: float = 30.0
+    approval: str = "never"
     scope: str = "global"
+    # Optional session binding for session-scoped tools.
+    session_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.permission not in PERMISSION_LEVELS:
@@ -102,27 +106,16 @@ class Tool:
             raise ValueError(f"invalid approval policy: {self.approval}")
         if self.scope not in VALID_TOOL_SCOPES:
             raise ValueError(f"invalid tool scope: {self.scope}")
-        if self.timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
         if not callable(self.execute):
             raise ValueError("execute must be callable")
-        # A read-permission tool must never require write approval; conversely
-        # a destructive tool must always require approval.  These are guard
-        # rails on the *declaration*, enforced before any registration.
         if self.permission == "destructive" and self.approval != "always":
             raise ValueError("destructive tools must use approval='always'")
-        if self.permission == "read" and self.approval == "always":
-            # Allowed but unusual; nothing to enforce here.
-            pass
+        if self.scope == "session" and not (self.session_id and self.session_id.strip()):
+            raise ValueError("session-scoped tools must declare session_id")
 
     @property
     def requires_approval(self) -> bool:
-        if self.approval == "always":
-            return True
-        if self.approval == "never":
-            return False
-        # on_write: only write/destructive tools need approval.
-        return self.permission in {"write", "destructive"}
+        return self.approval == "always"
 
     def visible_surface(self) -> dict[str, Any]:
         """What a model is allowed to see.  Implementation is never exposed."""
@@ -131,28 +124,54 @@ class Tool:
             "name": self.schema.name,
             "description": self.schema.description,
             "input_schema": dict(self.schema.input_schema),
-            "output_contract": self.schema.output_contract,
         }
+
+
+def _canonical_arguments(arguments: dict[str, Any]) -> str:
+    """A stable canonical form for binding approvals to exact arguments."""
+
+    return json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _arguments_hash(arguments: dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_arguments(arguments).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class ApprovalToken:
+    """A one-time, call-bound approval grant.  Verified, never self-asserted."""
+
+    id: str
+    tool_name: str
+    arguments_hash: str
+    approver_id: str
+    granted_at: str
 
 
 @dataclass
 class ToolRegistry:
-    """A scoped registry.  Narrower scopes shadow wider ones, audibly."""
+    """A scoped registry with a ledger-backed approval gate."""
 
     store: HarnessStore
     _tools: dict[str, Tool] = field(default_factory=dict)
+    # Live (unconsumed) approval tokens, keyed by token id.  Rebuilt from the
+    # ledger's tool.approval_granted events, so a grant is verifiable.
+    _grants: dict[str, ApprovalToken] = field(default_factory=dict)
 
+    # ------------------------------------------------------------------
+    # registration
+    # ------------------------------------------------------------------
     def register(self, tool: Tool) -> dict[str, Any]:
+        # The gate must not be overridable: only exact Tool instances register.
+        if type(tool) is not Tool:
+            raise ToolError("only exact Tool instances can be registered")
         name = tool.schema.name
         shadowed = self._tools.get(name)
-        self._tools[name] = tool
-        result = {
-            "registered": name,
-            "scope": tool.scope,
-            "shadowed": None,
-        }
         if shadowed is not None:
-            # Shadowing is legal but must never be silent.
+            self._check_shadowing(shadowed, tool)
+        self._tools[name] = tool
+        result = {"registered": name, "scope": tool.scope, "shadowed": None}
+        if shadowed is not None:
             result["shadowed"] = {"scope": shadowed.scope, "permission": shadowed.permission}
             self.store.append_event(
                 "system",
@@ -160,6 +179,7 @@ class ToolRegistry:
                 {
                     "name": name,
                     "new_scope": tool.scope,
+                    "new_permission": tool.permission,
                     "previous_scope": shadowed.scope,
                     "previous_permission": shadowed.permission,
                 },
@@ -172,34 +192,107 @@ class ToolRegistry:
                 "scope": tool.scope,
                 "permission": tool.permission,
                 "approval": tool.approval,
+                "session_id": tool.session_id,
                 "shadowed": result["shadowed"],
             },
         )
         return result
 
+    @staticmethod
+    def _check_shadowing(old: Tool, new: Tool) -> None:
+        """A shadowing registration may never weaken the gate or mis-scope.
+
+        - scope monotonicity: a wider scope may not shadow a narrower one;
+        - permission monotonicity: the new tool's risk may not be lower;
+        - approval monotonicity: the new tool may not drop a required approval.
+        """
+
+        if _SCOPE_RANK[new.scope] < _SCOPE_RANK[old.scope]:
+            raise ToolShadowingError(
+                f"a {new.scope}-scoped tool cannot shadow a {old.scope}-scoped tool"
+            )
+        if _PERMISSION_RANK[new.permission] < _PERMISSION_RANK[old.permission]:
+            raise ToolShadowingError(
+                f"cannot shadow {old.permission} tool with lower-risk {new.permission} tool"
+            )
+        if old.requires_approval and not new.requires_approval:
+            raise ToolShadowingError(
+                "cannot shadow an approval-gated tool with one that needs no approval"
+            )
+
     def unregister(self, name: str) -> bool:
         tool = self._tools.pop(name, None)
         if tool is None:
             return False
-        # Unloading must release anything the tool held.  The contract layer
-        # drops the reference; a tool that holds timers/listeners must expose
-        # its own ``close`` and is invoked here if present.
-        close = getattr(tool.execute, "close", None)
-        if callable(close):
-            close()
-        self.store.append_event("system", "tool.unregistered", {"name": name, "scope": tool.scope})
+        self.store.append_event(
+            "system", "tool.unregistered", {"name": name, "scope": tool.scope}
+        )
         return True
 
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 
-    def visible_tools(self) -> list[dict[str, Any]]:
-        """The model-visible surface of every registered tool."""
+    def visible_tools(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        """The model-visible surface a given session is allowed to see.
 
-        return [tool.visible_surface() for tool in self._tools.values()]
+        Session-scoped tools are visible only to their own session; wider
+        scopes are visible to all.  This is what makes scope real rather than
+        decorative.
+        """
 
-    # -- execution pipeline ------------------------------------------------
+        visible = []
+        for tool in self._tools.values():
+            if tool.scope == "session" and tool.session_id != session_id:
+                continue
+            visible.append(tool.visible_surface())
+        return visible
 
+    # ------------------------------------------------------------------
+    # approval (the approver's path)
+    # ------------------------------------------------------------------
+    def grant_approval(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        approver_id: str,
+        session_id: str,
+    ) -> ApprovalToken:
+        """Mint a one-time approval token for an exact call.  Writes the grant.
+
+        This is the only path that may authorise a gated call.  The grant is
+        recorded in the ledger by the approver, never by the executor.
+        """
+
+        tool = self._tools.get(name)
+        if tool is None:
+            raise ToolError(f"unknown tool: {name}")
+        if not approver_id.strip():
+            raise ValueError("approver_id cannot be empty")
+        token = ApprovalToken(
+            id=f"apr_{hashlib.sha256(_canonical_arguments(arguments).encode('utf-8')).hexdigest()[:16]}"
+               f"_{len(self._grants)}",
+            tool_name=name,
+            arguments_hash=_arguments_hash(arguments),
+            approver_id=approver_id,
+            granted_at=self._now(),
+        )
+        self._grants[token.id] = token
+        self.store.append_event(
+            session_id,
+            "tool.approval_granted",
+            {
+                "token_id": token.id,
+                "name": name,
+                "arguments_hash": token.arguments_hash,
+                "approver_id": approver_id,
+            },
+        )
+        return token
+
+    # ------------------------------------------------------------------
+    # execution pipeline
+    # ------------------------------------------------------------------
     def _validate_input(self, tool: Tool, arguments: dict[str, Any]) -> None:
         if not isinstance(arguments, dict):
             raise ToolValidationError("tool arguments must be an object")
@@ -222,7 +315,6 @@ class ToolRegistry:
             py_type = type_map.get(expected)
             if py_type is None:
                 raise ToolValidationError(f"unknown schema type for {param}: {expected}")
-            # bool is a subclass of int; keep integer/number honest.
             if expected in {"integer", "number"} and isinstance(value, bool):
                 raise ToolValidationError(f"argument {param} must be {expected}, got boolean")
             if not isinstance(value, py_type):
@@ -236,77 +328,141 @@ class ToolRegistry:
         arguments: dict[str, Any],
         *,
         session_id: str,
-        approved: bool = False,
+        approval_token: ApprovalToken | None = None,
         actor_id: str = "model",
     ) -> dict[str, Any]:
-        """Run the fixed pipeline for a tool call.
+        """Run the pipeline for a tool call.  Every outcome is logged.
 
-        Every stage transition is logged.  A tool requiring approval raises
-        :class:`ToolApprovalRequired` *before* execution unless ``approved`` is
-        true; approval must therefore be granted out-of-band (and recorded)
-        before a gated call can proceed.
+        A gated tool executes only when presented a valid, unconsumed approval
+        token bound to this exact call's arguments.  There is no boolean to
+        self-assert; the token must have been minted by ``grant_approval``.
         """
 
         tool = self._tools.get(name)
         if tool is None:
             raise ToolError(f"unknown tool: {name}")
+        # Scope enforcement: a session-scoped tool runs only for its session.
+        if tool.scope == "session" and tool.session_id != session_id:
+            raise ToolError(f"tool '{name}' is not available in this session")
 
-        requested_at = _now()
+        # Record the request with an arguments *hash*, not the raw content: a
+        # not-yet-approved gated call must not persist model-controlled content
+        # into the append-only ledger.
         self.store.append_event(
             session_id,
             "tool.requested",
             {
                 "name": name,
-                "arguments": arguments,
+                "arguments_hash": _arguments_hash(arguments),
                 "actor_id": actor_id,
                 "scope": tool.scope,
                 "permission": tool.permission,
+                "gated": tool.requires_approval,
             },
         )
 
         # validate
-        self._validate_input(tool, arguments)
-
-        # policy + approval: a physical gate.
-        if tool.requires_approval and not approved:
+        try:
+            self._validate_input(tool, arguments)
+        except ToolValidationError as exc:
             self.store.append_event(
                 session_id,
-                "tool.approval_required",
-                {"name": name, "permission": tool.permission, "actor_id": actor_id},
+                "tool.validation_failed",
+                {"name": name, "error": str(exc), "actor_id": actor_id},
             )
-            raise ToolApprovalRequired(
-                f"tool '{name}' (permission={tool.permission}) requires approval before execution"
-            )
+            raise
+
+        # approval: verify a ledger-backed, call-bound, single-use token.
         if tool.requires_approval:
-            self.store.append_event(
-                session_id,
-                "tool.approved",
-                {"name": name, "permission": tool.permission, "actor_id": actor_id},
-            )
+            token = self._verify_approval(tool, arguments, approval_token, session_id, actor_id)
+        else:
+            token = None
 
-        # execute -> normalize -> log
+        # execute -> log
+        import time
+
+        started = time.monotonic()
         try:
             raw = tool.execute(arguments)
-        except ToolError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - normalised into a ledger event
+        except Exception as exc:  # noqa: BLE001 - every failure is logged
             self.store.append_event(
                 session_id,
                 "tool.failed",
                 {"name": name, "error": str(exc), "actor_id": actor_id},
             )
             raise ToolError(f"tool '{name}' failed: {exc}") from exc
+        elapsed_ms = int((time.monotonic() - started) * 1000)
 
-        result = {"name": name, "output": raw, "output_contract": tool.schema.output_contract}
+        result = {"name": name, "output": raw}
         self.store.append_event(
             session_id,
             "tool.completed",
             {
                 "name": name,
                 "actor_id": actor_id,
-                "output_contract": tool.schema.output_contract,
-                "duration_note": "synchronous",
+                "elapsed_ms": elapsed_ms,
+                "approval_token_id": token.id if token else None,
             },
         )
-        # present: the normalized, model-safe result.
         return result
+
+    def _verify_approval(
+        self,
+        tool: Tool,
+        arguments: dict[str, Any],
+        token: ApprovalToken | None,
+        session_id: str,
+        actor_id: str,
+    ) -> ApprovalToken:
+        name = tool.schema.name
+        if token is None:
+            self.store.append_event(
+                session_id,
+                "tool.approval_required",
+                {"name": name, "permission": tool.permission, "actor_id": actor_id},
+            )
+            raise ToolApprovalRequired(
+                f"tool '{name}' (permission={tool.permission}) requires an approval token"
+            )
+        live = self._grants.get(token.id)
+        arguments_hash = _arguments_hash(arguments)
+        if (
+            live is None
+            or live.tool_name != name
+            or live.arguments_hash != arguments_hash
+        ):
+            self.store.append_event(
+                session_id,
+                "tool.approval_rejected",
+                {
+                    "name": name,
+                    "token_id": token.id,
+                    "reason": "invalid, consumed, or argument-mismatched token",
+                    "actor_id": actor_id,
+                },
+            )
+            raise ToolApprovalRequired(
+                f"approval token for '{name}' is invalid, consumed, or bound to different arguments"
+            )
+        # Single-use: consume the token so it cannot authorise a second call.
+        del self._grants[token.id]
+        self.store.append_event(
+            session_id,
+            "tool.approved",
+            {
+                "name": name,
+                "token_id": token.id,
+                "approver_id": live.approver_id,
+                "actor_id": actor_id,
+            },
+        )
+        return live
+
+    # ------------------------------------------------------------------
+    # internals
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _now() -> str:
+        from datetime import datetime, timezone
+
+        return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
