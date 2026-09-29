@@ -23,13 +23,16 @@ from .models import EvidenceInput, Event, ModelProfile
 from .workspace import git_snapshot
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 VALID_LAYERS = {"high", "mid"}
 VALID_REVIEW_ACTIONS = {"accept", "reject", "edit", "defer", "retire"}
 VALID_TASTE_TRACKS = {"authored", "adopted"}
 VALID_TASTE_SCOPES = {"user", "project"}
 VALID_TASTE_STATUSES = {"candidate", "active", "paused", "retired"}
 VALID_TASTE_ACTIONS = {"adopt", "edit", "pause", "resume", "retire"}
+VALID_CARD_TRACKS = {"authored", "adopted", "mixed"}
+VALID_CARD_STATUSES = {"candidate", "active", "paused", "retired"}
+VALID_CARD_ACTIONS = {"accept", "edit", "pause", "resume", "retire", "split"}
 
 # INSERT-boundary guards for supersede chains, shared by the initial schema and
 # the v4 -> v5 migration so both paths stay byte-for-byte identical.
@@ -41,6 +44,15 @@ BEGIN
     SELECT RAISE(ABORT, 'supersede target must be an existing, different taste record')
     WHERE NEW.supersedes_id = NEW.id
        OR NOT EXISTS (SELECT 1 FROM taste_records WHERE id = NEW.supersedes_id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS taste_cards_supersede_guard
+BEFORE INSERT ON taste_cards
+WHEN NEW.supersedes_id IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'supersede target must be an existing, different taste card')
+    WHERE NEW.supersedes_id = NEW.id
+       OR NOT EXISTS (SELECT 1 FROM taste_cards WHERE id = NEW.supersedes_id);
 END;
 
 CREATE TRIGGER IF NOT EXISTS state_revisions_supersede_guard
@@ -235,6 +247,27 @@ class HarnessStore:
             SELECT RAISE(ABORT, 'project metadata is append-only');
         END;
 
+        CREATE TABLE IF NOT EXISTS taste_cards (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            attitude TEXT NOT NULL,
+            track TEXT NOT NULL CHECK (track IN ('authored', 'adopted', 'mixed')),
+            scope TEXT NOT NULL CHECK (scope IN ('user', 'project')),
+            taste_ids_json TEXT NOT NULL,
+            representative_evidence_json TEXT NOT NULL,
+            tensions TEXT,
+            influence TEXT,
+            image_json TEXT,
+            status TEXT NOT NULL CHECK (status IN ('candidate', 'active', 'paused', 'retired')),
+            valid_from TEXT,
+            valid_to TEXT,
+            last_confirmed_at TEXT NOT NULL,
+            supersedes_id TEXT REFERENCES taste_cards(id),
+            origin TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            recorded_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS taste_records (
             id TEXT PRIMARY KEY,
             track TEXT NOT NULL CHECK (track IN ('authored', 'adopted')),
@@ -327,6 +360,18 @@ class HarnessStore:
 
         CREATE UNIQUE INDEX IF NOT EXISTS taste_records_one_child_per_parent
             ON taste_records(supersedes_id) WHERE supersedes_id IS NOT NULL;
+
+        CREATE TRIGGER IF NOT EXISTS taste_cards_append_only_update
+        BEFORE UPDATE ON taste_cards
+        BEGIN
+            SELECT RAISE(ABORT, 'taste_cards is append-only');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS taste_cards_append_only_delete
+        BEFORE DELETE ON taste_cards
+        BEGIN
+            SELECT RAISE(ABORT, 'taste_cards is append-only');
+        END;
 
         CREATE TRIGGER IF NOT EXISTS taste_records_append_only_update
         BEFORE UPDATE ON taste_records
@@ -428,6 +473,12 @@ class HarnessStore:
                     # step only needs to run them idempotently.
                     self._connection.executescript(_SUPERSEDE_GUARD_SQL)
                     current_version = 5
+                if current_version == 5:
+                    # v6 introduces taste cards (taste_cards).  The table and
+                    # append-only triggers come from the shared schema via
+                    # CREATE ... IF NOT EXISTS; the supersede guard is in the
+                    # shared guard script.  Only the version bump is durable here.
+                    current_version = 6
                 if current_version != SCHEMA_VERSION:  # pragma: no cover - defensive
                     raise RuntimeError(
                         f"Unsupported schema version {current_version}; expected {SCHEMA_VERSION}"

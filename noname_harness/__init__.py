@@ -3,6 +3,7 @@
 from .models import EvidenceInput, Event
 from .curator import CuratorService
 from .taste import TasteService
+from .taste_cards import TasteCardService
 from .agent_loop import AgentLoop, AgentLoopError, LoopResult, SessionDriver
 from .tools import (
     ApprovalToken,
@@ -24,6 +25,7 @@ __all__ = [
     "LoopResult",
     "SessionDriver",
     "TasteService",
+    "TasteCardService",
     "ApprovalToken",
     "Tool",
     "ToolApprovalRequired",

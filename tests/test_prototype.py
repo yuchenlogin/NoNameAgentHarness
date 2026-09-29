@@ -379,7 +379,7 @@ def test_schema_v1_is_migrated_through_the_chain_to_latest(tmp_path):
         ).fetchone()["value"]
         assert "proposal_reason" in columns
         # A v1 database is upgraded step by step to the current version.
-        assert version == "5"
+        assert version == "6"
         # The taste layer introduced by v3 exists after the migration.
         taste_tables = {
             row["name"]
@@ -387,7 +387,7 @@ def test_schema_v1_is_migrated_through_the_chain_to_latest(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'taste_%'"
             )
         }
-        assert taste_tables == {"taste_records", "taste_reviews"}
+        assert taste_tables == {"taste_records", "taste_reviews", "taste_cards"}
     finally:
         store.close()
 

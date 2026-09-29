@@ -93,7 +93,7 @@ def test_real_v3_database_migrates_without_losing_data(tmp_path):
         version = store.query_one(
             "SELECT value FROM harness_meta WHERE key = 'schema_version'"
         )["value"]
-        assert version == "5"
+        assert version == "6"
 
         # Bitemporal columns were added to existing rows (NULL bounds).
         columns = {row["name"] for row in store.query("PRAGMA table_info(state_revisions)")}
