@@ -29,18 +29,23 @@ from .store import HarnessStore
 from .taste import TasteService
 from .taste_cards import TasteCardService
 
-# Event types that are high-signal timeline nodes (low-level work noise like
-# file.read / loop.transition bookkeeping is folded into an expandable group).
-_HIGH_SIGNAL = {
-    "project.goal", "project.constraint", "decision.accepted",
-    "task.updated", "task.blocked", "task.progress", "phase.updated",
-    "memory.proposed", "memory.reviewed",
-    "taste.proposed", "taste.reviewed", "taste.card.generated", "taste.card.reviewed",
-    "tool.approval_required", "tool.approved", "tool.approval_granted", "tool.failed",
-    "route.selected", "model.failed", "loop.finished", "loop.error",
-    "plugin.loaded", "plugin.unloaded",
-    "test.failed", "artifact.changed",
+# Event types that are LOW-signal bookkeeping, folded into an expandable group
+# by default.  The fold set is *inverted* (an explicit low-signal allowlist, not
+# a high-signal one): any new event type is visible by default, so the ledger
+# fails open toward showing things rather than silently hiding a future
+# high-signal event.  These are the types that describe machinery, not work.
+_LOW_SIGNAL_PREFIXES = ("loop.", "plugin.build_")
+_LOW_SIGNAL_EXACT = {
+    "file.read", "workspace.snapshot", "model.requested", "model.completed",
+    "tool.requested", "tool.completed", "tool.registered", "tool.unregistered",
+    "tool.shadowed", "test.passed", "test.completed", "context.assembled",
 }
+
+
+def _is_low_signal(event_type: str) -> bool:
+    if event_type in _LOW_SIGNAL_EXACT:
+        return True
+    return any(event_type.startswith(prefix) for prefix in _LOW_SIGNAL_PREFIXES)
 
 _TYPE_LABELS = {
     "project": "法典", "decision": "决策", "task": "任务", "phase": "阶段",
@@ -55,16 +60,26 @@ def _type_group(event_type: str) -> str:
     return _TYPE_LABELS.get(prefix, "其它")
 
 
-def build_ledger_model(store: HarnessStore, *, session_id: str | None = None, limit: int = 200) -> dict[str, Any]:
-    """Assemble the ledger view-model from the store (a pure projection)."""
+def build_ledger_model(
+    store: HarnessStore, *, session_id: str | None = None, limit: int | None = None
+) -> dict[str, Any]:
+    """Assemble the ledger view-model from the store (a pure projection).
 
-    events = store.list_events(session_id=session_id, limit=limit)
+    ``limit=None`` (the default) shows the full history; the page is static, so
+    there is no incremental-load reason to cap it.  When a limit *is* given the
+    model records that the timeline is truncated, so the page can say so
+    honestly instead of implying a complete history.
+    """
+
+    fetch_limit = limit if limit is not None else 1_000_000
+    events = store.list_events(session_id=session_id, limit=fetch_limit)
+    truncated = limit is not None and len(events) >= limit
     # list_events is newest-first; present oldest-first for a timeline.
     timeline = []
     folded = 0
     for event in reversed(events):
-        high = event.event_type in _HIGH_SIGNAL
-        if not high:
+        low = _is_low_signal(event.event_type)
+        if low:
             folded += 1
         timeline.append(
             {
@@ -73,7 +88,7 @@ def build_ledger_model(store: HarnessStore, *, session_id: str | None = None, li
                 "group": _type_group(event.event_type),
                 "occurred_at": event.occurred_at,
                 "session_id": event.session_id,
-                "high_signal": high,
+                "high_signal": not low,
                 "payload": event.payload,
                 "id": event.id,
             }
@@ -81,7 +96,6 @@ def build_ledger_model(store: HarnessStore, *, session_id: str | None = None, li
 
     inbox = store.review_inbox()
     taste = TasteService(store)
-    cards = TasteCardService(store)
     active_taste = taste.active()
     state = {
         "high": store.active_state("high"),
@@ -93,12 +107,11 @@ def build_ledger_model(store: HarnessStore, *, session_id: str | None = None, li
         "session_id": session_id,
         "timeline": timeline,
         "folded_low_signal": folded,
+        "truncated": truncated,
+        "limit": limit,
         "inbox": inbox,
         "state": state,
-        "taste": {
-            "active": active_taste,
-            "cards": cards.by_status("active") + cards.by_status("candidate"),
-        },
+        "taste": {"active": active_taste},
         "counts": {
             "events": len(timeline),
             "pending_total": inbox["counts"]["total"],
@@ -116,22 +129,39 @@ def render_ledger_html(model: dict[str, Any]) -> str:
     def esc(value: Any) -> str:
         return html.escape(json.dumps(value, ensure_ascii=False, sort_keys=True) if not isinstance(value, str) else value)
 
-    # Timeline nodes.
+    # Timeline nodes.  High-signal nodes are always shown; low-signal nodes are
+    # folded into a <details> group the user can expand (progressive disclosure,
+    # not deletion).  Attribute interpolations are escaped with quote=True.
+    def seq_label(node: dict[str, Any]) -> str:
+        # seq is per-session; in the all-sessions view a bare #seq would imply
+        # a global ordering that does not exist, so prefix the session.
+        if model["session_id"] is None:
+            return f'{html.escape(node["session_id"])}#{node["seq"]}'
+        return f'#{node["seq"]}'
+
     timeline_rows = []
+    low_rows = []
     for node in model["timeline"]:
-        if not node["high_signal"]:
-            continue
         payload_text = esc(node["payload"])
         if len(payload_text) > 220:
             payload_text = payload_text[:220] + "…"
-        timeline_rows.append(
-            f'<li class="node g-{node["group"]}">'
-            f'<span class="seq">#{node["seq"]}</span>'
-            f'<span class="badge">{html.escape(node["group"])}</span>'
-            f'<span class="etype">{html.escape(node["event_type"])}</span>'
-            f'<span class="time">{html.escape(node["occurred_at"])}</span>'
+        row = (
+            f'<li class="node">'
+            f'<span class="seq">{seq_label(node)}</span>'
+            f'<span class="badge">{html.escape(node["group"], quote=True)}</span>'
+            f'<span class="etype">{html.escape(node["event_type"], quote=True)}</span>'
+            f'<span class="time">{html.escape(node["occurred_at"], quote=True)}</span>'
             f'<div class="payload">{payload_text}</div>'
             f"</li>"
+        )
+        if node["high_signal"]:
+            timeline_rows.append(row)
+        else:
+            low_rows.append(row)
+    if low_rows:
+        timeline_rows.append(
+            f'<li class="node low-fold"><details><summary>展开 {len(low_rows)} 条低层簿记事件'
+            f"</summary><ul>{''.join(low_rows)}</ul></details></li>"
         )
 
     # Inbox cards.
@@ -156,6 +186,11 @@ def render_ledger_html(model: dict[str, Any]) -> str:
     )
     if not inbox_html:
         inbox_html = '<p class="empty">收件箱是空的——没有等待你判断的事。</p>'
+    if model["session_id"] is not None:
+        inbox_html = (
+            '<p class="meta">收件箱与状态是全局视图，不受会话过滤影响；'
+            "只有时间线按会话过滤。</p>" + inbox_html
+        )
 
     # State (canon + task state).
     def state_section(title: str, items: list[dict[str, Any]]) -> str:
@@ -191,11 +226,17 @@ def render_ledger_html(model: dict[str, Any]) -> str:
         else '<span class="badge">全部会话</span>'
     )
 
+    truncation_note = (
+        f' · <span class="trunc">仅显示最近 {model["limit"]} 条（历史被截断）</span>'
+        if model.get("truncated")
+        else ""
+    )
     return _PAGE_TEMPLATE.format(
         project=project,
         session_note=session_note,
         event_count=model["counts"]["events"],
         folded=model["folded_low_signal"],
+        truncation_note=truncation_note,
         pending_total=counts["total"],
         inbox_html=inbox_html,
         state_html=state_html,
@@ -236,6 +277,11 @@ ul{{list-style:none}}
 .inbox-item strong{{font-size:.95rem}}
 .meta{{color:var(--muted);font-size:.76rem;margin-top:6px;font-family:var(--mono)}}
 .empty{{color:var(--muted);font-style:italic;padding:12px 0}}
+.low-fold details summary{{cursor:pointer;color:var(--muted);font-size:.85rem;font-family:var(--mono);padding:8px 0}}
+.low-fold details[open] summary{{color:var(--accent)}}
+.low-fold details ul{{margin-top:6px}}
+.trunc{{color:var(--accent)}}
+details summary::-webkit-details-marker{{color:var(--accent)}}
 .inbox-banner{{background:rgba(224,122,95,.08);border:1px solid rgba(224,122,95,.3);border-radius:8px;padding:12px 16px;margin-bottom:20px;color:var(--fg-dim);font-size:.9rem}}
 .inbox-banner strong{{color:var(--accent)}}
 </style>
@@ -244,7 +290,7 @@ ul{{list-style:none}}
 <div class="wrap">
 <header>
 <h1>NoName 账本 · {project}</h1>
-<div class="sub">{session_note} · {event_count} 事件 · {folded} 低层已折叠</div>
+<div class="sub">{session_note} · {event_count} 事件 · {folded} 低层已折叠{truncation_note}</div>
 </header>
 
 <section>

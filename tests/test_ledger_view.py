@@ -120,3 +120,81 @@ def test_ledger_cli_generates_html_file(tmp_path, capsys):
     # Refuses to overwrite without --overwrite.
     assert main(["ledger-html", "--db", str(db), "--out", str(out)]) == 2
     capsys.readouterr()
+
+
+# --- 对抗性审查发现的回归 ---
+
+def test_low_signal_events_are_expandable_via_details_not_deleted(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        _seed(store)  # includes a file.read low-signal event
+        model = build_ledger_model(store)
+        page = render_ledger_html(model)
+        # The low-signal event is present (inside a <details> fold), not deleted.
+        assert "<details>" in page
+        assert "file.read" in page
+        assert "低层簿记事件" in page
+    finally:
+        store.close()
+
+
+def test_class_attribute_is_escaped(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        _seed(store)
+        model = build_ledger_model(store)
+        # Inject a hostile group value; it must be escaped in the class/attribute context.
+        model["timeline"][0]["group"] = 'x"><img src=x onerror=alert(1)>'
+        page = render_ledger_html(model)
+        assert 'onerror=alert(1)' not in page.replace("&quot;", '"').replace("&#x27;", "'") or "&lt;img" in page
+        # The raw injection must not appear as a live attribute.
+        assert 'class="badge">x"><img' not in page
+    finally:
+        store.close()
+
+
+def test_all_sessions_view_prefixes_session_on_seq(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        store.append_event("alpha", "test.failed", {"path": "t.py", "message": "x"})
+        store.append_event("beta", "test.failed", {"path": "t.py", "message": "x"})
+        page = render_ledger_html(build_ledger_model(store))
+        # Both sessions' #1 are disambiguated with a session prefix.
+        assert "alpha#1" in page and "beta#1" in page
+    finally:
+        store.close()
+
+
+def test_session_filter_labels_global_sections(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        _seed(store)
+        page = render_ledger_html(build_ledger_model(store, session_id="s"))
+        assert "全局视图，不受会话过滤影响" in page
+    finally:
+        store.close()
+
+
+def test_truncation_is_surfaced_honestly(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        for i in range(5):
+            store.append_event("s", "note", {"text": f"event {i}"})
+        model = build_ledger_model(store, limit=2)
+        page = render_ledger_html(model)
+        assert model["truncated"] is True
+        assert "历史被截断" in page
+    finally:
+        store.close()
+
+
+def test_new_event_types_are_visible_by_default_fail_open(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        # A future event type not in any list must be shown (fail-open), not folded.
+        store.append_event("s", "human.note", {"text": "a brand new event type"})
+        model = build_ledger_model(store)
+        node = next(n for n in model["timeline"] if n["event_type"] == "human.note")
+        assert node["high_signal"] is True
+    finally:
+        store.close()
