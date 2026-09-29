@@ -22,10 +22,8 @@ from __future__ import annotations
 
 import json
 import os
-import urllib.error
-import urllib.request
-from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator
+from dataclasses import dataclass
+from typing import Any, Iterator
 
 from .adapters import (
     ModelAdapterError,
@@ -35,58 +33,21 @@ from .adapters import (
     StreamEvent,
 )
 from .models import ModelCapability
+from .vendor_http import (
+    Transport,
+    classify_http_status,
+    classify_transport_error,
+    safe_usage_ref,
+    secure_transport,
+    validate_base_url,
+    _NoRedirectHandler,
+)
 
 # A transport maps (url, headers, body_bytes, timeout) -> (status, response_bytes).
-Transport = Callable[[str, dict[str, str], bytes, float], tuple[int, bytes]]
 
 _DEFAULT_BASE_URL = "https://api.openai.com/v1"
 _ENV_KEY = "OPENAI_API_KEY"
 _ENV_BASE_URL = "OPENAI_BASE_URL"
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Refuse redirects: following one would forward the Authorization bearer
-    token to whatever host the redirect points at -- a silent credential
-    exfiltration primitive.  A redirect is surfaced as an error instead."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
-        return None
-
-
-def _http_transport(url: str, headers: dict[str, str], body: bytes, timeout: float) -> tuple[int, bytes]:
-    """The default real transport: a single POST via urllib (stdlib only).
-
-    Redirects are refused (never followed) so the API key can only ever go to
-    the configured endpoint.  Timeouts and connection failures are classified
-    distinctly: a true timeout is retryable; a connection/DNS/TLS failure is
-    not.
-    """
-
-    import socket
-
-    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    opener = urllib.request.build_opener(_NoRedirectHandler())
-    try:
-        with opener.open(request, timeout=timeout) as response:
-            return response.status, response.read()
-    except urllib.error.HTTPError as exc:
-        # A redirect with no handler surfaces as an HTTPError 3xx here.
-        if 300 <= exc.code < 400:
-            raise ModelAdapterError(
-                "invalid_request",
-                f"endpoint redirected ({exc.code}); redirects are refused to protect the API key",
-            ) from exc
-        return exc.code, exc.read()
-    except (socket.timeout, TimeoutError) as exc:
-        raise ModelAdapterError("timeout", f"request timed out after {timeout}s") from exc
-    except urllib.error.URLError as exc:
-        # urllib wraps read/connect timeouts in URLError; unwrap them so a true
-        # timeout is retryable, while DNS/connection/TLS failures are not.
-        if isinstance(exc.reason, (socket.timeout, TimeoutError)):
-            raise ModelAdapterError("timeout", f"request timed out after {timeout}s") from exc
-        raise ModelAdapterError(
-            "overloaded", f"cannot reach the endpoint: {type(exc.reason).__name__}"
-        ) from exc
 
 
 @dataclass
@@ -101,7 +62,7 @@ class OpenAIAdapter:
     model_id: str = "gpt-4o-mini"
     context_window: int | None = 128_000
     timeout: float = 60.0
-    transport: Transport = _http_transport
+    transport: Transport = secure_transport
     base_url: str | None = None
     api_key: str | None = None
     # Opt-in escape hatch for plaintext HTTP (e.g. a local model server).
@@ -122,22 +83,10 @@ class OpenAIAdapter:
     # -- request/response mapping ------------------------------------------
 
     def _endpoint(self) -> str:
-        base = (self.base_url or os.environ.get(_ENV_BASE_URL) or _DEFAULT_BASE_URL).rstrip("/")
-        # The base URL is a trust boundary: the bearer key is sent to whatever
-        # host it names, so plaintext HTTP is refused unless explicitly opted
-        # in (e.g. a local model server).  This blocks credential exfiltration
-        # via a poisoned OPENAI_BASE_URL pointing at an attacker endpoint.
-        from urllib.parse import urlsplit
-
-        scheme = urlsplit(base.strip().lower()).scheme
-        allowed = {"https"} if not self.allow_insecure else {"https", "http"}
-        if scheme not in allowed:
-            raise ModelAdapterError(
-                "auth",
-                f"refusing base URL scheme {scheme!r} (would send the API key "
-                "over a non-HTTPS channel); pass allow_insecure=True for a "
-                "local plaintext endpoint",
-            )
+        base = validate_base_url(
+            self.base_url or os.environ.get(_ENV_BASE_URL) or _DEFAULT_BASE_URL,
+            allow_insecure=self.allow_insecure,
+        )
         return f"{base}/chat/completions"
 
     def _headers(self) -> dict[str, str]:
@@ -190,24 +139,7 @@ class OpenAIAdapter:
         except ModelAdapterError:
             raise
         except Exception as exc:  # noqa: BLE001 - normalised at the vendor seam
-            # Classify transport-level failures by their cause: a true timeout
-            # is retryable; DNS/connection/TLS failures are not; anything else
-            # is unknown.  This applies whether the default or an injected
-            # transport raised it.
-            import socket
-            import urllib.error
-
-            cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-            if isinstance(cause, (socket.timeout, TimeoutError)):
-                raise ModelAdapterError(
-                    "timeout", f"request timed out after {self.timeout}s"
-                ) from exc
-            if isinstance(exc, urllib.error.URLError):
-                raise ModelAdapterError(
-                    "overloaded",
-                    f"cannot reach the endpoint: {type(cause).__name__}",
-                ) from exc
-            raise ModelAdapterError("unknown", f"transport failed: {type(exc).__name__}") from exc
+            raise classify_transport_error(exc, self.timeout) from exc
 
         if status != 200:
             raise self._classify_http_error(status, raw)
@@ -251,11 +183,7 @@ class OpenAIAdapter:
             vendor_ref={
                 "status": 200,
                 "id": data.get("id"),
-                "usage": {
-                    key: usage.get(key)
-                    for key in ("prompt_tokens", "completion_tokens", "total_tokens")
-                    if isinstance(usage.get(key), int)
-                },
+                "usage": safe_usage_ref(usage),
             },
         )
 
@@ -304,28 +232,7 @@ class OpenAIAdapter:
         }
 
     def _classify_http_error(self, status: int, raw: bytes) -> ModelAdapterError:
-        # vendor_ref is a *reference*, never the body: an error body can contain
-        # anything (including, for a 401, the bearer key itself, or attacker
-        # content from a hostile endpoint), and it would be persisted verbatim
-        # into the append-only ledger.  Only status and a vendor error id are
-        # kept -- enough to audit, nothing that can leak.
-        ref: dict[str, Any] = {"status": status}
-        try:
-            body = json.loads(raw.decode("utf-8"))
-            error = body.get("error") if isinstance(body, dict) else None
-            if isinstance(error, dict) and error.get("code"):
-                ref["error_code"] = str(error["code"])[:100]
-        except (ValueError, UnicodeDecodeError):
-            pass
-        if status in {401, 403}:
-            return ModelAdapterError("auth", f"vendor auth failed ({status})", vendor_ref=ref)
-        if status == 429:
-            return ModelAdapterError("rate_limit", "vendor rate limit (429)", vendor_ref=ref)
-        if status in {500, 502, 503, 504}:
-            return ModelAdapterError("overloaded", f"vendor overloaded ({status})", vendor_ref=ref)
-        if status == 400:
-            return ModelAdapterError("invalid_request", "vendor rejected request (400)", vendor_ref=ref)
-        return ModelAdapterError("unknown", f"vendor error ({status})", vendor_ref=ref)
+        return classify_http_status(status, raw)
 
     def stream(self, request: ModelRequest) -> Iterator[StreamEvent]:
         # A minimal honest stream: complete once and re-emit.  True SSE

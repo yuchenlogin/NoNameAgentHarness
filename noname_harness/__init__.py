@@ -8,6 +8,7 @@ from .plugins import Plugin, PluginContribution, PluginError, PluginManifest, Pl
 from .sandbox import Sandbox, SandboxError
 from .router import RouteDecision, Router
 from .openai_adapter import OpenAIAdapter, load_openai_adapter
+from .anthropic_adapter import AnthropicAdapter, load_anthropic_adapter
 from .adapters import (
     AdapterDriver,
     LocalEchoAdapter,
@@ -50,6 +51,8 @@ __all__ = [
     "Router",
     "AdapterDriver",
     "OpenAIAdapter",
+    "AnthropicAdapter",
+    "load_anthropic_adapter",
     "load_openai_adapter",
     "LocalEchoAdapter",
     "ModelAdapterError",
