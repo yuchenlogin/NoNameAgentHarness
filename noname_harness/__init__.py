@@ -7,6 +7,7 @@ from .taste_cards import TasteCardService
 from .plugins import Plugin, PluginContribution, PluginError, PluginManifest, PluginRuntime
 from .sandbox import Sandbox, SandboxError
 from .router import RouteDecision, Router
+from .openai_adapter import OpenAIAdapter, load_openai_adapter, openai_adapter_plugin
 from .adapters import (
     AdapterDriver,
     LocalEchoAdapter,
@@ -48,6 +49,9 @@ __all__ = [
     "RouteDecision",
     "Router",
     "AdapterDriver",
+    "OpenAIAdapter",
+    "load_openai_adapter",
+    "openai_adapter_plugin",
     "LocalEchoAdapter",
     "ModelAdapterError",
     "ModelMessage",
