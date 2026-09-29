@@ -2,10 +2,32 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
-## [0.13.0] - 2026-09-29
+
+## [0.14.0] - 2026-09-29
 
 ### Features
 
+- Model Adapter 契约 + Agent Loop 桥接落地（runtime-arch §3，经一轮对抗性审查加固，schema 不变，仍为 v6）：新增 `noname_harness/adapters.py`——`ModelAdapter` 协议（`id` / `capability` / `complete` / `stream` / `estimate_cost`）；统一数据类型 `ModelMessage` / `ModelRequest` / `ModelResponse` / `StreamEvent`，`vendor_ref` 保留供应商原始响应引用；统一错误分类（`rate_limit` / `timeout` / `overloaded` / `auth` / `invalid_request` / `cancelled` / `unknown`）+ `retryable` 标注。
+- 参考实现 `LocalEchoAdapter`：确定性、无网络（非 vendor mock），完整实现契约，`responder` 可注入规则，用于验证契约并驱动 Agent Loop；真实供应商适配器（OpenAI / Anthropic / 本地模型）按同一协议以插件接入，内核不依赖任何供应商。
+- `AdapterDriver`：把 `ModelAdapter` 包装成 Agent Loop 的 `SessionDriver`——从上下文包构建 `ModelRequest`（brief 含 high / mid / low / guardrails / next_steps / preference + visible_tools 契约不含实现），调用适配器，把 `tool_call` 映射为 `LoopResult` 交给 loop 路由过审批门。
+- 审查加固：Agent Loop 组装上下文时注入 `tool_registry.visible_tools`（修复「真实路径模型看不到工具契约」）；`registry.get_live_token(id)` 重新水合跨模型边界的 `approval_token`（修复「token 类型腐坏致 resume 崩溃」）；`ModelAdapterError` 的 `error_class` / `retryable` / `vendor_ref` 在 loop 失败事件与 summary 中保留（不再被字符串化擦除）；tool_call 边界校验（无 name / 并行调用 / arguments=null 响亮拒绝）。
+- 端到端验证：真实 adapter 驱动的完整 agent run（模型读文件免审 → 决定写文件被审批门拦下 → 人授权 → 带 token 重新驱动完成 → 从事件流恢复）。
+
+### Design Rationale
+
+- **为什么业务逻辑只按 capability 选模型、vendor_ref 必须保留**：供应商差异（消息格式、流式事件、错误形状、价格与隐私属性）被收敛成稳定能力，换供应商不换业务逻辑；同时 `vendor_ref` 保留每次调用的原始响应引用，让审计能回到供应商真相，而内核本身不依赖任何供应商的形状——可替换与可审计是同一份契约的两面。
+- **为什么真实供应商适配器是插件而非内核**：内核不依赖任何供应商，正是「能力结晶成插件」的赌注——网络接入、鉴权、供应商 SDK 都是易变的外层，只有契约是稳定的。`LocalEchoAdapter` 作为参考实现，让契约正确性与 Agent Loop 集成可以离线、确定性验证，不拖任何真实供应商进场。
+
+### Notes & Caveats
+
+- `LocalEchoAdapter` 是契约参考实现，不是真实模型；真实供应商适配器（OpenAI / Anthropic / 本地模型）待以插件接入。
+- `estimate_cost` 暂无消费方。
+- 并行 tool_call 暂不支持，响亮拒绝。
+- 新增 14 个测试，总数到 213。
+
+## [0.13.0] - 2026-09-29
+
+### Features
 - Router 保守落地（vision 原则一、runtime-arch §7，schema 不变，仍为 v6）：`RouteDecision`（continue / fork / rebirth / switch_recipe / spawn_subagent + 理由 + 触发信号 + 建议配方），决策记 `route.selected` 账本事件；Router 只读信号、不修改长期记忆。决策优先级：用户显式指令 > 挂起审批（继续等人）> 饱和度（fork / rebirth / continue）；歧义指令保守默认 continue。CLI：`route --session [--task-type] [--instruction]`。
 - 信号层经审查加固：挂起审批按调用关联（`tool.requested` 的 `arguments_hash` 须匹配 `tool.approval_granted`，定向只读 SQL 投影，无截断窗口），不再按全局数量配对；饱和度锚定最近一次 `context.assembled`（handoff / rebirth 边界），只计边界后的 live context，rebirth 后自动重置；reason 用固定模板，不嵌入指令原文。
 - README 整合：状态从「最小原型」更新为「本地优先的内核与运行时骨架已落地，无外部依赖」；新增「已落地的能力」表格（12 层能力 + CLI / Python 入口）与「尚未做（诚实边界）」（真实 Model Adapter、自然语言抽取 / 向量检索、多模态视觉、网络隔离 / 资源限额、暂停 resume）；验证 19 个命令真实存在。

@@ -64,6 +64,8 @@ Capability Layer
 
 业务逻辑只能按 capability 选择模型，不直接依赖某家 API 字段。适配器必须保留供应商原始响应引用，便于审计。
 
+**原型落地状态**：契约已落地——`ModelAdapter` 协议（`id` / `capability` / `complete` / `stream` / `estimate_cost`），统一数据类型 `ModelMessage` / `ModelRequest` / `ModelResponse` / `StreamEvent`（`vendor_ref` 保留供应商原始响应引用），统一错误分类（`rate_limit` / `timeout` / `overloaded` / `auth` / `invalid_request` / `cancelled` / `unknown`）+ `retryable` 标注。`LocalEchoAdapter` 是确定性、无网络的参考实现（非 vendor mock），用于验证契约并驱动 Agent Loop。`AdapterDriver` 把适配器包装为 loop 的 `SessionDriver`：组装上下文时注入 `tool_registry.visible_tools`，跨模型边界的 `approval_token` 经 `registry.get_live_token` 重新水合，`ModelAdapterError` 的 `error_class` / `retryable` / `vendor_ref` 在失败事件与 summary 中保留入账。真实供应商适配器（OpenAI / Anthropic / 本地模型）按同一协议以插件接入，内核不依赖任何供应商。
+
 ## 4. Model Recipe
 
 一个 recipe 是角色组合，不是模型列表：
