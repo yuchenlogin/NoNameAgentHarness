@@ -13,6 +13,7 @@ from .curator import CuratorService
 from .models import EvidenceInput, ModelCapability, ModelProfile
 from .recipes import DEFAULT_RECIPES, resolve_recipe
 from .taste import TasteService
+from .taste_cards import TasteCardService
 from .store import HarnessStore, WorkspaceBoundaryError
 
 
@@ -144,6 +145,32 @@ def build_parser() -> argparse.ArgumentParser:
     taste_list = sub.add_parser("taste", parents=[_db_parent()], help="list taste records")
     taste_list.add_argument("--status", choices=["active", "candidate", "paused", "retired"], default="active")
     taste_list.add_argument("--scope", choices=["user", "project"])
+
+    card_propose = sub.add_parser("card-propose", parents=[_db_parent()], help="propose taste-card clusters from active taste")
+    card_propose.add_argument("--scope", choices=["user", "project"])
+
+    card_create = sub.add_parser("card-create", parents=[_db_parent()], help="create a taste card candidate")
+    card_create.add_argument("--title", required=True)
+    card_create.add_argument("--attitude", required=True)
+    card_create.add_argument("--track", choices=["authored", "adopted", "mixed"], required=True)
+    card_create.add_argument("--scope", choices=["user", "project"], required=True)
+    card_create.add_argument("--taste-id", action="append", required=True, dest="taste_ids")
+    card_create.add_argument("--tensions")
+    card_create.add_argument("--influence")
+    card_create.add_argument("--by", default="clusterer", dest="actor_id")
+
+    card_review = sub.add_parser("card-review", parents=[_db_parent()], help="review a taste card")
+    card_review.add_argument("--card-id", required=True)
+    card_review.add_argument("--action", choices=["accept", "edit", "pause", "resume", "retire", "split"], required=True)
+    card_review.add_argument("--reviewer", required=True, dest="reviewer_id")
+    card_review.add_argument("--edited", help="JSON edited fields, or {'cards':[...]} for split")
+
+    card_queue = sub.add_parser("card-queue", parents=[_db_parent()], help="show the deterministic card review queue")
+    card_queue.add_argument("--limit", type=int, default=5)
+
+    card_list = sub.add_parser("card", parents=[_db_parent()], help="list taste cards by status")
+    card_list.add_argument("--status", choices=["candidate", "active", "paused", "retired"], default="active")
+    card_list.add_argument("--scope", choices=["user", "project"])
 
     return parser
 
@@ -320,6 +347,43 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _print(store.review_inbox())
             elif args.command == "taste":
                 service = TasteService(store)
+                _print(service.by_status(args.status, scope=args.scope))
+            elif args.command == "card-propose":
+                service = TasteCardService(store)
+                clusters = service.propose_clusters(scope=args.scope)
+                _print([
+                    {k: v for k, v in c.items() if k != "records"} for c in clusters
+                ])
+            elif args.command == "card-create":
+                service = TasteCardService(store)
+                _print(
+                    service.create_card(
+                        title=args.title,
+                        attitude=args.attitude,
+                        track=args.track,
+                        scope=args.scope,
+                        taste_ids=args.taste_ids,
+                        tensions=args.tensions,
+                        influence=args.influence,
+                        actor_id=args.actor_id,
+                    )
+                )
+            elif args.command == "card-review":
+                service = TasteCardService(store)
+                edited = _json_value(args.edited) if args.edited else None
+                _print(
+                    service.review(
+                        args.card_id,
+                        args.action,
+                        args.reviewer_id,
+                        edited=edited,
+                    )
+                )
+            elif args.command == "card-queue":
+                service = TasteCardService(store)
+                _print(service.review_queue(limit=args.limit))
+            elif args.command == "card":
+                service = TasteCardService(store)
                 _print(service.by_status(args.status, scope=args.scope))
             else:  # pragma: no cover - argparse guarantees a known command
                 raise AssertionError(args.command)
