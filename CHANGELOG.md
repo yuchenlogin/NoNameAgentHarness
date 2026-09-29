@@ -3,6 +3,32 @@
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
 
+## [0.15.0] - 2026-09-29
+
+### Features
+
+- 第一个真实供应商适配器落地（runtime-arch §3，经两轮对抗性审查——两次 REJECT 后修复，均为凭证安全——schema 不变，仍为 v6）：新增 `noname_harness/openai_adapter.py`（`OpenAIAdapter` + `load_openai_adapter`），与 `LocalEchoAdapter` 同一 `ModelAdapter` 契约的另一实现，支持 OpenAI 兼容端点；API key 从环境变量读取、只用于请求头。验证「能力结晶成插件」：真实供应商以插件接入，内核不依赖任何供应商。
+- 传输层可注入：默认真实 urllib POST，测试用确定性 replay 传输——无需网络/key 即可验证请求构建、vendor schema 映射、错误分类、`vendor_ref`。
+- 凭证安全加固：`_NoRedirectHandler` 拒绝一切重定向（否则 302 会把 Bearer key 转发到攻击者主机——silent 凭证外泄）；base URL scheme 归一化强制 HTTPS（plaintext / `HTTP://` 大小写 / `ftp://` 全拒），`allow_insecure` 仅本地端点 opt-in。
+- `vendor_ref` 全路径白名单：只存 `{status, id, error_code, 三个 token usage 字段}`，错误体永不落盘（OpenAI auth 错误常含 `Bearer sk-...`），永不放 bytes（否则 `append_event` 崩溃、loop 卡非终态）。
+- 错误按因分类：true timeout（含 URLError 包裹）→ `timeout` 可重试；DNS / 连接 / TLS → `overloaded` 不可重试。
+- `PluginManifest` 新增 `side_effects` 字段，OpenAI 插件声明 `(network-egress, billing)` 记 `plugin.loaded`（manifest 的 `max_permission` 只覆盖贡献的工具，此插件不贡献工具但做网络出站+计费，必须诚实声明）。
+- 边界加固：dict tool_call arguments 直传、非法 JSON 归一化为 `ModelAdapterError`、超 1MB 拒绝。
+- 端到端验证：插件加载 → adapter 驱动 Agent Loop → 模型见 3 个沙箱工具契约 → `read_file` 过审批门 → 读真实文件 → 返回中文答案 → 账本可审计（全部 replay 无网络）。
+
+### Design Rationale
+
+- **为什么传输层必须可注入**：请求构建/响应解析与实际 HTTP 必须分离——契约正确性（请求构建、错误分类、`vendor_ref`）需要在无网络、无 key 的环境下用确定性 replay 传输验证，默认真实 urllib 只在部署时启用。否则验证契约就要拖真实网络与真实凭证进场，凭证安全的每一轮加固都无法在测试中复现。
+- **为什么 `vendor_ref` 必须全路径白名单、永不放错误体/bytes**：错误体可能含 API key 或攻击者控制的内容，一旦入账本即凭证外泄——审计面就是泄密面；bytes 不可 JSON 序列化，会让 `append_event` 崩溃、loop 卡非终态。只存 `{status, id, error_code, token usage}` 让审计可用而泄密不可能：可审计性不依赖存下供应商说的一切，只依赖存下足以定位真相的引用。
+
+### Notes & Caveats
+
+- 默认只允许 HTTPS；`allow_insecure` 仅为本地端点 opt-in。
+- 真实网络调用未在测试中启用（replay 验证契约，部署时启用真实 urllib）。
+- `side_effects` 是声明性审计字段，不是强制门——诚实声明靠插件作者，账本只负责记录。
+- `estimate_cost` 是词数估算，非真实 token 计数。
+- 新增 28 个测试，总数到 241。
+
 ## [0.14.0] - 2026-09-29
 
 ### Features

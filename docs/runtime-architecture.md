@@ -66,6 +66,8 @@ Capability Layer
 
 **原型落地状态**：契约已落地——`ModelAdapter` 协议（`id` / `capability` / `complete` / `stream` / `estimate_cost`），统一数据类型 `ModelMessage` / `ModelRequest` / `ModelResponse` / `StreamEvent`（`vendor_ref` 保留供应商原始响应引用），统一错误分类（`rate_limit` / `timeout` / `overloaded` / `auth` / `invalid_request` / `cancelled` / `unknown`）+ `retryable` 标注。`LocalEchoAdapter` 是确定性、无网络的参考实现（非 vendor mock），用于验证契约并驱动 Agent Loop。`AdapterDriver` 把适配器包装为 loop 的 `SessionDriver`：组装上下文时注入 `tool_registry.visible_tools`，跨模型边界的 `approval_token` 经 `registry.get_live_token` 重新水合，`ModelAdapterError` 的 `error_class` / `retryable` / `vendor_ref` 在失败事件与 summary 中保留入账。真实供应商适配器（OpenAI / Anthropic / 本地模型）按同一协议以插件接入，内核不依赖任何供应商。
 
+第一个真实供应商适配器已落地：`noname_harness/openai_adapter.py`（`OpenAIAdapter` + `load_openai_adapter`），支持 OpenAI 兼容端点。要点：传输层可注入（默认真实 urllib POST，测试用确定性 replay 传输，无网络/key 即可验证请求构建、错误分类、`vendor_ref`）；base URL scheme 归一化强制 HTTPS（`allow_insecure` 仅本地 opt-in）；拒绝一切重定向（防 302 转发 Bearer key）；`vendor_ref` 全路径白名单——只存 `{status, id, error_code, token usage}`，错误体永不落盘、永不放 bytes；错误按因分类（true timeout 可重试，DNS/连接/TLS 不可重试）；`PluginManifest.side_effects` 声明 `(network-egress, billing)` 记 `plugin.loaded` 审计。该适配器经插件加载、驱动 Agent Loop 完成端到端验证（replay 无网络），「能力结晶成插件」从原则变为已验证事实。
+
 ## 4. Model Recipe
 
 一个 recipe 是角色组合，不是模型列表：
