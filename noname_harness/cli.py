@@ -97,6 +97,10 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("query")
     search.add_argument("--session")
     search.add_argument("--limit", type=int, default=20)
+    search.add_argument("--semantic", action="store_true", help="use vector/semantic recall (requires an embedding index)")
+
+    embed = sub.add_parser("embed", parents=[_db_parent()], help="(re)build the vector recall projection")
+    embed.add_argument("--session")
 
     verify = sub.add_parser("verify", parents=[_db_parent()], help="verify event/evidence hashes")
 
@@ -259,16 +263,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             elif args.command == "ledger":
                 _print([_event_dict(event) for event in store.list_events(args.session, args.limit)])
             elif args.command == "search":
-                _print(
-                    [
-                        _event_dict(event)
-                        for event in store.search_events(
-                            args.query,
-                            session_id=args.session,
-                            limit=args.limit,
-                        )
-                    ]
-                )
+                if args.semantic:
+                    from .embeddings import local_hash_embedding
+
+                    _print(
+                        [
+                            {**_event_dict(hit["event"]), "similarity": hit["similarity"], "ref_id": hit["ref_id"]}
+                            for hit in store.search_events_semantic(
+                                args.query,
+                                local_hash_embedding,
+                                session_id=args.session,
+                                limit=args.limit,
+                            )
+                        ]
+                    )
+                else:
+                    _print(
+                        [
+                            _event_dict(event)
+                            for event in store.search_events(
+                                args.query,
+                                session_id=args.session,
+                                limit=args.limit,
+                            )
+                        ]
+                    )
+            elif args.command == "embed":
+                from .embeddings import local_hash_embedding
+
+                _print(store.build_embedding_index(local_hash_embedding, session_id=args.session))
             elif args.command == "verify":
                 result = store.verify_integrity()
                 _print(result)

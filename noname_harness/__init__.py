@@ -9,6 +9,7 @@ from .sandbox import Sandbox, SandboxError
 from .router import RouteDecision, Router
 from .openai_adapter import OpenAIAdapter, load_openai_adapter
 from .anthropic_adapter import AnthropicAdapter, load_anthropic_adapter
+from .embeddings import local_hash_embedding, cosine_similarity
 from .adapters import (
     AdapterDriver,
     LocalEchoAdapter,
@@ -53,6 +54,8 @@ __all__ = [
     "OpenAIAdapter",
     "AnthropicAdapter",
     "load_anthropic_adapter",
+    "local_hash_embedding",
+    "cosine_similarity",
     "load_openai_adapter",
     "LocalEchoAdapter",
     "ModelAdapterError",

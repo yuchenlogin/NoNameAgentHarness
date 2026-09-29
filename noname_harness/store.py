@@ -24,7 +24,7 @@ from .models import EvidenceInput, Event, ModelProfile
 from .workspace import git_snapshot
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 VALID_LAYERS = {"high", "mid"}
 VALID_REVIEW_ACTIONS = {"accept", "reject", "edit", "defer", "retire"}
 VALID_TASTE_TRACKS = {"authored", "adopted"}
@@ -289,6 +289,18 @@ class HarnessStore:
             recorded_at TEXT NOT NULL
         );
 
+        -- Vector index for semantic recall.  This is a REBUILDABLE PROJECTION:
+        -- the embedding of each event's searchable text, stored so semantic
+        -- recall does not re-embed on every query.  It can be dropped and
+        -- rebuilt from session_events/evidence_spans at any time; it is never
+        -- the source of truth.
+        CREATE TABLE IF NOT EXISTS event_embeddings (
+            event_id TEXT PRIMARY KEY REFERENCES session_events(id),
+            dimensions INTEGER NOT NULL,
+            vector_json TEXT NOT NULL,
+            embedded_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS taste_records (
             id TEXT PRIMARY KEY,
             track TEXT NOT NULL CHECK (track IN ('authored', 'adopted')),
@@ -506,6 +518,12 @@ class HarnessStore:
                     # CREATE ... IF NOT EXISTS; the supersede guard is in the
                     # shared guard script.  Only the version bump is durable here.
                     current_version = 6
+                if current_version == 6:
+                    # v7 adds the event_embeddings vector-index projection.  It
+                    # is created by the shared schema via CREATE TABLE IF NOT
+                    # EXISTS (and is rebuildable), so only the version bump is
+                    # durable here.
+                    current_version = 7
                 if current_version != SCHEMA_VERSION:  # pragma: no cover - defensive
                     raise RuntimeError(
                         f"Unsupported schema version {current_version}; expected {SCHEMA_VERSION}"
@@ -988,6 +1006,127 @@ class HarnessStore:
                 ],
             )
         return True
+
+    # ------------------------------------------------------------------
+    # Semantic recall (vector projection, opt-in enhancement over FTS5)
+    # ------------------------------------------------------------------
+
+    def _searchable_text(self, event: Event) -> str:
+        """The text an event is embedded/searched by (payload + evidence)."""
+
+        parts = [_json(event.payload)]
+        for evidence in self.evidence_for_event(event.id):
+            parts.append(evidence["content"])
+        return "\n".join(parts)
+
+    def build_embedding_index(
+        self,
+        embedding_fn: Any,
+        *,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """(Re)build the vector-index projection from append-only events.
+
+        This is a projection, never the source of truth: it deletes and
+        re-embeds the searchable text of every event (optionally scoped to a
+        session).  The embedding function is injectable -- a real embedding
+        service plugs in behind the same protocol.
+        """
+
+        from .embeddings import local_hash_embedding
+
+        embed = embedding_fn or local_hash_embedding
+        events = self.list_events(session_id=session_id, limit=100000)
+        # Events come newest-first; embed oldest-first for a stable index.
+        count = 0
+        dimensions = 0
+        with self._transaction() as connection:
+            if session_id is None:
+                connection.execute("DELETE FROM event_embeddings")
+            else:
+                connection.execute(
+                    "DELETE FROM event_embeddings WHERE event_id IN "
+                    "(SELECT id FROM session_events WHERE session_id = ?)",
+                    (session_id,),
+                )
+            now = _now()
+            for event in reversed(events):
+                vector = embed(self._searchable_text(event))
+                dimensions = len(vector)
+                connection.execute(
+                    "INSERT INTO event_embeddings(event_id, dimensions, vector_json, embedded_at) "
+                    "VALUES(?, ?, ?, ?)",
+                    (event.id, dimensions, _json(vector), now),
+                )
+                count += 1
+        return {"embedded": count, "dimensions": dimensions}
+
+    def search_events_semantic(
+        self,
+        query: str,
+        embedding_fn: Any,
+        *,
+        session_id: str | None = None,
+        limit: int = 20,
+        min_similarity: float = 0.0,
+    ) -> list[dict[str, Any]]:
+        """Three-stage semantic recall over the vector projection.
+
+        Stage 1 (recall): cosine similarity against the vector projection, with
+        session/scoping and a similarity floor.  Stage 2 (rerank): similarity
+        plus recency.  Stage 3 (construct): each result carries the event and
+        its short reference id so a caller can drill down to the source.
+
+        The query is embedded with the same injectable function.  This never
+        replaces FTS5 keyword search; it is an opt-in semantic complement.
+        """
+
+        from .embeddings import cosine_similarity, local_hash_embedding
+
+        if not query.strip():
+            raise ValueError("query cannot be empty")
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        embed = embedding_fn or local_hash_embedding
+        query_vector = embed(query)
+
+        clauses = []
+        args: list[Any] = []
+        if session_id is not None:
+            clauses.append("e.session_id = ?")
+            args.append(session_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._connection.execute(
+            f"SELECT e.*, v.vector_json FROM event_embeddings v "
+            f"JOIN session_events e ON e.id = v.event_id {where}",
+            tuple(args),
+        ).fetchall()
+
+        scored = []
+        for row in rows:
+            vector = _decode(row["vector_json"])
+            similarity = cosine_similarity(query_vector, vector)
+            if similarity < min_similarity:
+                continue
+            scored.append((similarity, row))
+        # Rerank: similarity first, then recency as a tie-break.
+        scored.sort(key=lambda item: (item[0], item[1]["occurred_at"], item[1]["seq"]), reverse=True)
+        return [
+            {
+                "event": Event(
+                    row["id"],
+                    row["session_id"],
+                    row["seq"],
+                    row["event_type"],
+                    _decode(row["payload_json"]),
+                    row["occurred_at"],
+                    row["content_hash"],
+                ),
+                "similarity": similarity,
+                "ref_id": row["id"][:12],
+            }
+            for similarity, row in scored[:limit]
+        ]
 
     def check_event_ids(self, source_event_ids: Sequence[str]) -> None:
         """Public contract: assert every cited source event exists.
