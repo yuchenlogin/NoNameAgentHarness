@@ -2,6 +2,26 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.18.0] - 2026-09-29
+
+### Features
+
+- 最终交付审计（completion audit 方法，三路并行：vision 原则 / runtime-arch 稳定接口 / 文档一致性）+ 修复，schema 不变，仍为 v7。审计结论：vision 九项原则中八项已证实成立（append-only、写入是提案、品味不当事实、内核物理强制、换模型不换事实、插件不绕内核、事件流恢复、§12 五步），runtime-arch 核心契约大多已实现且正确，文档-代码一致性高。
+- model.* 事件入账（runtime-arch §2 事件类型缺口）：模型调用这一最核心行为此前没有自己的事件类型，审计粒度低于「模型可见内容可从日志重建」承诺的覆盖面。现 `AdapterDriver` 接受可选 `store`/`session_id`，调用 `adapter.complete` 时记 `model.requested`（vendor-neutral 请求形状，绝不含凭证）→ `model.completed`（`vendor_ref`/`finish_reason`/token 数）或 `model.failed`（`error_class`/`retryable`/`vendor_ref`）；`AgentLoop.run` 在 driver 未配置时自动注入 loop 自身的 store/session；无 store 的 driver 保持 audit-free，不强制开销。
+- 文档一致性修复（审计发现文档声称与实际不符，全部对齐到代码现状）：site/index.html 页脚从「最小原型/runtime 尚未实现」改为与 README 对齐（内核与运行时骨架已落地、适配器经插件接入 replay 验证、不是插件市场）；docs/prototype.md 头部 schema v4→v7、§3「当前不做什么」删除已过时的向量检索/品味卡片/插件运行时/文件命令执行并更新为真实未做项、§2 补 `embed` 与 `search --semantic` 示例；README「尚未做」移除真实适配器与向量检索两项（均已落地）；docs/taste-cards.md §3 与 docs/architecture.md §7 的卡片「合并（merge）」操作标注为未来能力（不存在于代码）。
+
+### Design Rationale
+
+- **为什么 model.* 事件是审计覆盖面最核心的一块**：「模型可见内容可从日志重建」是系统核心不变式，但若连模型调用本身都没有事件，这条不变式的覆盖面就有洞——最核心行为反而不可回放。每次调用记 `model.requested`/`model.completed`/`model.failed`（含错误分类与 `vendor_ref`、绝不含凭证），让模型行为与其他一切一样可回放、可审计、可归因。
+
+### Notes & Caveats
+
+- 审计仍发现的未做项：交互式账本 UI（vision 原则四）、多模态图像生成（刻意的保守边界）、真流式 SSE、取消机制、多模态消息格式、并行 tool_call、暂停 resume、网络隔离/资源限额、真实 embedding 服务插件、自然语言记忆抽取。
+- model.* 不含 `model.chunk`（真流式未实现，无 chunk 可记）。
+- 文档现已与代码一致；本轮修复后无已知文档-代码偏差。
+- 新增 3 个测试，总数到 278。
+
+
 ## [0.17.0] - 2026-09-29
 
 ### Features
