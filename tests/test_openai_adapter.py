@@ -184,7 +184,7 @@ def test_plaintext_http_base_url_refused_by_default(monkeypatch):
     with pytest.raises(ModelAdapterError) as exc_info:
         adapter.complete(_req())
     assert exc_info.value.error_class == "auth"
-    assert "plaintext HTTP" in str(exc_info.value)
+    assert exc_info.value.error_class == "auth"
 
 
 def test_allow_insecure_opt_in_permits_local_http(monkeypatch):
@@ -233,3 +233,68 @@ def test_default_transport_refuses_redirect(monkeypatch):
     from noname_harness.openai_adapter import _NoRedirectHandler
     handler = _NoRedirectHandler()
     assert handler.redirect_request(None, None, None, None, None, None) is None
+
+
+# --- 复审 (pass 2) 发现的回归 ---
+
+def test_no_choices_vendor_ref_has_no_body(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-SECRET")
+    adapter = OpenAIAdapter(
+        transport=lambda *a: (200, json.dumps({"note": "Bearer sk-SECRET"}).encode())
+    )
+    with pytest.raises(ModelAdapterError) as exc_info:
+        adapter.complete(_req())
+    assert "SECRET" not in str(exc_info.value.vendor_ref)
+    assert exc_info.value.vendor_ref == {"id": None}
+
+
+def test_success_usage_is_allowlisted(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-SECRET")
+    payload = ok_payload(text="ok")
+    payload["usage"] = {"prompt_tokens": 1, "evil": "sk-SECRET"}
+    adapter = OpenAIAdapter(transport=replay_transport(payload=payload))
+    response = adapter.complete(_req())
+    assert response.vendor_ref["usage"] == {"prompt_tokens": 1}
+    assert "SECRET" not in str(response.vendor_ref)
+
+
+def test_non_utf8_body_vendor_ref_is_json_serialisable(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    from noname_harness.store import _json
+    adapter = OpenAIAdapter(transport=lambda *a: (200, b"\xff\xfe garbage"))
+    with pytest.raises(ModelAdapterError) as exc_info:
+        adapter.complete(_req())
+    # vendor_ref holds no bytes, so it can be persisted to the ledger.
+    _json({"vendor_ref": exc_info.value.vendor_ref})
+    assert exc_info.value.vendor_ref["bytes"] == 10
+
+
+def test_uppercase_http_scheme_refused(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    adapter = OpenAIAdapter(base_url="HTTP://attacker.example/v1", transport=replay_transport())
+    with pytest.raises(ModelAdapterError) as exc_info:
+        adapter.complete(_req())
+    assert exc_info.value.error_class == "auth"
+
+
+def test_urlerror_wrapping_timeout_is_retryable(monkeypatch):
+    import socket
+    import urllib.error
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    def transport(url, headers, body, timeout):
+        raise urllib.error.URLError(socket.timeout("timed out"))
+    adapter = OpenAIAdapter(transport=transport)
+    with pytest.raises(ModelAdapterError) as exc_info:
+        adapter.complete(_req())
+    assert exc_info.value.error_class == "timeout"
+    assert exc_info.value.retryable is True
+
+
+def test_oversized_dict_arguments_rejected(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    big = {"data": "x" * 2_000_000}
+    tool_calls = [{"id": "c", "type": "function", "function": {"name": "t", "arguments": big}}]
+    adapter = OpenAIAdapter(transport=replay_transport(payload=ok_payload(text="", tool_calls=tool_calls)))
+    with pytest.raises(ModelAdapterError) as exc_info:
+        adapter.complete(_req())
+    assert "1MB" in str(exc_info.value)

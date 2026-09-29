@@ -80,7 +80,10 @@ def _http_transport(url: str, headers: dict[str, str], body: bytes, timeout: flo
     except (socket.timeout, TimeoutError) as exc:
         raise ModelAdapterError("timeout", f"request timed out after {timeout}s") from exc
     except urllib.error.URLError as exc:
-        # DNS / connection-refused / TLS failures are not retryable timeouts.
+        # urllib wraps read/connect timeouts in URLError; unwrap them so a true
+        # timeout is retryable, while DNS/connection/TLS failures are not.
+        if isinstance(exc.reason, (socket.timeout, TimeoutError)):
+            raise ModelAdapterError("timeout", f"request timed out after {timeout}s") from exc
         raise ModelAdapterError(
             "overloaded", f"cannot reach the endpoint: {type(exc.reason).__name__}"
         ) from exc
@@ -124,11 +127,16 @@ class OpenAIAdapter:
         # host it names, so plaintext HTTP is refused unless explicitly opted
         # in (e.g. a local model server).  This blocks credential exfiltration
         # via a poisoned OPENAI_BASE_URL pointing at an attacker endpoint.
-        if base.startswith("http://") and not self.allow_insecure:
+        from urllib.parse import urlsplit
+
+        scheme = urlsplit(base.strip().lower()).scheme
+        allowed = {"https"} if not self.allow_insecure else {"https", "http"}
+        if scheme not in allowed:
             raise ModelAdapterError(
                 "auth",
-                "refusing plaintext HTTP base URL (would send the API key "
-                "unencrypted); pass allow_insecure=True for a local endpoint",
+                f"refusing base URL scheme {scheme!r} (would send the API key "
+                "over a non-HTTPS channel); pass allow_insecure=True for a "
+                "local plaintext endpoint",
             )
         return f"{base}/chat/completions"
 
@@ -182,7 +190,24 @@ class OpenAIAdapter:
         except ModelAdapterError:
             raise
         except Exception as exc:  # noqa: BLE001 - normalised at the vendor seam
-            raise ModelAdapterError("unknown", f"transport failed: {exc}") from exc
+            # Classify transport-level failures by their cause: a true timeout
+            # is retryable; DNS/connection/TLS failures are not; anything else
+            # is unknown.  This applies whether the default or an injected
+            # transport raised it.
+            import socket
+            import urllib.error
+
+            cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+            if isinstance(cause, (socket.timeout, TimeoutError)):
+                raise ModelAdapterError(
+                    "timeout", f"request timed out after {self.timeout}s"
+                ) from exc
+            if isinstance(exc, urllib.error.URLError):
+                raise ModelAdapterError(
+                    "overloaded",
+                    f"cannot reach the endpoint: {type(cause).__name__}",
+                ) from exc
+            raise ModelAdapterError("unknown", f"transport failed: {type(exc).__name__}") from exc
 
         if status != 200:
             raise self._classify_http_error(status, raw)
@@ -191,14 +216,22 @@ class OpenAIAdapter:
             data = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as exc:
             raise ModelAdapterError(
-                "unknown", f"unparseable vendor response: {exc}", vendor_ref=raw[:500]
+                "unknown",
+                f"unparseable vendor response: {exc}",
+                # Never raw bytes (not JSON-serialisable, and could carry
+                # content) -- a length is enough to audit.
+                vendor_ref={"status": 200, "bytes": len(raw)},
             ) from exc
         return self._map_response(data, raw)
 
     def _map_response(self, data: dict[str, Any], raw: bytes) -> ModelResponse:
         choices = data.get("choices") or []
         if not choices:
-            raise ModelAdapterError("unknown", "vendor returned no choices", vendor_ref=data)
+            raise ModelAdapterError(
+                "unknown",
+                "vendor returned no choices",
+                vendor_ref={"id": data.get("id")} if isinstance(data, dict) else None,
+            )
         message = choices[0].get("message", {})
         usage = data.get("usage", {})
         tool_calls = tuple(
@@ -211,8 +244,19 @@ class OpenAIAdapter:
             finish_reason=choices[0].get("finish_reason", "stop"),
             input_tokens=usage.get("prompt_tokens"),
             output_tokens=usage.get("completion_tokens"),
-            # Preserve a reference to the raw response for audit -- never the key.
-            vendor_ref={"status": 200, "id": data.get("id"), "usage": usage},
+            # Preserve a reference for audit -- an allowlist, never the raw
+            # body: only the vendor id and the three numeric usage fields are
+            # kept, so hostile extra keys can never smuggle content into the
+            # ledger, and no credentials are ever stored.
+            vendor_ref={
+                "status": 200,
+                "id": data.get("id"),
+                "usage": {
+                    key: usage.get(key)
+                    for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                    if isinstance(usage.get(key), int)
+                },
+            },
         )
 
     def _map_tool_call(self, call: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
@@ -237,6 +281,22 @@ class OpenAIAdapter:
                     "vendor returned malformed tool-call arguments",
                     vendor_ref={"id": data.get("id")},
                 ) from exc
+        # A dict (or parsed dict) of unbounded size is a memory-amplification
+        # DoS into the ledger; cap the serialized size.
+        try:
+            serialized = json.dumps(parsed)
+        except (ValueError, TypeError) as exc:
+            raise ModelAdapterError(
+                "unknown",
+                "vendor tool-call arguments are not JSON-serialisable",
+                vendor_ref={"id": data.get("id")},
+            ) from exc
+        if len(serialized) > 1_000_000:
+            raise ModelAdapterError(
+                "unknown",
+                "vendor tool-call arguments exceed the 1MB limit",
+                vendor_ref={"id": data.get("id")},
+            )
         return {
             "name": function.get("name"),
             "arguments": parsed,
