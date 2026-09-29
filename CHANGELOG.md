@@ -2,6 +2,33 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.11.0] - 2026-09-29
+
+### Features
+
+- 品味卡片 CLI 落地：新增 `card-propose` / `card-create` / `card-review` / `card-queue` / `card` 五个命令，卡片层与 taste 层一样可从命令行完整使用；`card-review` 的 split 通过 `--edited` JSON 传入子卡内容。
+- 全局审查跨模块加固（schema 不变，仍为 v6）：一次通读全库的三视角审查，专找模块接缝处的内核削弱，逐项修复如下。
+- `store.query()` / `query_one()` 强制只读（仅 SELECT / WITH / 只读 PRAGMA）：堵死「公共只读 SQL 入口可 INSERT 绕过审核门」的写后门。
+- tombstone 与 generation 跨重启从 `tool.registered` 事件重建；generation 语义细化——shadow 与显式 unload 换代，进程重启的幂等重注册保持代不变。
+- 失败执行的令牌在重建时按 oldest-first 重放：reserved 之后若 `tool.failed` 则释放回——修复「已消费令牌重启后复活」的安全 bug 与「瞬时失败吞授权」。
+- Agent Loop 接受 `ToolRegistry`，tool_call 一律路由过审批门，不再信任 driver 内嵌的 result；无 registry 即契约违反；gated 工具需批准时停为 `waiting_approval`。
+- 插件 `_rollback` 改用 `register` 的 `_restore` 路径恢复被遮蔽的原工具：恢复是 undo 而非重注册，不触发 tombstone。
+- 卡片候选进入 `review_inbox`（`card_pending`）；`state_revisions` 补 `one_child_per_parent` 唯一索引；卡片 review 事件独立为 `taste.card.reviewed`；loop / tool / plugin / taste 的 bookkeeping 事件不再涌入 low 证据窗口。
+- 导出补全（`PluginError` / `ModelProfile` / `ModelCapability` / `Recipe` / `resolve_recipe`）；`validate_output_path` 防止写出 `harness.db-wal` / `harness.db-shm` 等兄弟文件；CLI package 写文件委托 `store.write_context_package`（支持 rendered 文本）。
+
+### Design Rationale
+
+- **为什么公共 query 必须强制只读**：`store.query()` 是所有服务被告知使用的接缝。接缝若可写，任何一行 SQL 都能绕过 ToolRegistry 审批门直接 INSERT——「写入是提案不是事实」在 DB 层的最后一道防线就此失效。把公共查询入口在结构上限定为只读，让绕过审核的写入不再靠约定禁止、而是在物理上不可能。
+- **为什么 Agent Loop 的工具调用必须路由过审批门**：审批门若只对「自愿使用 ToolRegistry 的代码」成立，那主 orchestrator 本身就是最大的旁路。loop 不再信 driver 自煮的结果，每个 tool_call 都走 `validate → approval → execute → log`——「审批是物理不可能」只有落在真正的执行路径上才算成立，否则只是文档里的愿望。
+
+### Notes & Caveats
+
+- 本轮修复包含一个真实安全 bug：已消费的审批令牌因重放顺序错误在重启后复活。
+- 恢复仍是只读重建，不能 resume 暂停的 run——`waiting_approval` 之后需开启新 run。
+- 真实 Model Adapter、执行世界沙箱、自然语言抽取、向量检索、多模态视觉仍未做。
+- 新增 9 个测试，总数到 164。
+
+
 ## [0.10.0] - 2026-09-29
 
 ### Features
