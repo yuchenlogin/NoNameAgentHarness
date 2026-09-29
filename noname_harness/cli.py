@@ -12,6 +12,7 @@ from .context import render_markdown
 from .curator import CuratorService
 from .models import EvidenceInput, ModelCapability, ModelProfile
 from .recipes import DEFAULT_RECIPES, resolve_recipe
+from .router import Router
 from .taste import TasteService
 from .taste_cards import TasteCardService
 from .store import HarnessStore, WorkspaceBoundaryError
@@ -136,6 +137,11 @@ def build_parser() -> argparse.ArgumentParser:
     taste_review.add_argument("--reviewer", required=True, dest="reviewer_id")
     taste_review.add_argument("--content", dest="edited_content")
     taste_review.add_argument("--reason")
+
+    route = sub.add_parser("route", parents=[_db_parent()], help="decide how a session's context should proceed")
+    route.add_argument("--session", required=True, dest="session_id")
+    route.add_argument("--task-type", dest="task_type")
+    route.add_argument("--instruction", help="explicit user instruction (fork/rebirth/switch/subagent)")
 
     recipes = sub.add_parser("recipes", parents=[_db_parent()], help="show default model recipes by task type")
     recipes.add_argument("--task-type", choices=sorted(DEFAULT_RECIPES.keys()), dest="task_type")
@@ -340,6 +346,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         edited_content=edited,
                         reason=args.reason,
                     )
+                )
+            elif args.command == "route":
+                router = Router(store)
+                _print(
+                    router.decide(
+                        session_id=args.session_id,
+                        task_type=args.task_type,
+                        user_instruction=args.instruction,
+                    ).describe()
                 )
             elif args.command == "recipes":
                 if args.task_type:
