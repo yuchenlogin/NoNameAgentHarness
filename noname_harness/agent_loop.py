@@ -198,6 +198,14 @@ class AgentLoop:
             context = self.store.assemble_context_package(
                 task, session_id=self.session_id, task_type=task_type
             )
+            # Inject the model-visible tool contracts so the driver can tell
+            # the model which tools exist (contracts only, never
+            # implementations).  Without this the model could only hallucinate
+            # tool names.
+            if self.tool_registry is not None:
+                context["visible_tools"] = self.tool_registry.visible_tools(
+                    session_id=self.session_id
+                )
             self._transition("SELECTING_MODEL")
             # Model selection is recorded by the package's recipe; the loop
             # does not choose a model itself.
@@ -235,14 +243,30 @@ class AgentLoop:
             # recorded as a *real* loop.transition so the event stream remains
             # the source of truth and reconstruct() sees the terminal state.
             error_text = str(exc)
+            # Preserve structured error classification (e.g. ModelAdapterError's
+            # error_class/retryable/vendor_ref) so the ledger keeps the
+            # actionable detail and the raw vendor reference, not just a string.
+            error_detail: dict[str, Any] = {}
+            error_class = getattr(exc, "error_class", None)
+            if error_class is not None:
+                error_detail["error_class"] = error_class
+                error_detail["retryable"] = getattr(exc, "retryable", False)
+                error_detail["vendor_ref"] = getattr(exc, "vendor_ref", None)
             if self._state not in TERMINAL_STATES:
                 self.store.append_event(
                     self.session_id,
                     "loop.error",
-                    {"state": self._state, "error": error_text, "round": self._rounds},
+                    {
+                        "state": self._state,
+                        "error": error_text,
+                        "round": self._rounds,
+                        **error_detail,
+                    },
                 )
                 self._force_fail(error_text)
-            return self._summary("unrecoverable_error", context, error=error_text)
+            summary = self._summary("unrecoverable_error", context, error=error_text)
+            summary.update(error_detail)
+            return summary
 
     def _check_stop(self, result: LoopResult) -> tuple[str, str] | None:
         if result.stop_reason is not None:

@@ -579,6 +579,16 @@ class ToolRegistry:
         )
         return result
 
+    def get_live_token(self, token_id: str) -> ApprovalToken | None:
+        """Return a live (unconsumed) approval token by id, or None.
+
+        A token crosses the model boundary as a JSON id string; the caller that
+        re-presents it must rehydrate it into the exact ApprovalToken object
+        before the registry will honour it.  This is that lookup.
+        """
+
+        return self._grants.get(token_id)
+
     def _verify_approval(
         self,
         tool: Tool,

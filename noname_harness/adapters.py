@@ -222,9 +222,18 @@ class AdapterDriver:
     permissions itself.
     """
 
-    def __init__(self, adapter: ModelAdapter, *, system_prompt: str | None = None):
+    def __init__(
+        self,
+        adapter: ModelAdapter,
+        *,
+        system_prompt: str | None = None,
+        tool_registry: Any = None,
+    ):
         self.adapter = adapter
         self.system_prompt = system_prompt
+        # Optional registry used to rehydrate approval token ids coming back
+        # from the model into the exact ApprovalToken objects the gate honours.
+        self.tool_registry = tool_registry
 
     def act(self, context: dict[str, Any], last_tool_result: Any = None) -> Any:
         from .agent_loop import LoopResult
@@ -232,15 +241,61 @@ class AdapterDriver:
         request = self._build_request(context, last_tool_result)
         response = self.adapter.complete(request)
         if response.tool_calls:
-            call = response.tool_calls[0]
-            return LoopResult(
-                tool_call={
-                    "name": call.get("name"),
-                    "arguments": call.get("arguments", {}),
-                    "approval_token": call.get("approval_token"),
-                }
-            )
+            if len(response.tool_calls) > 1:
+                # The loop is single-call-per-turn; parallel calls would be
+                # silently dropped, so reject them loudly instead.
+                from .agent_loop import AgentLoopError
+
+                raise AgentLoopError(
+                    f"adapter returned {len(response.tool_calls)} tool calls; "
+                    "the loop executes one tool call per turn"
+                )
+            return LoopResult(tool_call=self._map_tool_call(response.tool_calls[0], context))
         return LoopResult(output=response.text, task_complete=True)
+
+    def _map_tool_call(self, call: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        """Validate and normalise a vendor tool call for the loop's gate.
+
+        A malformed call (no name, arguments=null) is a driver-contract error,
+        not something the registry should choke on with a confusing message.
+        An approval token crosses the model boundary as an id string and must
+        be rehydrated into the exact ApprovalToken object via the registry.
+        """
+
+        from .agent_loop import AgentLoopError
+
+        name = call.get("name")
+        if not name or not isinstance(name, str) or not name.strip():
+            raise AgentLoopError(
+                f"adapter returned a tool call with no valid name: {call!r}"
+            )
+        arguments = call.get("arguments")
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            raise AgentLoopError(
+                f"adapter returned non-object arguments for tool '{name}': {arguments!r}"
+            )
+        # Rehydrate an approval token id (string) into the ApprovalToken the
+        # registry honours.  A bare string would crash the gate's verification.
+        approval_token = call.get("approval_token")
+        if isinstance(approval_token, str):
+            registry = self.tool_registry
+            if registry is None:
+                raise AgentLoopError(
+                    "adapter supplied an approval_token id but no registry is "
+                    "available to rehydrate it"
+                )
+            approval_token = registry.get_live_token(approval_token)
+            if approval_token is None:
+                raise AgentLoopError(
+                    "adapter supplied an unknown or consumed approval token id"
+                )
+        return {
+            "name": name,
+            "arguments": arguments,
+            "approval_token": approval_token,
+        }
 
     def _build_request(
         self, context: dict[str, Any], last_tool_result: Any
@@ -248,13 +303,22 @@ class AdapterDriver:
         messages: list[ModelMessage] = []
         if self.system_prompt:
             messages.append(ModelMessage(role="system", content=self.system_prompt))
-        # The assembled package is the user-visible brief for the model.
+        # The assembled package is the brief for the model.  It carries the
+        # facts the model needs to act: stable canon, current task state, the
+        # recent evidence window (low), the workspace guardrails (so the model
+        # sees the boundary it must respect), advisory next steps, and taste as
+        # soft influence.  NOTE: the package is the secrecy boundary -- only
+        # content that is safe to send to a vendor belongs here.
         import json
 
+        layers = context.get("layers", {})
         brief = {
             "task": context.get("task"),
-            "high": context.get("layers", {}).get("high"),
-            "mid": context.get("layers", {}).get("mid"),
+            "high": layers.get("high"),
+            "mid": layers.get("mid"),
+            "low": layers.get("low"),
+            "guardrails": context.get("guardrails"),
+            "next_step_candidates": context.get("next_step_candidates"),
             "preference": context.get("preference"),
         }
         messages.append(
