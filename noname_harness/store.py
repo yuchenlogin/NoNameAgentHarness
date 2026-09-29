@@ -23,9 +23,13 @@ from .models import EvidenceInput, Event
 from .workspace import git_snapshot
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 VALID_LAYERS = {"high", "mid"}
 VALID_REVIEW_ACTIONS = {"accept", "reject", "edit", "defer", "retire"}
+VALID_TASTE_TRACKS = {"authored", "adopted"}
+VALID_TASTE_SCOPES = {"user", "project"}
+VALID_TASTE_STATUSES = {"candidate", "active", "paused", "retired"}
+VALID_TASTE_ACTIONS = {"adopt", "edit", "pause", "resume", "retire"}
 
 
 class WorkspaceBoundaryError(ValueError):
@@ -178,6 +182,30 @@ class HarnessStore:
             SELECT RAISE(ABORT, 'project metadata is append-only');
         END;
 
+        CREATE TABLE IF NOT EXISTS taste_records (
+            id TEXT PRIMARY KEY,
+            track TEXT NOT NULL CHECK (track IN ('authored', 'adopted')),
+            scope TEXT NOT NULL CHECK (scope IN ('user', 'project')),
+            content_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('candidate', 'active', 'paused', 'retired')),
+            source_event_ids_json TEXT NOT NULL,
+            supersedes_id TEXT REFERENCES taste_records(id),
+            origin TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            reason TEXT,
+            recorded_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS taste_reviews (
+            id TEXT PRIMARY KEY,
+            taste_id TEXT NOT NULL REFERENCES taste_records(id),
+            action TEXT NOT NULL CHECK (action IN ('adopt', 'edit', 'pause', 'resume', 'retire')),
+            reviewer_id TEXT NOT NULL,
+            edited_content_json TEXT,
+            reason TEXT,
+            reviewed_at TEXT NOT NULL
+        );
+
         CREATE TRIGGER IF NOT EXISTS project_append_only_delete
         BEFORE DELETE ON project
         BEGIN
@@ -244,6 +272,30 @@ class HarnessStore:
             SELECT RAISE(ABORT, 'context_packages is append-only');
         END;
 
+        CREATE TRIGGER IF NOT EXISTS taste_records_append_only_update
+        BEFORE UPDATE ON taste_records
+        BEGIN
+            SELECT RAISE(ABORT, 'taste_records is append-only');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS taste_records_append_only_delete
+        BEFORE DELETE ON taste_records
+        BEGIN
+            SELECT RAISE(ABORT, 'taste_records is append-only');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS taste_reviews_append_only_update
+        BEFORE UPDATE ON taste_reviews
+        BEGIN
+            SELECT RAISE(ABORT, 'taste_reviews is append-only');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS taste_reviews_append_only_delete
+        BEFORE DELETE ON taste_reviews
+        BEGIN
+            SELECT RAISE(ABORT, 'taste_reviews is append-only');
+        END;
+
         CREATE TRIGGER IF NOT EXISTS context_packages_append_only_delete
         BEFORE DELETE ON context_packages
         BEGIN
@@ -271,6 +323,13 @@ class HarnessStore:
                 )
             else:
                 current_version = int(current["value"])
+                if current_version > SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"Unsupported schema version {current['value']}; expected {SCHEMA_VERSION}"
+                    )
+                # Migrations are append-only and idempotent: each step upgrades
+                # exactly one version, so a chain v1 -> v2 -> v3 always runs in
+                # order and can be tested step by step.
                 if current_version == 1:
                     columns = {
                         row["name"]
@@ -280,14 +339,21 @@ class HarnessStore:
                         self._connection.execute(
                             "ALTER TABLE state_proposals ADD COLUMN proposal_reason TEXT"
                         )
-                    self._connection.execute(
-                        "UPDATE harness_meta SET value = ? WHERE key = 'schema_version'",
-                        (str(SCHEMA_VERSION),),
-                    )
-                elif current_version != SCHEMA_VERSION:
+                    current_version = 2
+                if current_version == 2:
+                    # v3 introduces the taste layer (taste_records / taste_reviews).
+                    # The tables are created by the shared schema above via
+                    # CREATE TABLE IF NOT EXISTS, so the version bump itself is
+                    # the only durable change required here.
+                    current_version = 3
+                if current_version != SCHEMA_VERSION:  # pragma: no cover - defensive
                     raise RuntimeError(
-                        f"Unsupported schema version {current['value']}; expected {SCHEMA_VERSION}"
+                        f"Unsupported schema version {current_version}; expected {SCHEMA_VERSION}"
                     )
+                self._connection.execute(
+                    "UPDATE harness_meta SET value = ? WHERE key = 'schema_version'",
+                    (str(SCHEMA_VERSION),),
+                )
 
     def initialize_project(self, workspace_root: str | Path, name: str = "NoName project") -> dict[str, str]:
         root = Path(workspace_root).expanduser().resolve()
@@ -998,6 +1064,13 @@ class HarnessStore:
             for event in recent_events
         ]
         next_steps = infer_next_steps(low, mid_state)
+        # Taste is projected independently from facts and merged only here, at
+        # the assembly layer, so an attitude is never mistaken for a fact.
+        # Active user-scope and project-scope tastes are both eligible; the
+        # consumer sees them in an explicit, soft-influence section.
+        from .taste import TasteService
+
+        taste_projection = TasteService(self).active()
         source_event_ids = list(dict.fromkeys(
             [item["event_id"] for item in low]
             + [event_id for item in active_high + mid_state for event_id in item["source_event_ids"]]
@@ -1032,6 +1105,25 @@ class HarnessStore:
             },
             "next_step_candidates": next_steps,
             "pending_review": pending,
+            # Taste lives in its own section, clearly marked as a soft
+            # influence on attitude (ordering, trade-offs, expression), never
+            # as evidence for facts or a reason to lower verification.
+            "preference": {
+                "influence": "soft",
+                "note": (
+                    "Taste shapes attitude only: option ordering, trade-offs, "
+                    "expression and exploration direction. It must not rewrite "
+                    "facts, lower verification standards or override the task."
+                ),
+                "tracks": {
+                    "authored": [
+                        item for item in taste_projection if item["track"] == "authored"
+                    ],
+                    "adopted": [
+                        item for item in taste_projection if item["track"] == "adopted"
+                    ],
+                },
+            },
             "guardrails": {
                 "source_of_truth": "append-only events and evidence",
                 "durable_state_requires_review": True,
@@ -1045,6 +1137,7 @@ class HarnessStore:
                     item["id"]
                     for item in active_high + mid_state
                 ],
+                "taste_ids": [item["id"] for item in taste_projection],
             },
         }
         with self._transaction() as connection:

@@ -11,6 +11,7 @@ from typing import Any, Sequence
 from .context import render_markdown
 from .curator import CuratorService
 from .models import EvidenceInput
+from .taste import TasteService
 from .store import HarnessStore, WorkspaceBoundaryError
 
 
@@ -103,6 +104,31 @@ def build_parser() -> argparse.ArgumentParser:
     package.add_argument("--out")
     package.add_argument("--format", choices=["json", "markdown"], default="markdown")
     package.add_argument("--overwrite", action="store_true")
+
+    taste_add = sub.add_parser("taste-add", parents=[_db_parent()], help="record an authored taste (active immediately)")
+    taste_add.add_argument("--content", required=True, help="JSON taste content (examples and judgements, not adjectives)")
+    taste_add.add_argument("--scope", choices=["user", "project"], default="user")
+    taste_add.add_argument("--source-event", action="append", default=[], dest="source_event_ids")
+    taste_add.add_argument("--by", default="user", dest="actor_id")
+    taste_add.add_argument("--reason")
+
+    taste_propose = sub.add_parser("taste-propose", parents=[_db_parent()], help="propose an adopted taste candidate from a model moment")
+    taste_propose.add_argument("--content", required=True, help="JSON taste content")
+    taste_propose.add_argument("--scope", choices=["user", "project"], default="user")
+    taste_propose.add_argument("--source-event", action="append", required=True, dest="source_event_ids")
+    taste_propose.add_argument("--by", default="model", dest="proposed_by")
+    taste_propose.add_argument("--reason")
+
+    taste_review = sub.add_parser("taste-review", parents=[_db_parent()], help="review a taste record")
+    taste_review.add_argument("--taste-id", required=True)
+    taste_review.add_argument("--action", choices=["adopt", "edit", "pause", "resume", "retire"], required=True)
+    taste_review.add_argument("--reviewer", required=True, dest="reviewer_id")
+    taste_review.add_argument("--content", dest="edited_content")
+    taste_review.add_argument("--reason")
+
+    taste_list = sub.add_parser("taste", parents=[_db_parent()], help="list taste records")
+    taste_list.add_argument("--status", choices=["active", "candidate"], default="active")
+    taste_list.add_argument("--scope", choices=["user", "project"])
 
     return parser
 
@@ -213,6 +239,46 @@ def main(argv: Sequence[str] | None = None) -> int:
                     _print({"package_id": package_value["package_id"], "path": str(destination)})
                 else:
                     print(rendered, end="")
+            elif args.command == "taste-add":
+                service = TasteService(store)
+                _print(
+                    service.record_authored(
+                        _json_value(args.content),
+                        scope=args.scope,
+                        source_event_ids=args.source_event_ids,
+                        actor_id=args.actor_id,
+                        reason=args.reason,
+                    )
+                )
+            elif args.command == "taste-propose":
+                service = TasteService(store)
+                _print(
+                    service.propose_adopted(
+                        _json_value(args.content),
+                        scope=args.scope,
+                        source_event_ids=args.source_event_ids,
+                        proposed_by=args.proposed_by,
+                        reason=args.reason,
+                    )
+                )
+            elif args.command == "taste-review":
+                service = TasteService(store)
+                edited = _json_value(args.edited_content) if args.edited_content else None
+                _print(
+                    service.review(
+                        args.taste_id,
+                        args.action,
+                        args.reviewer_id,
+                        edited_content=edited,
+                        reason=args.reason,
+                    )
+                )
+            elif args.command == "taste":
+                service = TasteService(store)
+                if args.status == "active":
+                    _print(service.active(scope=args.scope))
+                else:
+                    _print(service.pending())
             else:  # pragma: no cover - argparse guarantees a known command
                 raise AssertionError(args.command)
         return 0

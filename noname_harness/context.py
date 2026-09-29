@@ -105,6 +105,30 @@ def render_markdown(package: dict[str, Any]) -> str:
     else:
         lines.extend(["_No recent evidence._", ""])
 
+    # Taste is rendered in its own section, explicitly labelled as a soft
+    # influence.  It never appears inside the factual layers above.
+    preference = package.get("preference")
+    lines.extend(["", "## Preference · taste (soft influence, not fact)", ""])
+    if preference and (preference["tracks"]["authored"] or preference["tracks"]["adopted"]):
+        lines.append(f"_{preference['note']}_")
+        lines.append("")
+        for track in ("authored", "adopted"):
+            items = preference["tracks"][track]
+            if not items:
+                continue
+            label = "Authored · your own words" if track == "authored" else "Adopted · chosen from model moments"
+            lines.extend([f"### {label}", ""])
+            for item in items:
+                lines.append(f"- {_inline(item['content'])}")
+                lines.append(
+                    f"  (scope `{item['scope']}`, status `{item['status']}`, "
+                    f"taste `{item['id']}`)"
+                )
+            lines.append("")
+    else:
+        lines.append("_No active taste yet._")
+        lines.append("")
+
     lines.extend(["", "## Next-step candidates · advisory", ""])
     if package.get("next_step_candidates"):
         for candidate in package["next_step_candidates"]:

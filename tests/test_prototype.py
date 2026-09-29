@@ -344,7 +344,7 @@ def test_project_database_cannot_attach_to_a_different_workspace(tmp_path):
         store.close()
 
 
-def test_schema_v1_is_migrated_with_proposal_reason(tmp_path):
+def test_schema_v1_is_migrated_through_the_chain_to_latest(tmp_path):
     db = tmp_path / "legacy.db"
     connection = sqlite3.connect(db)
     connection.executescript(
@@ -378,7 +378,16 @@ def test_schema_v1_is_migrated_with_proposal_reason(tmp_path):
             "SELECT value FROM harness_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
         assert "proposal_reason" in columns
-        assert version == "2"
+        # A v1 database is upgraded step by step to the current version.
+        assert version == "3"
+        # The taste layer introduced by v3 exists after the migration.
+        taste_tables = {
+            row["name"]
+            for row in store._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'taste_%'"
+            )
+        }
+        assert taste_tables == {"taste_records", "taste_reviews"}
     finally:
         store.close()
 
