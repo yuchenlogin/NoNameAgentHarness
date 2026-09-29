@@ -249,6 +249,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     destination = store.validate_output_path(Path(args.out))
                     if destination.exists() and not args.overwrite:
                         raise FileExistsError(f"refusing to overwrite existing file: {destination}")
+                # --budget/--context-window only mean something with a target
+                # model; fail fast rather than silently drop them.
+                if (args.context_window is not None or args.budget != "medium") and not args.model_id:
+                    raise ValueError("--budget/--context-window require --model-id")
                 model_profile = None
                 if args.model_id:
                     model_profile = ModelProfile(

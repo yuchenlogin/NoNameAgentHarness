@@ -1249,21 +1249,36 @@ class HarnessStore:
             )
         return self.get_proposal(proposal_id)
 
+    # A declared context window below this many tokens is treated as
+    # "tight": the projection assumes roughly a thousand tokens per carried
+    # work event (a diff or test output is rarely smaller), so a window that
+    # can hold only a handful of events tightens the low window further.  The
+    # ratio is a coarse heuristic, named here so it can be revisited, not a
+    # precise estimator.
+    _TIGHT_CONTEXT_WINDOW_TOKENS = 16_000
+
     @staticmethod
-    def _low_limit_for_model(model: "ModelProfile", default: int) -> int:
+    def _low_limit_for_model(model: "ModelProfile", requested: int) -> int:
         """Tighten the low evidence window for a constrained target model.
 
-        Budget posture is the primary dial.  A very small declared context
-        window tightens further, but the window never drops below a floor that
-        keeps a handoff meaningful (a few recent events plus the snapshot).
+        Projection only ever *tightens* the caller's requested window -- a
+        smaller budget or a tight context window narrows it, but nothing ever
+        widens it beyond what the caller asked for.  A floor keeps even the
+        tightest projection useful (a few recent events plus the snapshot),
+        unless the caller explicitly requested fewer than the floor.
         """
 
-        floor = 3
-        by_budget = {"low": max(floor, default // 4), "medium": default, "high": default * 2}
-        limit = by_budget[model.budget]
+        # Respect an explicit small request: the floor only protects the
+        # default window, never overrides a deliberate smaller choice.
+        floor = min(3, requested)
+        limit = requested
+        if model.budget == "low":
+            limit = max(floor, limit // 4)
+        # "medium" and "high" keep the requested window: a larger budget does
+        # not widen it beyond the caller's ask.
         window = model.capability.context_window
-        if window is not None and window < 16_000:
-            limit = max(floor, min(limit, limit // 2))
+        if window is not None and window < HarnessStore._TIGHT_CONTEXT_WINDOW_TOKENS:
+            limit = max(floor, limit // 2)
         return limit
 
     def active_state(
@@ -1328,22 +1343,38 @@ class HarnessStore:
         # test/error/diff events that explain why the handoff exists.
         # Fetch a little beyond the requested window because source events
         # already promoted to high/mid state are intentionally omitted.
+        # Two distinct windows are derived from the same work history:
+        #
+        # * the *display* window (``recent_events``) is what the target model's
+        #   budget trims -- it is the only model-dependent part of the package;
+        # * the *inference* window (``inference_events``) is model-independent,
+        #   so advisory next steps never change just because the target model
+        #   has a smaller context budget.
+        #
+        # The inference window is deliberately generous and independent of
+        # ``low_limit``: advisory reasoning should see the same recent history
+        # regardless of which model the package is projected for.
+        inference_window = 100
         work_limit = low_limit + len(promoted_event_ids)
+        fetch_limit = max(work_limit, low_limit, inference_window + len(promoted_event_ids))
+        inference_events: list[Event] = []
         recent_events = []
         for event in self.list_work_events(
             session_id=session_id,
-            limit=max(work_limit, low_limit),
+            limit=fetch_limit,
             include_workspace_snapshots=False,
         ):
             if event.id in promoted_event_ids:
                 continue
-            recent_events.append(event)
-            if len(recent_events) >= low_limit:
-                break
+            if len(inference_events) < inference_window:
+                inference_events.append(event)
+            if len(recent_events) < low_limit:
+                recent_events.append(event)
         if snapshot_event is not None:
             recent_events.append(snapshot_event)
-        low = [
-            {
+            inference_events.append(snapshot_event)
+        def _low_item(event: Event) -> dict[str, Any]:
+            return {
                 "event_id": event.id,
                 "session_id": event.session_id,
                 "seq": event.seq,
@@ -1353,9 +1384,13 @@ class HarnessStore:
                 "content_hash": event.content_hash,
                 "evidence": self.evidence_for_event(event.id),
             }
-            for event in recent_events
-        ]
-        next_steps = infer_next_steps(low, mid_state)
+
+        low = [_low_item(event) for event in recent_events]
+        # Next steps are advisory, but they must not depend on the target
+        # model's budget: inference runs over the model-independent window.
+        next_steps = infer_next_steps(
+            [_low_item(event) for event in inference_events], mid_state
+        )
         # Taste is projected independently from facts and merged only here, at
         # the assembly layer, so an attitude is never mistaken for a fact.
         # Active user-scope and project-scope tastes are both eligible; the
@@ -1363,14 +1398,25 @@ class HarnessStore:
         from .taste import TasteService
 
         taste_projection = TasteService(self).active()
-        source_event_ids = list(dict.fromkeys(
-            [item["event_id"] for item in low]
-            + [event_id for item in active_high + mid_state for event_id in item["source_event_ids"]]
+        # Provenance is split into a model-independent state part and a
+        # model-dependent evidence part, so the invariant "reviewed state is
+        # traceable identically for every target model" is actually true.
+        #
+        # State provenance covers reviewed canon, task state, pending proposals
+        # and taste -- it is identical for every projection of the same ledger.
+        state_event_ids = list(dict.fromkeys(
+            [event_id for item in active_high + mid_state for event_id in item["source_event_ids"]]
             + [event_id for item in pending for event_id in item["source_event_ids"]]
             # An adopted taste cites the "model moment" that justified it; those
             # source events must be part of the package provenance too, or a
             # taste could point at evidence the package cannot account for.
             + [event_id for item in taste_projection for event_id in item["source_event_ids"]]
+        ))
+        # Evidence provenance additionally covers the low events this
+        # projection chose to carry; it legitimately varies with the target
+        # model's budget, and is kept separate so that variation is explicit.
+        source_event_ids = list(dict.fromkeys(
+            [item["event_id"] for item in low] + state_event_ids
         ))
         evidence_ids = list(dict.fromkeys(
             evidence["id"]
@@ -1447,6 +1493,9 @@ class HarnessStore:
                     for item in active_high + mid_state
                 ],
                 "taste_ids": [item["id"] for item in taste_projection],
+                # Model-independent: identical for every projection of the same
+                # ledger, regardless of the target model's evidence budget.
+                "state_event_ids": state_event_ids,
             },
         }
         with self._transaction() as connection:

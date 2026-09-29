@@ -2,6 +2,26 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.6.0] - 2026-09-29
+
+### Features
+
+- 模型能力契约（schema 不变，仍为 v5）：`noname_harness/models.py` 新增 `ModelCapability`（reasoning / vision / tool_calling / context_window）与 `ModelProfile`（目标模型能力 + 预算姿态 low/medium/high）。纯契约层，不调用任何真实外部模型。
+- 配方注册表：`noname_harness/recipes.py` 新增 6 个默认配方（question / research / code-change / memory-write / taste-card / high-risk），把任务类型映射到建议的角色链，对齐 docs/runtime-architecture.md；配方是建议而非锁死，注册表可注入覆盖；memory-write 配方强制 extractor 与 conflict-checker 由不同角色承担。
+- 按模型投影接续包：`assemble_context_package` 接受可选 `model` 与 `task_type`。核心不变式是「事实对任何模型一致」——已审核法典、任务态、品味、provenance 完全不变，只按目标模型的预算姿态与 context window 收紧低层证据窗口（low 约 1/4、high 约 2 倍、<16k 窗口再减半、地板 3）；投影目标与配方记入 assembly 元数据与 `context.assembled` 账本事件。
+- CLI：`package` 新增 `--model-id` / `--budget` / `--context-window` / `--task-type`；新增 `recipes` 命令查看默认配方。
+
+### Design Rationale
+
+- **为什么投影只裁剪低层证据窗口，而不动法典 / 任务态 / 品味 / 溯源**：上下文包是投影，不是数据库——换模型换的是投影参数，不是事实来源。低层是「最近工作现场」，本来就是最易从事件流重建的一层，裁剪发生在这一层代价最小、可逆性最强；而已审核的法典、任务态、品味是经过人工确认的稳定层，若因目标模型不同而改变，等于让「给哪个模型看」反过来决定「事实是什么」，溯源也会随之分叉。所以稳定层对任何模型逐字一致，只有低层窗口随预算伸缩。
+- **为什么配方是「建议 + 入账」而非直接路由**：原型没有真实外部模型可路由，此时做自动路由只是空转。但把每次推荐的配方、角色链与理由记入 assembly 元数据和 `context.assembled` 账本事件，等于提前积累了路由决策的证据——未来接入真实路由时，规则不是从空白开始设计，而是可以回放账本、回答「这次推荐是否合适」，路由因此可解释、可审计。
+
+### Notes & Caveats
+
+- 本步仍是契约层：不含真实模型调用、流式输出、计费、向量检索；`ModelProfile` 只是投影参数，不验证目标模型是否真实存在。
+- 低层裁剪有地板（窗口至少保留 3 条事件），保证即使最低预算下接续包仍可接管。
+- 新增 6 个测试（契约、配方、按预算与窗口投影、元数据入账、CLI 参数），总数到 75。
+
 ## [0.5.0] - 2026-09-29
 
 ### Features

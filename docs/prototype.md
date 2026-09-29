@@ -214,11 +214,36 @@ python3 -m noname_harness inbox --db .noname/harness.db
 
 每条事项附带来源事件、冲突引用和提出理由，让审核人做判断而不是盲点。收件箱完全由 append-only 表派生，自身不存任何事实，随时可以重建。
 
+### 2.3 跨模型投影与配方
+
+同一个事实基座可以为不同目标模型投影出不同的接续包。通过 `package` 的可选参数声明投影目标：
+
+```bash
+python3 -m noname_harness package \
+  --db .noname/harness.db \
+  --session s1 \
+  --task "继续处理上次的测试问题" \
+  --model-id some-strong-model \
+  --budget low \
+  --context-window 32000 \
+  --task-type code-change \
+  --out .noname/packages/handoff.md
+```
+
+核心不变式是「事实对任何模型一致」：为哪个模型投影只改变低层证据窗口的宽窄（`low` 预算约收紧到 1/4、`high` 约放宽到 2 倍、窗口小于 16k 再减半、地板 3 条），已审核的法典、任务态、品味和 provenance 完全不变——换模型不换事实来源。投影目标与所用配方会记入包的 assembly 元数据和 `context.assembled` 账本事件，未来可回放审计。
+
+`--task-type` 选择配方：内置 6 个默认配方（question / research / code-change / memory-write / taste-card / high-risk），把任务类型映射到建议的角色链。配方是建议而非锁死——原型没有真实外部模型可路由，但推荐与理由会入账，让未来的路由规则可解释。查看默认配方：
+
+```bash
+python3 -m noname_harness recipes --db .noname/harness.db
+python3 -m noname_harness recipes --db .noname/harness.db --task-type code-change
+```
+
 ## 3. 当前不做什么
 
 这不是完整的 agent runtime，目前明确不包含：
 
-- 外部模型调用、模型适配器和自动模型切换；
+- 真实外部模型调用、流式输出、计费与自动模型路由（模型能力契约与按预算投影、配方建议与入账已落地，但尚无任何真实模型被调用）；
 - 文件、命令、网络工具的实际执行；
 - 自然语言记忆抽取、向量检索和语义重排（当前只有 FTS5 文字检索）；
 - 品味卡片、聚类、多模态图像和插件运行时（品味层本身已有双轨 MVP：两条来源轨道、版本化审核、独立 preference section，但无卡片、无视觉、无聚类）；
