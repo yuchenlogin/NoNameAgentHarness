@@ -482,13 +482,16 @@ class TasteCardService:
         # Candidates first (awaiting a first decision), ordered by an explicit,
         # auditable rule -- oldest first, id as tie-break -- never by insertion
         # accident.  Active cards follow, by longest time since confirmation.
+        # Tie-break on rowid (monotonic insertion order), not the random id, so
+        # the queue is deterministic even when two cards share a
+        # second-resolution timestamp.
         candidates = sorted(
             (r for r in heads if r["status"] == "candidate"),
-            key=lambda r: (r["recorded_at"], r["id"]),
+            key=lambda r: (r["recorded_at"], r["_rowid"]),
         )
         active = sorted(
             (r for r in heads if r["status"] == "active"),
-            key=lambda r: (r["last_confirmed_at"], r["id"]),
+            key=lambda r: (r["last_confirmed_at"], r["_rowid"]),
         )
         ordered = candidates + active
         return [self._project(row) for row in ordered[:limit]]
@@ -497,7 +500,9 @@ class TasteCardService:
     # internals
     # ------------------------------------------------------------------
     def _head_rows(self) -> list[Any]:
-        rows = self.store.query("SELECT * FROM taste_cards ORDER BY recorded_at, rowid")
+        rows = self.store.query(
+            "SELECT rowid AS _rowid, * FROM taste_cards ORDER BY recorded_at, rowid"
+        )
         superseded = {row["supersedes_id"] for row in rows if row["supersedes_id"]}
         return [row for row in rows if row["id"] not in superseded]
 

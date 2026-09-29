@@ -13,7 +13,7 @@ from noname_harness.taste_cards import TasteCardService
 
 def make_store(tmp_path):
     root = tmp_path / "project"
-    root.mkdir()
+    root.mkdir(parents=True)
     store = HarnessStore(root / ".noname" / "harness.db")
     store.initialize_project(root, "cards project")
     return store, root
@@ -364,16 +364,34 @@ def test_split_inherits_image_contract(tmp_path):
         store.close()
 
 
-def test_review_queue_candidates_sorted_by_recorded_time(tmp_path):
+def test_review_queue_candidates_sorted_by_insertion_order(tmp_path):
     store, _ = make_store(tmp_path)
     try:
         authored = TasteService(store).record_authored({"judgement": "x"})
         cards = TasteCardService(store)
         c1 = cards.create_card(title="一", attitude="a", track="authored", scope="user", taste_ids=[authored["id"]])
         c2 = cards.create_card(title="二", attitude="a", track="authored", scope="user", taste_ids=[authored["id"]])
+        # Even when created within the same second (timestamps tie), the queue
+        # orders candidates by insertion order (rowid), not the random id.
         queue = cards.review_queue()
         candidate_ids = [c["id"] for c in queue if c["status"] == "candidate"]
-        # Oldest candidate first, deterministically.
         assert candidate_ids == [c1["id"], c2["id"]]
+        # Repeated calls are deterministic.
+        assert [c["id"] for c in cards.review_queue() if c["status"] == "candidate"] == candidate_ids
     finally:
         store.close()
+
+
+def test_review_queue_is_deterministic_across_many_runs(tmp_path):
+    # Run the same scenario repeatedly to catch timestamp-resolution flakes.
+    for i in range(20):
+        store, _ = make_store(tmp_path / f"run{i}")
+        try:
+            authored = TasteService(store).record_authored({"judgement": "x"})
+            cards = TasteCardService(store)
+            c1 = cards.create_card(title="一", attitude="a", track="authored", scope="user", taste_ids=[authored["id"]])
+            c2 = cards.create_card(title="二", attitude="a", track="authored", scope="user", taste_ids=[authored["id"]])
+            queue = [c["id"] for c in cards.review_queue() if c["status"] == "candidate"]
+            assert queue == [c1["id"], c2["id"]]
+        finally:
+            store.close()
