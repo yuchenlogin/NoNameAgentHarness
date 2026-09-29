@@ -2,6 +2,31 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.12.0] - 2026-09-29
+
+### Features
+
+- 执行世界/沙箱落地（架构 §5 能力层最后一块，schema 不变，仍为 v6）：新增 `noname_harness/sandbox.py`（`Sandbox`）——文件读/写强制约束在工作区根目录内；命令执行为允许列表 + 硬超时 + 输出捕获；产出注册进 ToolRegistry 的工具（`read_file`=never、`write_file`=always、`run_command`=destructive/always），沙箱边界与审批门是两层独立防线；每次操作产出证据事件。
+- 默认允许列表只含纯只读且无 exec/write hook 的命令（`ls`/`cat`/`echo`/`grep`/`wc`/`head`/`tail`/`pwd`/`date`）；`git`/`find`/`sed`/`awk`/`xargs`/解释器（`pytest`/`python3`）全部移除——它们本身就是任意执行原语（`git -c alias`、`find -exec`），执行面无法枚举。
+- argv 路径扫描：任何解析为路径的命令参数必须在工作区内——只读命令带 `/etc/passwd` 也能 exfiltrate，必须堵。
+- 写入经 `store.write_text_nofollow`：open 用未 resolve 的原始路径 + `O_NOFOLLOW`，TOCTOU 窗口关闭（resolve 只用于边界判定）；`O_NOFOLLOW` 缺失的平台 fail-closed。
+- DB 侧车防护：名称（大小写不敏感，含 `-journal`）+ inode（`os.path.samefile` 对 db + 全部侧车）双重判定，hardlink 穿透被堵。
+- 命令在独立进程组运行，超时 `killpg` 杀整组；pipe 排空无界改有界；非零退出记 `tool.failed`；`execve` 失败入账。
+- 二进制文件以 hex 无损存储并标记 `encoding`；`read_file` 拒绝 FIFO（防永久阻塞）；截断有 `truncated` / `evidence_chars` 标记。
+
+### Design Rationale
+
+- **为什么允许列表按可执行名过滤不充分**：`git`/`find` 这类「安全」命令本身就是任意执行原语——`git -c alias.x=!cmd`、`find -exec`、`sed -e e` 都能借它们的合法外壳执行任意命令，执行面无法枚举。按名字过滤只是「尽量拦截」：每漏掉一个 flag 或子命令组合就是一个洞。默认只允许纯只读、无 exec/write hook 的命令，才让「越界执行不可能发生」在结构上成立，而不是靠拦截清单的完备性祈祷。
+- **为什么写入必须用未 resolve 路径 + O_NOFOLLOW**：`resolve` 会静默跟随 symlink，校验时解析出的真实目标与写入时的真实目标之间隔着 TOCTOU 窗口——攻击者在窗口内替换 symlink 即可把写出到边界外，而所有检查都「通过」。resolve 只用于边界判定；open 时用未 resolve 的原始路径加 `O_NOFOLLOW` 拒绝最终组件 symlink，校验与写入才对最终组件原子，窗口在结构上被关闭而不是被缩小。
+
+### Notes & Caveats
+
+- 解释器 / test runner / `git` / `find` 等需显式 opt-in（`allowed_commands`），此时边界弱化为仅审批门——沙箱层不再提供物理保证。
+- 沙箱不含网络隔离、资源限额（CPU/内存）、chroot/namespace，那属更深的沙箱层，后续按需叠加。
+- 经两轮对抗性审查（两次 REJECT 后修复），共修复多个 REJECT 级漏洞，含一个真实毁库向量：hardlink 到 `harness.db-wal`。
+- 新增 22 个测试，总数到 186。
+
+
 ## [0.11.0] - 2026-09-29
 
 ### Features

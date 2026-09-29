@@ -120,7 +120,7 @@ validate → policy → approval → execute → normalize → log → present
 - 遮蔽单调性 + tombstone：同名注册与 unregister 后重注册都不能削弱审批门；
 - 作用域保留 global / session 两级，agent 因原型层无强制力暂移除；
 - 落地管线为 `validate → approval → execute → log → return`（policy / normalize / present 在原型层尚无对应物）；
-- 执行世界（真实副作用、沙箱、超时、并发）属下一阶段。
+- 执行世界/沙箱已落地：`noname_harness/sandbox.py` 提供文件读/写与命令执行——文件操作强制约束在工作区根目录内，写入用未 resolve 原始路径 + `O_NOFOLLOW` 关闭 TOCTOU 窗口（resolve 仅用于边界判定，平台缺 `O_NOFOLLOW` 则 fail-closed）；命令执行为纯只读默认允许列表（`git`/`find`/解释器等任意执行原语全部移除，需显式 opt-in）+ argv 路径扫描（工作区外路径参数直接拒绝）+ 独立进程组硬超时（`killpg` 杀整组）。产出注册进 ToolRegistry 的工具走审批门（`read_file`=never、`write_file`=always、`run_command`=destructive/always）——沙箱边界与审批门是两层独立防线，每次操作产出证据事件。本层不含网络隔离与资源限额（CPU/内存），属更深的沙箱层。
 
 ## 6. Agent Loop
 
