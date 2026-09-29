@@ -6,6 +6,7 @@ import pytest
 
 from noname_harness.agent_loop import AgentLoop, AgentLoopError, LoopResult
 from noname_harness.store import HarnessStore
+from noname_harness.tools import Tool, ToolRegistry, ToolSchema
 
 
 def make_store(tmp_path):
@@ -56,11 +57,18 @@ def test_happy_path_completes_and_logs_transitions(tmp_path):
 def test_tool_call_turn_goes_through_waiting_tool(tmp_path):
     store, _ = make_store(tmp_path)
     try:
+        # A read tool registered in the registry; the loop routes the call
+        # through the approval gate and returns its real output.
+        registry = ToolRegistry(store)
+        registry.register(Tool(
+            ToolSchema(name="search", description="d", input_schema={"q": "string"}),
+            execute=lambda a: [f"hit:{a['q']}"], permission="read", approval="never",
+        ))
         driver = ScriptedDriver([
-            LoopResult(tool_call={"name": "search", "result": ["hit"]}),
+            LoopResult(tool_call={"name": "search", "arguments": {"q": "noname"}}),
             LoopResult(task_complete=True),
         ])
-        loop = AgentLoop(store=store, session_id="s", driver=driver)
+        loop = AgentLoop(store=store, session_id="s", driver=driver, tool_registry=registry)
         summary = loop.run("research")
         assert summary["final_state"] == "COMPLETED"
         assert summary["rounds"] == 2
@@ -70,6 +78,46 @@ def test_tool_call_turn_goes_through_waiting_tool(tmp_path):
             )
         ]
         assert "WAITING_TOOL" in states
+        # The call went through the gate: tool.* events are in the ledger.
+        types = [e.event_type for e in store.list_events("s", limit=100)]
+        assert "tool.requested" in types
+        assert "tool.completed" in types
+    finally:
+        store.close()
+
+
+def test_tool_call_without_registry_is_a_contract_violation(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        # A driver asking for a tool with no registry configured: the loop must
+        # NOT trust a self-cooked result -- it fails loudly instead.
+        driver = ScriptedDriver([LoopResult(tool_call={"name": "x", "result": "fake"})])
+        loop = AgentLoop(store=store, session_id="s", driver=driver)
+        summary = loop.run("t")
+        assert summary["final_state"] == "FAILED"
+        assert "no tool_registry" in summary["error"]
+    finally:
+        store.close()
+
+
+def test_gated_tool_in_loop_stops_for_approval(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        registry = ToolRegistry(store)
+        registry.register(Tool(
+            ToolSchema(name="delete", description="d", input_schema={"path": "string"}),
+            execute=lambda a: "gone", permission="destructive", approval="always",
+        ))
+        driver = ScriptedDriver([LoopResult(tool_call={"name": "delete", "arguments": {"path": "/tmp/x"}})])
+        loop = AgentLoop(store=store, session_id="s", driver=driver, tool_registry=registry)
+        summary = loop.run("t")
+        # The gated tool cannot run without a token: the loop stops for approval
+        # rather than executing or fabricating a result.
+        assert summary["final_state"] == "CANCELLED"
+        assert summary["stop_reason"] == "waiting_approval"
+        types = [e.event_type for e in store.list_events("s", limit=100)]
+        assert "tool.approval_required" in types
+        assert "tool.completed" not in types
     finally:
         store.close()
 

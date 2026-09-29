@@ -176,10 +176,10 @@ class PluginRuntime:
         for name, original in zip(reversed(registered), reversed(displaced)):
             self.registry.unregister(name)
             if original is not None:
-                # The displaced tool is an exact Tool instance; re-register it.
-                # Its generation has moved on, which is correct -- it is a fresh
-                # registration, and stale grants stay invalid.
-                self.registry.register(original)
+                # The displaced tool is an exact Tool instance; put it back via
+                # the restore path, which is an undo -- the transient shadow may
+                # have ratcheted the tombstone, and restoring must not trip it.
+                self.registry.register(original, _restore=True)
 
     def unload(self, plugin_id: str) -> dict[str, Any]:
         plugin = self._loaded.pop(plugin_id, None)

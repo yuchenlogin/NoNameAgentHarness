@@ -104,7 +104,7 @@ def test_review_inbox_aggregates_canon_task_and_taste(tmp_path):
         )
 
         inbox = store.review_inbox()
-        assert inbox["counts"] == {"canon": 1, "task": 1, "taste": 1, "total": 3}
+        assert inbox["counts"] == {"canon": 1, "task": 1, "taste": 1, "card": 0, "total": 3}
         assert inbox["canon_pending"][0]["id"] == canon["id"]
         assert inbox["canon_pending"][0]["impact"] == "project canon (long-term)"
         assert inbox["task_pending"][0]["layer"] == "mid"

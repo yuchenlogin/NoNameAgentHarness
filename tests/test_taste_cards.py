@@ -212,7 +212,7 @@ def test_card_events_are_logged(tmp_path):
         cards.review(card["id"], "accept", "user")
         types = [e.event_type for e in store.list_events("system", limit=50)]
         assert "taste.card.generated" in types
-        assert "taste.reviewed" in types
+        assert "taste.card.reviewed" in types
     finally:
         store.close()
 

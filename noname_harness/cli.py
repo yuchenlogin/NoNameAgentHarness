@@ -299,9 +299,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else:
                     rendered = render_markdown(package_value)
                 if destination is not None:
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    destination.write_text(rendered, encoding="utf-8")
-                    _print({"package_id": package_value["package_id"], "path": str(destination)})
+                    # Delegate the write to the store's sanctioned path so the
+                    # boundary/sidecar validation lives in exactly one place.
+                    written = store.write_context_package(
+                        destination, package_value, overwrite=True, rendered=rendered
+                    )
+                    _print({"package_id": package_value["package_id"], "path": str(written)})
                 else:
                     print(rendered, end="")
             elif args.command == "taste-add":

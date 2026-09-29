@@ -1,10 +1,11 @@
 """A small, local-first prototype for evidence-backed agent handoffs."""
 
-from .models import EvidenceInput, Event
+from .models import EvidenceInput, Event, ModelCapability, ModelProfile
 from .curator import CuratorService
 from .taste import TasteService
 from .taste_cards import TasteCardService
-from .plugins import Plugin, PluginContribution, PluginManifest, PluginRuntime
+from .plugins import Plugin, PluginContribution, PluginError, PluginManifest, PluginRuntime
+from .recipes import Recipe, RoleSpec, resolve_recipe
 from .agent_loop import AgentLoop, AgentLoopError, LoopResult, SessionDriver
 from .tools import (
     ApprovalToken,
@@ -31,6 +32,12 @@ __all__ = [
     "PluginContribution",
     "PluginManifest",
     "PluginRuntime",
+    "PluginError",
+    "ModelCapability",
+    "ModelProfile",
+    "Recipe",
+    "RoleSpec",
+    "resolve_recipe",
     "ApprovalToken",
     "Tool",
     "ToolApprovalRequired",

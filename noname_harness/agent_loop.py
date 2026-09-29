@@ -47,6 +47,9 @@ STATES = {
 TERMINAL_STATES = {"COMPLETED", "FAILED", "CANCELLED"}
 
 # Explicit stop reasons.
+# Sentinel returned when a gated tool needs approval before it can run.
+_WAITING_APPROVAL = object()
+
 STOP_REASONS = {
     "task_complete",
     "user_pause",
@@ -112,6 +115,10 @@ class AgentLoop:
     driver: SessionDriver
     max_rounds: int = 10
     budget_rounds: int | None = None
+    # Optional tool registry.  When present, every driver tool_call is routed
+    # through the approval gate; when absent, the loop is a pure state-machine
+    # driver with no execution (tool_calls become a contract violation).
+    tool_registry: Any = None
     _state: str = field(default="IDLE", init=False)
     _rounds: int = field(default=0, init=False)
 
@@ -203,7 +210,12 @@ class AgentLoop:
 
                 if result.tool_call is not None:
                     self._transition("WAITING_TOOL", {"tool": result.tool_call.get("name")})
-                    last_tool_result = result.tool_call.get("result")
+                    last_tool_result = self._execute_tool_call(result.tool_call)
+                    if last_tool_result is _WAITING_APPROVAL:
+                        # The tool needs approval: stop and surface it, do not
+                        # fabricate a result or continue as if it ran.
+                        self._transition("CANCELLED", {"reason": "waiting_approval"})
+                        return self._summary("waiting_approval", context)
                     self._transition("APPLYING_RESULT")
                 else:
                     self._transition("APPLYING_RESULT")
@@ -250,6 +262,37 @@ class AgentLoop:
         if self.budget_rounds is not None and self._rounds >= self.budget_rounds:
             return ("FAILED", "budget_limit")
         return None
+
+    def _execute_tool_call(self, tool_call: dict[str, Any]) -> Any:
+        """Route a driver's tool call through the approval gate.
+
+        The loop never trusts a result the driver cooked up itself: a tool
+        call is executed via the injected :class:`ToolRegistry`, so validation,
+        approval and ledger logging all apply.  Without a registry the loop
+        cannot execute tools at all -- a tool_call is then a contract
+        violation, surfaced as a FAILED run rather than silently trusted.
+        """
+
+        if self.tool_registry is None:
+            raise AgentLoopError(
+                "driver requested a tool call but no tool_registry is configured; "
+                "the loop will not execute unverified tools"
+            )
+        from .tools import ToolApprovalRequired
+
+        name = tool_call.get("name")
+        arguments = tool_call.get("arguments", {})
+        approval_token = tool_call.get("approval_token")
+        try:
+            result = self.tool_registry.request(
+                name,
+                arguments,
+                session_id=self.session_id,
+                approval_token=approval_token,
+            )
+        except ToolApprovalRequired:
+            return _WAITING_APPROVAL
+        return result.get("output")
 
     @staticmethod
     def _validate_result(result: LoopResult) -> None:

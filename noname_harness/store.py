@@ -112,6 +112,26 @@ def _parse_instant(value: str, field: str) -> str:
     return parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+
+def _is_read_only_sql(sql: str) -> bool:
+    """Return whether a statement is a plain read (SELECT / WITH / read PRAGMA).
+
+    A public query seam must never be a write backdoor around the kernel's
+    review gates.  Only reads are allowed; PRAGMA is limited to its query
+    forms (``PRAGMA table_info(...)`` etc.), never state-changing assignments
+    like ``PRAGMA foreign_keys = OFF``.
+    """
+
+    stripped = sql.lstrip().lower()
+    if stripped.startswith("select") or stripped.startswith("with"):
+        return True
+    if stripped.startswith("pragma"):
+        # A PRAGMA containing '=' is an assignment (a write).  Query forms
+        # either have no '=' or use the function-call form "name(...)".
+        return "=" not in stripped
+    return False
+
+
 class HarnessStore:
     """The local fact base for one NoName project."""
 
@@ -358,6 +378,9 @@ class HarnessStore:
             SELECT RAISE(ABORT, 'context_packages is append-only');
         END;
 
+        CREATE UNIQUE INDEX IF NOT EXISTS state_revisions_one_child_per_parent
+            ON state_revisions(supersedes_id) WHERE supersedes_id IS NOT NULL;
+
         CREATE UNIQUE INDEX IF NOT EXISTS taste_records_one_child_per_parent
             ON taste_records(supersedes_id) WHERE supersedes_id IS NOT NULL;
 
@@ -533,8 +556,16 @@ class HarnessStore:
 
         destination = self.validate_workspace_path(path)
         database = self.db_path.expanduser().resolve()
-        if destination == database:
-            raise WorkspaceBoundaryError("refusing to use the harness database as an output file")
+        # Refuse the database and its WAL-mode sidecar files: writing to
+        # harness.db-wal / harness.db-shm would corrupt the live database.
+        db_name = database.name
+        if destination == database or (
+            destination.parent == database.parent
+            and destination.name in {db_name, f"{db_name}-wal", f"{db_name}-shm"}
+        ):
+            raise WorkspaceBoundaryError(
+                "refusing to use the harness database or its sidecar files as an output file"
+            )
         if destination.exists() and destination.is_dir():
             raise ValueError("context package output path must be a file")
         return destination
@@ -664,13 +695,23 @@ class HarnessStore:
         )
 
     def query(self, sql: str, args: Sequence[Any] = ()) -> list[sqlite3.Row]:
-        """Run a read-only query against the store for service projections."""
+        """Run a read-only query against the store for service projections.
 
+        This is a *read* seam: a statement that writes (INSERT/UPDATE/DELETE/
+        DDL) would bypass every review gate the kernel enforces, so anything
+        that is not a plain SELECT/WITH...SELECT is refused here.  Services
+        that need to write go through the explicit store methods instead.
+        """
+
+        if not _is_read_only_sql(sql):
+            raise ValueError("query() is read-only; use store methods for writes")
         return self._connection.execute(sql, tuple(args)).fetchall()
 
     def query_one(self, sql: str, args: Sequence[Any] = ()) -> sqlite3.Row | None:
         """Run a read-only query expected to return at most one row."""
 
+        if not _is_read_only_sql(sql):
+            raise ValueError("query_one() is read-only; use store methods for writes")
         return self._connection.execute(sql, tuple(args)).fetchone()
 
     def get_event(self, event_id: str) -> Event:
@@ -732,7 +773,17 @@ class HarnessStore:
 
         if limit < 1:
             raise ValueError("limit must be positive")
-        clauses = ["event_type NOT LIKE 'memory.%'", "event_type != 'context.assembled'"]
+        # Bookkeeping and state-machine noise never belong in the low evidence
+        # window: it exists to carry the work itself (diffs, test results,
+        # commands, errors), not the loop/tool/plugin/card machinery around it.
+        clauses = [
+            "event_type NOT LIKE 'memory.%'",
+            "event_type != 'context.assembled'",
+            "event_type NOT LIKE 'loop.%'",
+            "event_type NOT LIKE 'tool.%'",
+            "event_type NOT LIKE 'plugin.%'",
+            "event_type NOT LIKE 'taste.%'",
+        ]
         args: list[Any] = []
         if not include_workspace_snapshots:
             clauses.append("event_type != 'workspace.snapshot'")
@@ -1142,6 +1193,24 @@ class HarnessStore:
                 }
             )
 
+        from .taste_cards import TasteCardService
+
+        card_items = []
+        for card in TasteCardService(self).by_status("candidate"):
+            card_items.append(
+                {
+                    "kind": "taste_card_candidate",
+                    "id": card["id"],
+                    "title": card["title"],
+                    "summary": card["attitude"],
+                    "impact": f"taste card ({card['scope']} scope, attitude only)",
+                    "track": card["track"],
+                    "taste_ids": card["taste_ids"],
+                    "stale": card["stale"],
+                    "created_at": card["recorded_at"],
+                }
+            )
+
         taste_items = []
         for record in TasteService(self).pending():
             taste_items.append(
@@ -1163,11 +1232,13 @@ class HarnessStore:
             "canon_pending": [item for item in canon_items if item["layer"] == "high"],
             "task_pending": [item for item in canon_items if item["layer"] == "mid"],
             "taste_pending": taste_items,
+            "card_pending": card_items,
             "counts": {
                 "canon": sum(1 for item in canon_items if item["layer"] == "high"),
                 "task": sum(1 for item in canon_items if item["layer"] == "mid"),
                 "taste": len(taste_items),
-                "total": len(canon_items) + len(taste_items),
+                "card": len(card_items),
+                "total": len(canon_items) + len(taste_items) + len(card_items),
             },
         }
 
@@ -1606,13 +1677,26 @@ class HarnessStore:
             raise KeyError(f"unknown context package: {package_id}")
         return _decode(row["package_json"])
 
-    def write_context_package(self, path: str | Path, package: dict[str, Any], *, overwrite: bool = False) -> Path:
+    def write_context_package(
+        self,
+        path: str | Path,
+        package: dict[str, Any],
+        *,
+        overwrite: bool = False,
+        rendered: str | None = None,
+    ) -> Path:
+        """Write a context package to a workspace file.
+
+        ``rendered`` lets the caller supply the exact text (for example the
+        Markdown view); otherwise the canonical JSON form is written.  The
+        output path is always validated against the workspace boundary and the
+        database sidecar guard.
+        """
+
         destination = self.validate_output_path(path)
         if destination.exists() and not overwrite:
             raise FileExistsError(f"refusing to overwrite existing file: {destination}")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(
-            json.dumps(package, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        text = rendered if rendered is not None else json.dumps(package, ensure_ascii=False, indent=2) + "\n"
+        destination.write_text(text, encoding="utf-8")
         return destination

@@ -188,16 +188,32 @@ class ToolRegistry:
     # grant binds the generation it was issued against, so unloading or
     # replacing a tool invalidates outstanding grants for the old instance.
     _generations: dict[str, int] = field(default_factory=dict)
+    # Names explicitly unregistered in this process; re-registering one starts
+    # a new instance (new generation).  A name with no live tool merely because
+    # the process restarted keeps its generation, so a recovered tool table
+    # does not burn outstanding grants.
+    _explicitly_unregistered: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
-        # Rebuild live grants from the ledger: a grant is durable evidence, so
-        # an unconsumed token must survive a restart.  Grants recorded by
-        # tool.approval_granted minus those consumed by tool.approved are live.
-        consumed: set[str] = set()
+        # Rebuild grants, tombstones and generations from the ledger, so the
+        # gate is reconstructed from durable evidence -- not process memory.
+        #
+        # Live grants: a token is *reserved* by tool.approved and *consumed for
+        # good* only by a subsequent tool.completed that references it.  A
+        # reservation followed by tool.failed releases the token (a transient
+        # failure must not burn a human's approval) -- so a reserved-but-failed
+        # token is live again after a restart, exactly as it was in memory.
         granted: dict[str, ApprovalToken] = {}
-        for event in self.store.list_events(session_id=None, limit=100000):
-            if event.event_type == "tool.approval_granted":
-                payload = event.payload
+        # token_id -> "reserved" once tool.approved fires
+        reserved: dict[str, dict[str, Any]] = {}
+        consumed: set[str] = set()
+        # list_events returns newest-first; the reservation/consumption pairing
+        # must be replayed oldest-first so tool.approved is seen before the
+        # tool.completed/tool.failed that resolves it.
+        for event in reversed(self.store.list_events(session_id=None, limit=100000)):
+            etype = event.event_type
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            if etype == "tool.approval_granted":
                 granted[payload["token_id"]] = ApprovalToken(
                     id=payload["token_id"],
                     tool_name=payload["name"],
@@ -207,18 +223,47 @@ class ToolRegistry:
                     granted_at=event.occurred_at,
                     tool_generation=payload.get("tool_generation", 0),
                 )
-            elif event.event_type == "tool.approved":
-                token_id = event.payload.get("approval_token_id") or event.payload.get("token_id")
+            elif etype == "tool.approved":
+                token_id = payload.get("approval_token_id") or payload.get("token_id")
                 if token_id:
+                    reserved[token_id] = payload
+            elif etype == "tool.completed":
+                token_id = payload.get("approval_token_id")
+                if token_id and token_id in reserved:
+                    # Reserved and completed: the grant is consumed for good.
                     consumed.add(token_id)
+                    reserved.pop(token_id, None)
+            elif etype == "tool.failed":
+                # A failure releases the reservation for any token reserved on
+                # this tool in the same session whose call just failed.  We
+                # match by tool name: a failure cannot reference the token id
+                # directly (it is recorded before execution), but the most
+                # recent reservation on that tool is the one being retried.
+                name = payload.get("name")
+                for token_id, reservation in list(reserved.items()):
+                    if granted.get(token_id) and granted[token_id].tool_name == name:
+                        reserved.pop(token_id, None)
+            elif etype == "tool.registered":
+                # Rebuild generation and tombstone monotonicity per tool name.
+                name = payload.get("name")
+                if name:
+                    generation = int(payload.get("generation", 0))
+                    self._generations[name] = max(self._generations.get(name, 0), generation)
+                    rank = _PERMISSION_RANK.get(payload.get("permission", "read"), 0)
+                    gated = payload.get("approval") == "always"
+                    previous = self._strongest.get(name)
+                    if previous is None or (rank, gated) > previous:
+                        self._strongest[name] = (rank, gated)
         self._grants = {
-            token_id: token for token_id, token in granted.items() if token_id not in consumed
+            token_id: token
+            for token_id, token in granted.items()
+            if token_id not in consumed
         }
 
     # ------------------------------------------------------------------
     # registration
     # ------------------------------------------------------------------
-    def register(self, tool: Tool) -> dict[str, Any]:
+    def register(self, tool: Tool, *, _restore: bool = False) -> dict[str, Any]:
         # The gate must not be overridable: only exact Tool instances register.
         if type(tool) is not Tool:
             raise ToolError("only exact Tool instances can be registered")
@@ -228,15 +273,29 @@ class ToolRegistry:
             self._check_shadowing(shadowed, tool)
         # Even with no live tool (e.g. after unregister), a registration may
         # not be weaker than the strongest gate this name has ever had.
-        self._check_tombstone(name, tool)
+        # ``_restore`` bypasses this: putting back a displaced tool is an undo,
+        # not a fresh (potentially weakening) registration, and the transient
+        # shadow may legitimately have ratcheted the tombstone above it.
+        if not _restore:
+            self._check_tombstone(name, tool)
         self._tools[name] = tool
         rank = _PERMISSION_RANK[tool.permission]
         gated = tool.requires_approval
         previous = self._strongest.get(name)
         if previous is None or (rank, gated) > previous:
             self._strongest[name] = (rank, gated)
-        generation = self._generations.get(name, 0) + 1
+        # Generation semantics: a grant binds the exact tool *instance* it was
+        # issued for.  A new instance starts (generation bumps) when a live
+        # tool is shadowed, or when a name is re-registered after an explicit
+        # unload.  Merely re-registering a name with no live tool -- e.g. a
+        # host re-registering its tools after a process restart -- keeps the
+        # generation, so recovered tool tables do not invalidate live grants.
+        if shadowed is not None or name in self._explicitly_unregistered:
+            generation = self._generations.get(name, 0) + 1
+        else:
+            generation = max(self._generations.get(name, 0), 1)
         self._generations[name] = generation
+        self._explicitly_unregistered.discard(name)
         result = {
             "registered": name,
             "scope": tool.scope,
@@ -316,6 +375,9 @@ class ToolRegistry:
         tool = self._tools.pop(name, None)
         if tool is None:
             return False
+        # Mark the explicit unload: a later re-registration of this name is a
+        # new instance, so outstanding grants for the old instance stay invalid.
+        self._explicitly_unregistered.add(name)
         self.store.append_event(
             "system", "tool.unregistered", {"name": name, "scope": tool.scope}
         )

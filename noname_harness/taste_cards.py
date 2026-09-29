@@ -320,7 +320,7 @@ class TasteCardService:
             self.store.record_event(
                 connection,
                 "system",
-                "taste.reviewed",
+                "taste.card.reviewed",
                 {
                     "card_id": card_id,
                     "new_card_id": new_id,
@@ -414,7 +414,7 @@ class TasteCardService:
             self.store.record_event(
                 connection,
                 "system",
-                "taste.reviewed",
+                "taste.card.reviewed",
                 {
                     "card_id": row["id"],
                     "new_card_id": retired_id,
