@@ -2,6 +2,25 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.13.0] - 2026-09-29
+
+### Features
+
+- Router 保守落地（vision 原则一、runtime-arch §7，schema 不变，仍为 v6）：`RouteDecision`（continue / fork / rebirth / switch_recipe / spawn_subagent + 理由 + 触发信号 + 建议配方），决策记 `route.selected` 账本事件；Router 只读信号、不修改长期记忆。决策优先级：用户显式指令 > 挂起审批（继续等人）> 饱和度（fork / rebirth / continue）；歧义指令保守默认 continue。CLI：`route --session [--task-type] [--instruction]`。
+- 信号层经审查加固：挂起审批按调用关联（`tool.requested` 的 `arguments_hash` 须匹配 `tool.approval_granted`，定向只读 SQL 投影，无截断窗口），不再按全局数量配对；饱和度锚定最近一次 `context.assembled`（handoff / rebirth 边界），只计边界后的 live context，rebirth 后自动重置；reason 用固定模板，不嵌入指令原文。
+- README 整合：状态从「最小原型」更新为「本地优先的内核与运行时骨架已落地，无外部依赖」；新增「已落地的能力」表格（12 层能力 + CLI / Python 入口）与「尚未做（诚实边界）」（真实 Model Adapter、自然语言抽取 / 向量检索、多模态视觉、网络隔离 / 资源限额、暂停 resume）；验证 19 个命令真实存在。
+
+### Design Rationale
+
+- **为什么挂起审批必须按调用关联、饱和度必须锚定边界**：路由的信号若按全局数量配对、或把全部历史都计入饱和度，就会「自信地解释一个错误的世界」——重试风暴时明明仍有未答审批却被判为无，rebirth 之后饱和度永不重置、每次都触发 rebirth。路由的正确性完全建立在信号之上，信号层必须用定向只读投影把世界算准，路由的决策才可信；信号失真一寸，路由就错一丈。
+
+### Notes & Caveats
+
+- `switch_recipe` / `spawn_subagent` 是合法的决策输出，但执行者尚未接入——后续由 AgentLoop 与子 agent 机制承接。
+- 饱和度阈值是启发式，可注入覆盖，不是内核常量。
+- 新增 13 个测试，总数到 199。
+
+
 ## [0.12.0] - 2026-09-29
 
 ### Features
