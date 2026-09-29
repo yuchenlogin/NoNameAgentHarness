@@ -7,6 +7,14 @@ from .taste_cards import TasteCardService
 from .plugins import Plugin, PluginContribution, PluginError, PluginManifest, PluginRuntime
 from .sandbox import Sandbox, SandboxError
 from .router import RouteDecision, Router
+from .adapters import (
+    AdapterDriver,
+    LocalEchoAdapter,
+    ModelAdapterError,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+)
 from .recipes import Recipe, RoleSpec, resolve_recipe
 from .agent_loop import AgentLoop, AgentLoopError, LoopResult, SessionDriver
 from .tools import (
@@ -39,6 +47,12 @@ __all__ = [
     "SandboxError",
     "RouteDecision",
     "Router",
+    "AdapterDriver",
+    "LocalEchoAdapter",
+    "ModelAdapterError",
+    "ModelMessage",
+    "ModelRequest",
+    "ModelResponse",
     "ModelCapability",
     "ModelProfile",
     "Recipe",
