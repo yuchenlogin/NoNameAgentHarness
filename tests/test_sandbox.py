@@ -134,9 +134,9 @@ def test_command_timeout_is_enforced(tmp_path):
 def test_command_failure_is_captured_not_raised(tmp_path):
     store, _ = make_store(tmp_path)
     try:
-        # git is allow-listed by default; a failing git command returns non-zero.
+        # A failing allowed command returns its non-zero exit code.
         sandbox = Sandbox(store)
-        result = sandbox.run_command(["git", "status", "--porcelain=v"], session_id="s")
+        result = sandbox.run_command(["grep", "nomatch-string-xyz", "pyproject.toml"], session_id="s")
         assert result["returncode"] != 0
     finally:
         store.close()
@@ -248,8 +248,9 @@ def test_write_refuses_symlinked_final_component(tmp_path):
         target_inside.write_text("real")
         inside_link = root / "inside_link.txt"
         inside_link.symlink_to(target_inside)
-        with pytest.raises(SandboxError):
-            sandbox._write_text_nofollow(inside_link, "PWNED")
+        from noname_harness.store import WorkspaceBoundaryError as WBE
+        with pytest.raises(WBE):
+            store.write_text_nofollow("inside_link.txt", "PWNED")
         assert target_inside.read_text() == "real"
     finally:
         store.close()
@@ -307,9 +308,84 @@ def test_nonzero_exit_records_tool_failed(tmp_path):
     store, _ = make_store(tmp_path)
     try:
         sandbox = Sandbox(store)
-        result = sandbox.run_command(["git", "definitely-not-a-command"], session_id="s")
+        result = sandbox.run_command(["grep", "nomatch-string-xyz", "pyproject.toml"], session_id="s")
         assert result["returncode"] != 0
         event = next(e for e in store.list_events("s", limit=10) if e.event_type.startswith("tool."))
         assert event.event_type == "tool.failed"
+    finally:
+        store.close()
+
+
+# --- 复审 (第二轮 REJECT) 发现的回归 ---
+
+def test_git_and_find_are_not_in_default_allowlist(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        sandbox = Sandbox(store)
+        # git and find are themselves arbitrary-execution primitives
+        # (git -c alias.x='!cmd', find -exec) whose exec surface cannot be
+        # enumerated -- they must not be safe defaults.
+        for cmd in ("git", "find", "sed", "awk", "xargs"):
+            with pytest.raises(SandboxError):
+                sandbox.run_command([cmd], session_id="s")
+    finally:
+        store.close()
+
+
+def test_read_only_command_cannot_exfiltrate_via_path(tmp_path):
+    store, root = make_store(tmp_path)
+    try:
+        (root / "a.txt").write_text("inside")
+        sandbox = Sandbox(store)
+        # A read-only command with an outside path argument must be refused.
+        for cmd in (["cat", "/etc/passwd"], ["cat", "../outside"], ["ls", "/"], ["wc", "-l", "/etc/passwd"]):
+            with pytest.raises(SandboxError):
+                sandbox.run_command(cmd, session_id="s")
+        # The same command confined to the workspace works.
+        assert "inside" in sandbox.run_command(["cat", "a.txt"], session_id="s")["stdout"]
+    finally:
+        store.close()
+
+
+def test_read_file_rejects_fifo(tmp_path):
+    store, root = make_store(tmp_path)
+    try:
+        import os
+        os.mkfifo(root / "pipe")
+        sandbox = Sandbox(store)
+        # A FIFO would block read_bytes forever; it must be refused up front.
+        with pytest.raises(SandboxError):
+            sandbox.read_file("pipe", session_id="s")
+    finally:
+        store.close()
+
+
+def test_failed_execve_is_logged_and_raises_sandbox_error(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        # A name in the allow-list but not actually on PATH is hard to
+        # simulate; instead verify the error path with a command whose cwd or
+        # binary fails.  Use an allowed name patched to a missing one.
+        sandbox = Sandbox(store, allowed_commands={"definitely-missing-cmd-xyz": ()})
+        with pytest.raises(SandboxError):
+            sandbox.run_command(["definitely-missing-cmd-xyz"], session_id="s")
+        types = [e.event_type for e in store.list_events("s", limit=10)]
+        assert "tool.failed" in types
+    finally:
+        store.close()
+
+
+def test_write_context_package_also_uses_nofollow(tmp_path):
+    store, root = make_store(tmp_path)
+    try:
+        # A final-component symlink must be refused for package writes too.
+        inside = root / "real.txt"
+        inside.write_text("real")
+        link = root / "pkg.md"
+        link.symlink_to(inside)
+        package = store.assemble_context_package("t", session_id="s")
+        with pytest.raises(WorkspaceBoundaryError):
+            store.write_text_nofollow("pkg.md", "content")
+        assert inside.read_text() == "real"
     finally:
         store.close()

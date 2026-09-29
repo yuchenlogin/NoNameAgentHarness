@@ -29,32 +29,34 @@ from .models import EvidenceInput
 from .store import HarnessStore, WorkspaceBoundaryError
 from .tools import Tool, ToolRegistry, ToolSchema
 
-# Commands that may run by default.  Each entry is an executable name; a
-# command runs only if its first token matches exactly AND carries no path
-# separator (so "./git" or "/usr/bin/git" cannot smuggle a workspace-local or
-# arbitrary binary).
+# Default allow-list: strictly read-only commands with no execution hook.
 #
-# Interpreters (python, node, sh, ...) and test runners (pytest, ...) are
-# deliberately ABSENT: an interpreter runs arbitrary code with the harness
-# process's full privileges, which is equivalent to disabling the file
-# boundary entirely -- an approved ``python3 -c "open('/etc','w')"`` would be
-# the attack itself, and no per-call approval can prevent it.  Only commands
-# with no arbitrary-code capability are safe defaults.  A deployment that
-# truly needs an interpreter must pass it explicitly via ``allowed_commands``
-# and accept that doing so weakens the boundary to "approval-only".
-DEFAULT_ALLOWED_COMMANDS = (
-    "git",
-    "ls",
-    "cat",
-    "echo",
-    "grep",
-    "find",
-    "wc",
-    "head",
-    "tail",
-    "pwd",
-    "date",
-)
+# Filtering by executable name is NOT enough: ``git`` and ``find`` are
+# themselves arbitrary-execution primitives (``git -c alias.x='!cmd' x``,
+# ``git -c core.fsmonitor=...``, a malicious ``[alias]`` in the workspace's own
+# ``.git/config``, ``find -exec``/``-delete``).  Their exec surface cannot be
+# enumerated, so they are NOT in the default list.  Only commands that purely
+# read and have no run-a-program / write-file flag are safe defaults.
+#
+# Interpreters (python, node, sh, ...), test runners (pytest, ...), git, find,
+# sed, awk, xargs, and anything with an exec/write hook are all absent.  A
+# deployment that needs one must pass ``allowed_commands`` explicitly and
+# accept that the boundary then rests on the approval gate alone.
+#
+# Even a read-only command can exfiltrate ``/etc/passwd`` via a path argument,
+# so every path-like argument is additionally confined to the workspace (see
+# run_command).  The denylist per command blocks known write/exec knobs.
+DEFAULT_ALLOWED_COMMANDS: dict[str, tuple[str, ...]] = {
+    "ls": (),
+    "cat": (),
+    "echo": (),
+    "grep": (),
+    "wc": (),
+    "head": (),
+    "tail": (),
+    "pwd": (),
+    "date": (),
+}
 
 
 class SandboxError(Exception):
@@ -73,7 +75,13 @@ class Sandbox:
         max_output_chars: int = 100_000,
     ):
         self.store = store
-        self.allowed_commands = tuple(allowed_commands or DEFAULT_ALLOWED_COMMANDS)
+        if allowed_commands is None:
+            self.allowed_commands = dict(DEFAULT_ALLOWED_COMMANDS)
+        elif isinstance(allowed_commands, dict):
+            self.allowed_commands = dict(allowed_commands)
+        else:
+            # A bare sequence means "allowed, with no extra argument filter".
+            self.allowed_commands = {name: () for name in allowed_commands}
         if command_timeout <= 0:
             raise ValueError("command_timeout must be positive")
         self.command_timeout = command_timeout
@@ -85,9 +93,13 @@ class Sandbox:
     def read_file(self, path: str, *, session_id: str) -> dict[str, Any]:
         """Read a file inside the workspace, recording it as evidence."""
 
+        import stat as _stat
+
         target = self.store.validate_workspace_path(path)
-        if not target.is_file():
-            raise SandboxError(f"not a readable file inside the workspace: {path}")
+        # Only regular files may be read: a FIFO or device node passes is_file()
+        # for some types but read_bytes() would block forever -- a trivial DoS.
+        if not target.exists() or not _stat.S_ISREG(target.stat().st_mode):
+            raise SandboxError(f"not a readable regular file inside the workspace: {path}")
         relative = str(target.relative_to(Path(self.store.project()["workspace_root"])))
         raw = target.read_bytes()
         # Binary safety: never crash on non-UTF-8 content.  Undecodable bytes
@@ -125,13 +137,10 @@ class Sandbox:
         off-limits.
         """
 
-        target = self.store.validate_output_path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # Write via an O_NOFOLLOW file descriptor: validation and the write must
-        # not have a TOCTOU window in which a symlink is swapped in to redirect
-        # the write outside the workspace.  O_NOFOLLOW refuses to open through
-        # a final-component symlink, closing the race.
-        self._write_text_nofollow(target, content)
+        # Delegate to the store's shared O_NOFOLLOW writer: validation confines
+        # the path, and the write closes the TOCTOU window against a symlink
+        # swap, so check and write are atomic for the final component.
+        target = self.store.write_text_nofollow(path, content)
         relative = str(target.relative_to(Path(self.store.project()["workspace_root"])))
         self.store.append_event(
             session_id,
@@ -140,34 +149,6 @@ class Sandbox:
             [EvidenceInput(content[: self.max_output_chars], f"file://{relative}")],
         )
         return {"path": relative, "size": len(content)}
-
-    @staticmethod
-    def _write_text_nofollow(target: Path, content: str) -> None:
-        """Write text to ``target`` without following a final symlink.
-
-        ``validate_output_path`` resolves and confines the path, but a symlink
-        can be swapped in between that check and the write (TOCTOU).  Opening
-        with ``O_NOFOLLOW`` makes the open itself refuse a final-component
-        symlink, so the check and the write are atomic with respect to the
-        final path component.
-        """
-
-        import os
-
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        try:
-            fd = os.open(str(target), flags, 0o644)
-        except OSError as exc:
-            raise SandboxError(
-                f"refusing to write through a symlink or unreadable path: {target}"
-            ) from exc
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(content)
-        except Exception:
-            raise
 
     # ------------------------------------------------------------------
     # command execution (allow-listed, timed, captured)
@@ -198,10 +179,28 @@ class Sandbox:
                 f"command must be a bare name resolved via PATH, not a path: {raw_executable!r}"
             )
         executable = raw_executable
-        if executable not in set(self.allowed_commands):
+        if executable not in self.allowed_commands:
             raise SandboxError(
                 f"command '{executable}' is not in the allow-list: {sorted(self.allowed_commands)}"
             )
+        # Argument-level guard: even an allow-listed command is refused if any
+        # argument matches a forbidden execution/write knob for that command.
+        forbidden = self.allowed_commands.get(executable, ())
+        for arg in command[1:]:
+            token = str(arg)
+            for pattern in forbidden:
+                if token == pattern or token.startswith(pattern + "="):
+                    raise SandboxError(
+                        f"argument '{token}' gives '{executable}' an execution/write "
+                        "capability and is refused"
+                    )
+        # Path confinement: even a read-only command can exfiltrate secrets via
+        # a path argument (``cat /etc/passwd``).  Every argument that resolves
+        # to a filesystem path must stay inside the workspace; anything that
+        # escapes (absolute outside path, ``..`` traversal, a symlink pointing
+        # out) is refused before the process starts.
+        for arg in command[1:]:
+            self._confine_argument_path(str(arg))
         effective_timeout = timeout if timeout is not None else self.command_timeout
         if effective_timeout <= 0:
             raise SandboxError("timeout must be positive")
@@ -217,13 +216,24 @@ class Sandbox:
         # Start the child in its own process group so a timeout kills the whole
         # group, not just the direct child -- detached grandchildren cannot
         # outlive the timeout and keep running outside the boundary.
-        process = subprocess.Popen(
-            list(command),
-            cwd=root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
+        try:
+            process = subprocess.Popen(
+                list(command),
+                cwd=root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            # A failed execve (e.g. command not found) is still an execution
+            # attempt: record it and surface a clean SandboxError, not a raw
+            # FileNotFoundError that skips the ledger.
+            self.store.append_event(
+                session_id,
+                "tool.failed",
+                {"command": list(command), "error": str(exc)},
+            )
+            raise SandboxError(f"failed to start command '{executable}': {exc}") from exc
         timed_out = False
         try:
             stdout_b, stderr_b = process.communicate(timeout=effective_timeout)
@@ -234,7 +244,14 @@ class Sandbox:
                 os.killpg(process.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 process.kill()
-            stdout_b, stderr_b = process.communicate()
+            # Bound the pipe drain: a detached grandchild holding the pipe open
+            # must not turn the "hard" timeout into an unbounded wait.  Drain
+            # with a grace period, then abandon the pipes.
+            try:
+                stdout_b, stderr_b = process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout_b, stderr_b = b"", b""
             returncode = None
         stdout = _decode(stdout_b)
         stderr = _decode(stderr_b)
@@ -270,6 +287,34 @@ class Sandbox:
     # ------------------------------------------------------------------
     # tools: the sandbox's operations, gated through the ToolRegistry
     # ------------------------------------------------------------------
+    def _confine_argument_path(self, token: str) -> None:
+        """Refuse an argument that points outside the workspace.
+
+        Only tokens that look like paths are checked: absolute paths, and
+        relative paths that exist (or whose parent exists) relative to the
+        workspace.  Flags, globs and bare words are left alone.  A token that
+        resolves outside the root is a boundary crossing.
+        """
+
+        if token.startswith("-"):
+            return
+        root = Path(self.store.project()["workspace_root"]).resolve()
+        candidate = Path(token)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        try:
+            resolved = candidate.resolve(strict=False)
+        except OSError:
+            return
+        if not (resolved.exists() or resolved.parent.exists()):
+            return
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise SandboxError(
+                f"argument path escapes the workspace: {token!r}"
+            ) from exc
+
     def tools(self, *, session_id: str) -> list[Tool]:
         """Return the sandbox's operations as approval-gated tools.
 

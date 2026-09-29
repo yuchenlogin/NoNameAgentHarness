@@ -568,20 +568,70 @@ class HarnessStore:
                 "refusing to use the harness database or its sidecar files as an output file"
             )
         if destination.exists():
-            try:
-                if database.exists() and os.path.samefile(destination, database):
+            # Compare by inode against the database AND every sidecar: the live
+            # database spans harness.db + -wal (+ -shm/-journal), so a hardlink
+            # to any of them is a corruption vector a name check cannot see.
+            for protected in self._db_family_paths(database):
+                try:
+                    if protected.exists() and os.path.samefile(destination, protected):
+                        raise WorkspaceBoundaryError(
+                            "refusing to write through a hardlink to the harness database"
+                        )
+                except OSError:
                     raise WorkspaceBoundaryError(
-                        "refusing to write through a hardlink to the harness database"
+                        f"cannot verify output path is not the database: {destination}"
                     )
-            except OSError:
-                # A samefile comparison failure (e.g. dangling path) must not
-                # silently allow the write; refuse defensively.
-                raise WorkspaceBoundaryError(
-                    f"cannot verify output path is not the database: {destination}"
-                )
             if destination.is_dir():
                 raise ValueError("context package output path must be a file")
         return destination
+
+    @staticmethod
+    def _db_family_paths(database: Path) -> list[Path]:
+        """The database and its WAL-mode sidecar files (corruption targets)."""
+
+        return [
+            database,
+            database.with_name(database.name + "-wal"),
+            database.with_name(database.name + "-shm"),
+            database.with_name(database.name + "-journal"),
+        ]
+
+    def write_text_nofollow(self, path: str | Path, content: str) -> Path:
+        """Write text inside the workspace without following a final symlink.
+
+        Shared by every writer (context packages, sandbox file writes) so the
+        TOCTOU window between path validation and the write stays closed.  The
+        open uses O_NOFOLLOW (fail-closed if unavailable) and O_EXCL semantics
+        are approximated by refusing an existing final symlink.
+        """
+
+        # validate_output_path resolves the path to confirm it stays inside the
+        # workspace.  But the *write* must use the un-resolved path with
+        # O_NOFOLLOW: resolving first would silently follow a symlink, and a
+        # symlink swapped in afterward would redirect the write.  Opening the
+        # original path with O_NOFOLLOW refuses a final-component symlink at
+        # the moment of open, closing the validate->write TOCTOU window.
+        validated = self.validate_output_path(path)
+        root = Path(self.project()["workspace_root"]).resolve()
+        raw = Path(path).expanduser()
+        open_target = raw if raw.is_absolute() else (root / raw)
+        open_target.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        else:
+            raise WorkspaceBoundaryError(
+                "O_NOFOLLOW is unavailable; refusing to write without symlink protection"
+            )
+        try:
+            fd = os.open(str(open_target), flags, 0o644)
+        except OSError as exc:
+            raise WorkspaceBoundaryError(
+                f"refusing to write through a symlink or unreadable path: {open_target}"
+            ) from exc
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        return validated
 
     def append_event(
         self,
@@ -1709,7 +1759,5 @@ class HarnessStore:
         destination = self.validate_output_path(path)
         if destination.exists() and not overwrite:
             raise FileExistsError(f"refusing to overwrite existing file: {destination}")
-        destination.parent.mkdir(parents=True, exist_ok=True)
         text = rendered if rendered is not None else json.dumps(package, ensure_ascii=False, indent=2) + "\n"
-        destination.write_text(text, encoding="utf-8")
-        return destination
+        return self.write_text_nofollow(destination, text)
