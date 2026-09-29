@@ -165,6 +165,10 @@ class ApprovalToken:
     approver_id: str
     session_id: str
     granted_at: str
+    # The exact tool *generation* this grant authorises.  Re-registering or
+    # shadowing a tool bumps its generation, so a token never outlives the
+    # precise tool instance it was granted for.
+    tool_generation: int = 0
 
 
 @dataclass
@@ -180,6 +184,10 @@ class ToolRegistry:
     # the gate -- monotonicity is enforced against the strongest-ever record,
     # not just the currently-registered tool.
     _strongest: dict[str, tuple[int, bool]] = field(default_factory=dict)
+    # Monotonic generation per tool name; bumped on every registration.  A
+    # grant binds the generation it was issued against, so unloading or
+    # replacing a tool invalidates outstanding grants for the old instance.
+    _generations: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Rebuild live grants from the ledger: a grant is durable evidence, so
@@ -197,6 +205,7 @@ class ToolRegistry:
                     approver_id=payload["approver_id"],
                     session_id=payload.get("session_id", ""),
                     granted_at=event.occurred_at,
+                    tool_generation=payload.get("tool_generation", 0),
                 )
             elif event.event_type == "tool.approved":
                 token_id = event.payload.get("approval_token_id") or event.payload.get("token_id")
@@ -226,7 +235,17 @@ class ToolRegistry:
         previous = self._strongest.get(name)
         if previous is None or (rank, gated) > previous:
             self._strongest[name] = (rank, gated)
-        result = {"registered": name, "scope": tool.scope, "shadowed": None}
+        generation = self._generations.get(name, 0) + 1
+        self._generations[name] = generation
+        result = {
+            "registered": name,
+            "scope": tool.scope,
+            "generation": generation,
+            "shadowed": None,
+            # The displaced tool object itself, so a caller (e.g. the plugin
+            # runtime) can restore it when rolling back a failed operation.
+            "displaced": shadowed,
+        }
         if shadowed is not None:
             result["shadowed"] = {"scope": shadowed.scope, "permission": shadowed.permission}
             self.store.append_event(
@@ -249,6 +268,7 @@ class ToolRegistry:
                 "permission": tool.permission,
                 "approval": tool.approval,
                 "session_id": tool.session_id,
+                "generation": generation,
                 "shadowed": result["shadowed"],
             },
         )
@@ -348,6 +368,7 @@ class ToolRegistry:
             approver_id=approver_id,
             session_id=session_id,
             granted_at=self._now(),
+            tool_generation=self._generations.get(name, 0),
         )
         # The ledger is the source of truth: record the grant *first*, and only
         # add the token to the live set once the write succeeded.  A failed
@@ -361,6 +382,7 @@ class ToolRegistry:
                 "arguments_hash": token.arguments_hash,
                 "approver_id": approver_id,
                 "session_id": session_id,
+                "tool_generation": token.tool_generation,
             },
         )
         self._grants[token.id] = token
@@ -515,10 +537,14 @@ class ToolRegistry:
             )
         live = self._grants.get(token.id)
         arguments_hash = _safe_arguments_hash(arguments)
+        current_generation = self._generations.get(name, 0)
         if (
             live is None
             or live.tool_name != name
             or live.arguments_hash != arguments_hash
+            # A grant never outlives the exact tool instance it was issued for:
+            # re-registering or shadowing bumps the generation, invalidating it.
+            or live.tool_generation != current_generation
         ):
             self.store.append_event(
                 session_id,

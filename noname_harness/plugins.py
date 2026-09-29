@@ -109,39 +109,77 @@ class PluginRuntime:
             raise PluginError(f"plugin already loaded: {manifest.id}")
         self._validate_compatibility(manifest)
 
-        # Build and validate contributions *before* registering anything, so a
-        # bad plugin cannot half-load.
-        contributions = plugin.build()
+        # Build the plugin's contributions.  ``build()`` is arbitrary host
+        # code, so the kernel cannot make it safe -- but it *can* make it
+        # auditable: the ledger records that plugin code ran (and if it
+        # failed), and any exception is normalised into a PluginError rather
+        # than leaking a raw traceback through the seam.
+        self.store.append_event("system", "plugin.build_started", {"plugin_id": manifest.id})
+        try:
+            contributions = plugin.build()
+        except Exception as exc:  # noqa: BLE001 - normalised at the seam
+            self.store.append_event(
+                "system",
+                "plugin.build_failed",
+                {"plugin_id": manifest.id, "error": str(exc)},
+            )
+            raise PluginError(f"plugin {manifest.id} build() failed: {exc}") from exc
         tools = self._validate_contributions(manifest, contributions)
 
         # Register each tool through the normal registry -- the approval gate
         # and shadowing monotonicity apply to plugins exactly as to anything
-        # else.  If any registration fails, roll back the ones already added so
-        # a plugin never half-loads.
+        # else.  The whole load (registration + ledger record) is atomic: on
+        # any failure every change is rolled back, including restoring any
+        # pre-existing tool a contribution displaced, so a failed load never
+        # leaves a zombie or a destroyed host tool behind.
         registered: list[str] = []
+        displaced: list[Tool | None] = []
         try:
             for tool in tools:
-                self.registry.register(tool)
+                outcome = self.registry.register(tool)
                 registered.append(tool.schema.name)
+                displaced.append(outcome.get("displaced"))
+            self.store.append_event(
+                "system",
+                "plugin.loaded",
+                {
+                    "plugin_id": manifest.id,
+                    "version": manifest.version,
+                    "capabilities": list(manifest.capabilities),
+                    "tools": registered,
+                    "max_permission": manifest.max_permission,
+                },
+            )
         except Exception:
-            for name in registered:
-                self.registry.unregister(name)
+            self._rollback(registered, displaced)
+            self.store.append_event(
+                "system",
+                "plugin.load_failed",
+                {"plugin_id": manifest.id, "rolled_back": registered},
+            )
             raise
 
         self._loaded[manifest.id] = plugin
         self._contributions[manifest.id] = registered
-        self.store.append_event(
-            "system",
-            "plugin.loaded",
-            {
-                "plugin_id": manifest.id,
-                "version": manifest.version,
-                "capabilities": list(manifest.capabilities),
-                "tools": registered,
-                "max_permission": manifest.max_permission,
-            },
-        )
         return {"loaded": manifest.id, "version": manifest.version, "tools": registered}
+
+    def _rollback(self, registered: list[str], displaced: list[Tool | None]) -> None:
+        """Undo a partial load, restoring any tools that were displaced.
+
+        Rollback is not just ``unregister``: a contribution that shadowed a
+        pre-existing tool must put the original back, so a failed load cannot
+        destroy host state.  Restoring re-registers the displaced tool, which
+        bumps its generation again -- so any approval granted for the transient
+        shadow is invalidated too.
+        """
+
+        for name, original in zip(reversed(registered), reversed(displaced)):
+            self.registry.unregister(name)
+            if original is not None:
+                # The displaced tool is an exact Tool instance; re-register it.
+                # Its generation has moved on, which is correct -- it is a fresh
+                # registration, and stale grants stay invalid.
+                self.registry.register(original)
 
     def unload(self, plugin_id: str) -> dict[str, Any]:
         plugin = self._loaded.pop(plugin_id, None)

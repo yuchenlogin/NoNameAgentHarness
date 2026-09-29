@@ -184,3 +184,110 @@ def test_double_load_refused(tmp_path):
             runtime.load(_plugin([_read_tool()]))
     finally:
         store.close()
+
+
+# --- 对抗性审查发现的回归 ---
+
+def test_grant_does_not_outlive_tool_instance_across_unload(tmp_path):
+    store, registry = make_runtime(tmp_path)
+    try:
+        runtime = PluginRuntime(store, registry)
+        gated = Tool(
+            ToolSchema(name="danger", description="d", input_schema={}),
+            execute=lambda a: "v1", permission="destructive", approval="always",
+            scope="session", session_id="s",
+        )
+        runtime.load(_plugin([gated], max_permission="destructive"))
+        token = registry.grant_approval("danger", {}, approver_id="u", session_id="s")
+        runtime.unload("demo")
+        # A new equal-strength tool of the same name is a DIFFERENT instance.
+        runtime.load(_plugin([Tool(
+            ToolSchema(name="danger", description="d", input_schema={}),
+            execute=lambda a: "v2", permission="destructive", approval="always",
+            scope="session", session_id="s",
+        )], id="demo2", max_permission="destructive"))
+        # The old token must NOT authorise the new instance.
+        with pytest.raises(ToolApprovalRequired):
+            registry.request("danger", {}, session_id="s", approval_token=token)
+    finally:
+        store.close()
+
+
+def test_failed_load_restores_displaced_host_tool(tmp_path):
+    store, registry = make_runtime(tmp_path)
+    try:
+        runtime = PluginRuntime(store, registry)
+        # Host has a strong global tool.
+        host_tool = Tool(
+            ToolSchema(name="search", description="d", input_schema={"q": "string"}),
+            execute=lambda a: "orig", permission="write", approval="always", scope="global",
+        )
+        registry.register(host_tool)
+        # Plugin's first contribution LEGALLY shadows it (stronger), second fails.
+        stronger = Tool(
+            ToolSchema(name="search", description="d", input_schema={"q": "string"}),
+            execute=lambda a: "shadow", permission="destructive", approval="always", scope="global",
+        )
+        failing = Tool(  # global scope not requested -> rejected
+            ToolSchema(name="other", description="d", input_schema={"q": "string"}),
+            execute=lambda a: "x", permission="read", approval="never", scope="global",
+        )
+        plugin = Plugin(
+            manifest=PluginManifest(id="demo", version="1", capabilities=("x",), max_permission="destructive"),
+            build=lambda: [PluginContribution(tool=stronger), PluginContribution(tool=failing)],
+        )
+        with pytest.raises(PluginError):
+            runtime.load(plugin)
+        # The host's original tool is restored (not destroyed by rollback), and
+        # the plugin's transient shadow is gone.
+        current = registry.get("search")
+        assert current is not None
+        assert current.execute({"q": "x"}) == "orig"
+        assert current.permission == "write"
+        assert registry.get("other") is None
+        assert runtime.loaded_plugins() == []
+        # The host tool can still be approved and used.
+        token = registry.grant_approval("search", {"q": "x"}, approver_id="u", session_id="s")
+        assert registry.request("search", {"q": "x"}, session_id="s", approval_token=token)["output"] == "orig"
+    finally:
+        store.close()
+
+
+def test_failed_load_leaves_no_unaudited_zombie(tmp_path):
+    store, registry = make_runtime(tmp_path)
+    try:
+        runtime = PluginRuntime(store, registry)
+        tool = _read_tool()
+        plugin = _plugin([tool])
+        # Force the plugin.loaded ledger write to fail after registration.
+        original_append = store.append_event
+        def flaky_append(session_id, event_type, payload, evidence=None, occurred_at=None):
+            if event_type == "plugin.loaded":
+                raise RuntimeError("disk full")
+            return original_append(session_id, event_type, payload, evidence, occurred_at)
+        store.append_event = flaky_append
+        with pytest.raises(RuntimeError):
+            runtime.load(plugin)
+        store.append_event = original_append
+        # No zombie: the tool was rolled back, plugin not loaded, retry is clean.
+        assert registry.get("search") is None
+        assert runtime.loaded_plugins() == []
+        assert any(e.event_type == "plugin.load_failed" for e in store.list_events("system", limit=50))
+    finally:
+        store.close()
+
+
+def test_build_is_audited_and_failures_normalized(tmp_path):
+    store, registry = make_runtime(tmp_path)
+    try:
+        runtime = PluginRuntime(store, registry)
+        def bad_build():
+            raise RuntimeError("build exploded")
+        plugin = Plugin(manifest=PluginManifest(id="bad", version="1", capabilities=("x",)), build=bad_build)
+        with pytest.raises(PluginError):
+            runtime.load(plugin)
+        types = [e.event_type for e in store.list_events("system", limit=50)]
+        assert "plugin.build_started" in types
+        assert "plugin.build_failed" in types
+    finally:
+        store.close()
