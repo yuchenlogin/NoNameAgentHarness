@@ -361,6 +361,9 @@ class HarnessStore:
         CREATE UNIQUE INDEX IF NOT EXISTS taste_records_one_child_per_parent
             ON taste_records(supersedes_id) WHERE supersedes_id IS NOT NULL;
 
+        CREATE UNIQUE INDEX IF NOT EXISTS taste_cards_one_child_per_parent
+            ON taste_cards(supersedes_id) WHERE supersedes_id IS NOT NULL;
+
         CREATE TRIGGER IF NOT EXISTS taste_cards_append_only_update
         BEFORE UPDATE ON taste_cards
         BEGIN

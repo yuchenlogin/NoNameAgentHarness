@@ -117,8 +117,11 @@ class TasteCardService:
             raise ValueError("card title cannot be empty")
         if not attitude.strip():
             raise ValueError("card attitude cannot be empty")
+        taste_ids = list(taste_ids)
         if not taste_ids:
             raise ValueError("a card must group at least one taste record")
+        if len(set(taste_ids)) != len(taste_ids):
+            raise ValueError("taste_ids must not contain duplicates")
         # Every grouped taste id must resolve -- a card cannot point at
         # evidence the ledger does not contain.
         for taste_id in taste_ids:
@@ -128,47 +131,96 @@ class TasteCardService:
         card_id = _id("crd")
         now = _now()
         with self.store.transaction() as connection:
-            connection.execute(
-                "INSERT INTO taste_cards "
-                "(id, title, attitude, track, scope, taste_ids_json, "
-                "representative_evidence_json, tensions, influence, image_json, "
-                "status, valid_from, valid_to, last_confirmed_at, supersedes_id, "
-                "origin, actor_id, recorded_at) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, ?)",
-                (
-                    card_id,
-                    title,
-                    attitude,
-                    track,
-                    scope,
-                    _json(list(dict.fromkeys(taste_ids))),
-                    _json(list(representative_evidence or [])),
-                    tensions,
-                    influence,
-                    _json(image) if image is not None else None,
-                    status,
-                    now,
-                    "cluster",
-                    actor_id,
-                    now,
-                ),
-            )
-            self.store.record_event(
+            self._insert_card(
                 connection,
-                "system",
-                "taste.card.generated",
-                {
-                    "card_id": card_id,
-                    "title": title,
-                    "track": track,
-                    "scope": scope,
-                    "status": status,
-                    "taste_ids": list(dict.fromkeys(taste_ids)),
-                    "has_image": image is not None,
-                },
-                occurred_at=now,
+                card_id=card_id,
+                title=title,
+                attitude=attitude,
+                track=track,
+                scope=scope,
+                taste_ids=taste_ids,
+                representative_evidence=list(representative_evidence or []),
+                tensions=tensions,
+                influence=influence,
+                image=image,
+                status=status,
+                last_confirmed_at=now,
+                supersedes_id=None,
+                origin="cluster",
+                actor_id=actor_id,
+                recorded_at=now,
             )
         return self.get(card_id)
+
+    def _insert_card(
+        self,
+        connection: Any,
+        *,
+        card_id: str,
+        title: str,
+        attitude: str,
+        track: str,
+        scope: str,
+        taste_ids: list[str],
+        representative_evidence: list[str],
+        tensions: str | None,
+        influence: str | None,
+        image: dict[str, Any] | None,
+        status: str,
+        last_confirmed_at: str,
+        supersedes_id: str | None,
+        origin: str,
+        actor_id: str,
+        recorded_at: str,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
+    ) -> None:
+        """Insert a card row and its ledger event inside a transaction."""
+
+        connection.execute(
+            "INSERT INTO taste_cards "
+            "(id, title, attitude, track, scope, taste_ids_json, "
+            "representative_evidence_json, tensions, influence, image_json, "
+            "status, valid_from, valid_to, last_confirmed_at, supersedes_id, "
+            "origin, actor_id, recorded_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                card_id,
+                title,
+                attitude,
+                track,
+                scope,
+                _json(taste_ids),
+                _json(representative_evidence),
+                tensions,
+                influence,
+                _json(image) if image is not None else None,
+                status,
+                valid_from,
+                valid_to,
+                last_confirmed_at,
+                supersedes_id,
+                origin,
+                actor_id,
+                recorded_at,
+            ),
+        )
+        self.store.record_event(
+            connection,
+            "system",
+            "taste.card.generated",
+            {
+                "card_id": card_id,
+                "title": title,
+                "track": track,
+                "scope": scope,
+                "status": status,
+                "taste_ids": taste_ids,
+                "has_image": image is not None,
+                "supersedes_id": supersedes_id,
+            },
+            occurred_at=recorded_at,
+        )
 
     def review(
         self,
@@ -221,6 +273,12 @@ class TasteCardService:
             for key in ("title", "attitude", "tensions", "influence", "image"):
                 if key in edited:
                     fields[key] = edited[key]
+            # Re-run the same validation create_card applies -- an edit must not
+            # be a way to sneak in an empty title/attitude or a bad image.
+            if not str(fields["title"]).strip():
+                raise ValueError("card title cannot be empty")
+            if not str(fields["attitude"]).strip():
+                raise ValueError("card attitude cannot be empty")
             if fields["image"] is not None:
                 self._validate_image(fields["image"])
 
@@ -228,33 +286,36 @@ class TasteCardService:
         now = _now()
         last_confirmed = now if confirm else row["last_confirmed_at"]
         with self.store.transaction() as connection:
-            connection.execute(
-                "INSERT INTO taste_cards "
-                "(id, title, attitude, track, scope, taste_ids_json, "
-                "representative_evidence_json, tensions, influence, image_json, "
-                "status, valid_from, valid_to, last_confirmed_at, supersedes_id, "
-                "origin, actor_id, recorded_at) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    new_id,
-                    fields["title"],
-                    fields["attitude"],
-                    row["track"],
-                    row["scope"],
-                    row["taste_ids_json"],
-                    row["representative_evidence_json"],
-                    fields["tensions"],
-                    fields["influence"],
-                    _json(fields["image"]) if fields["image"] is not None else None,
-                    new_status,
-                    row["valid_from"],
-                    row["valid_to"],
-                    last_confirmed,
-                    card_id,
-                    row["origin"],
-                    reviewer_id,
-                    now,
-                ),
+            # Re-check under the write lock: the pre-transaction head check is a
+            # fast path, but two concurrent reviewers could both pass it.  The
+            # loser must see the head moved and abort rather than fork.
+            still_head = connection.execute(
+                "SELECT 1 FROM taste_cards WHERE supersedes_id = ? LIMIT 1", (card_id,)
+            ).fetchone()
+            if still_head is not None:
+                raise ValueError(
+                    f"card {card_id} was superseded concurrently; review the current head"
+                )
+            self._insert_card(
+                connection,
+                card_id=new_id,
+                title=fields["title"],
+                attitude=fields["attitude"],
+                track=row["track"],
+                scope=row["scope"],
+                taste_ids=_decode(row["taste_ids_json"]),
+                representative_evidence=_decode(row["representative_evidence_json"]),
+                tensions=fields["tensions"],
+                influence=fields["influence"],
+                image=fields["image"],
+                status=new_status,
+                valid_from=row["valid_from"],
+                valid_to=row["valid_to"],
+                last_confirmed_at=last_confirmed,
+                supersedes_id=card_id,
+                origin=row["origin"],
+                actor_id=reviewer_id,
+                recorded_at=now,
             )
             self.store.record_event(
                 connection,
@@ -302,24 +363,96 @@ class TasteCardService:
             assigned |= set(part_ids)
         if assigned != original_taste_ids:
             raise ValueError("split must account for every taste record in the card")
-
-        # Retire the original, then create the new candidate cards.
-        self.review(row["id"], "retire", reviewer_id)
+        # Validate every part up front (title/attitude/taste_ids/image), so a
+        # bad part cannot abort the split half-way and leave the ledger
+        # inconsistent.  This mirrors create_card's own checks.
+        original_image = _decode(row["image_json"]) if row["image_json"] else None
         for part in parts:
-            new_cards.append(
-                self.create_card(
+            if not str(part.get("title", "")).strip():
+                raise ValueError("each split part needs a non-empty title")
+            if not str(part.get("attitude", "")).strip():
+                raise ValueError("each split part needs a non-empty attitude")
+            part_image = part.get("image", original_image)
+            if part_image is not None:
+                self._validate_image(part_image)
+
+        # Atomic: retire the original AND create all sub-cards in one
+        # transaction.  If anything fails, nothing is written -- the ledger can
+        # never hold a retired original with only some of its parts.
+        now = _now()
+        with self.store.transaction() as connection:
+            still_head = connection.execute(
+                "SELECT 1 FROM taste_cards WHERE supersedes_id = ? LIMIT 1", (row["id"],)
+            ).fetchone()
+            if still_head is not None:
+                raise ValueError(
+                    f"card {row['id']} was superseded concurrently; review the current head"
+                )
+            # Retire the original.
+            retired_id = _id("crd")
+            self._insert_card(
+                connection,
+                card_id=retired_id,
+                title=row["title"],
+                attitude=row["attitude"],
+                track=row["track"],
+                scope=row["scope"],
+                taste_ids=_decode(row["taste_ids_json"]),
+                representative_evidence=_decode(row["representative_evidence_json"]),
+                tensions=row["tensions"],
+                influence=row["influence"],
+                image=original_image,
+                status="retired",
+                valid_from=row["valid_from"],
+                valid_to=row["valid_to"],
+                last_confirmed_at=row["last_confirmed_at"],
+                supersedes_id=row["id"],
+                origin=row["origin"],
+                actor_id=reviewer_id,
+                recorded_at=now,
+            )
+            self.store.record_event(
+                connection,
+                "system",
+                "taste.reviewed",
+                {
+                    "card_id": row["id"],
+                    "new_card_id": retired_id,
+                    "action": "retire",
+                    "reviewer_id": reviewer_id,
+                    "new_status": "retired",
+                    "via": "split",
+                },
+                occurred_at=now,
+            )
+            # Create the disjoint candidate sub-cards (inheriting the image).
+            new_ids = []
+            for part in parts:
+                new_id = _id("crd")
+                new_ids.append(new_id)
+                self._insert_card(
+                    connection,
+                    card_id=new_id,
                     title=part["title"],
                     attitude=part["attitude"],
                     track=row["track"],
                     scope=row["scope"],
                     taste_ids=part["taste_ids"],
+                    representative_evidence=part.get(
+                        "representative_evidence",
+                        _decode(row["representative_evidence_json"]),
+                    ),
                     tensions=part.get("tensions", row["tensions"]),
                     influence=part.get("influence", row["influence"]),
-                    actor_id=reviewer_id,
+                    image=part.get("image", original_image),
                     status="candidate",
+                    last_confirmed_at=now,
+                    supersedes_id=None,
+                    origin="split",
+                    actor_id=reviewer_id,
+                    recorded_at=now,
                 )
-            )
-        return new_cards
+        return [self.get(card_id) for card_id in new_ids]
 
     # ------------------------------------------------------------------
     # queries & review queue
@@ -346,7 +479,13 @@ class TasteCardService:
         """
 
         heads = self._head_rows()
-        candidates = [r for r in heads if r["status"] == "candidate"]
+        # Candidates first (awaiting a first decision), ordered by an explicit,
+        # auditable rule -- oldest first, id as tie-break -- never by insertion
+        # accident.  Active cards follow, by longest time since confirmation.
+        candidates = sorted(
+            (r for r in heads if r["status"] == "candidate"),
+            key=lambda r: (r["recorded_at"], r["id"]),
+        )
         active = sorted(
             (r for r in heads if r["status"] == "active"),
             key=lambda r: (r["last_confirmed_at"], r["id"]),
@@ -396,7 +535,22 @@ class TasteCardService:
             "origin": row["origin"],
             "actor_id": row["actor_id"],
             "recorded_at": row["recorded_at"],
+            # Staleness is surfaced, not hidden: a card whose taste records are
+            # no longer all current active heads is drifting from the taste
+            # layer, and a reviewer should know before confirming "still me".
+            "stale": self._is_stale(row),
         }
+
+    def _is_stale(self, row: Any) -> bool:
+        """Return whether any grouped taste record is no longer an active head.
+
+        A card is a view over taste evidence; when a taste record is retired or
+        superseded, the card's evidence drifts.  This is deterministic and
+        cheap, and only *annotates* -- it never blocks or auto-updates a card.
+        """
+
+        active_head_ids = {t["id"] for t in self.taste.active()}
+        return any(tid not in active_head_ids for tid in _decode(row["taste_ids_json"]))
 
     @staticmethod
     def _validate_image(image: dict[str, Any]) -> None:
