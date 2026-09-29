@@ -337,3 +337,100 @@ def test_token_ids_are_unique_across_grants(tmp_path):
         assert len(ids) == 5  # identical arguments still get distinct tokens
     finally:
         store.close()
+
+
+# ---复审 (round 5) 发现的回归 ---
+
+def test_grant_is_recorded_before_token_goes_live(tmp_path):
+    """A failed ledger append must not leave a live, unlogged token."""
+    store, _ = make_store(tmp_path)
+    try:
+        registry = ToolRegistry(store)
+        registry.register(Tool(_schema("w"), execute=lambda a: "ok", permission="write", approval="always"))
+        # Empty session_id makes append_event raise; the token must NOT go live.
+        with pytest.raises(ValueError):
+            registry.grant_approval("w", {"text": "x"}, approver_id="u", session_id="")
+        # No grant event was written, and no live token exists.
+        assert registry._grants == {}
+        assert not any(
+            e.event_type == "tool.approval_granted" for e in store.list_events(limit=50)
+        )
+    finally:
+        store.close()
+
+
+def test_unregister_then_reregister_cannot_downgrade_permission(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        registry = ToolRegistry(store)
+        registry.register(Tool(_schema(), execute=lambda a: "g", permission="destructive", approval="always", scope="global"))
+        registry.unregister("echo")
+        # The tombstone remembers the strongest-ever gate; a weaker re-register
+        # is refused even though no live tool shadows it.
+        with pytest.raises(ToolShadowingError):
+            registry.register(Tool(_schema(), execute=lambda a: "x", permission="read", approval="never", scope="global"))
+        with pytest.raises(ToolShadowingError):
+            registry.register(Tool(_schema(), execute=lambda a: "x", permission="write", approval="always", scope="global"))
+    finally:
+        store.close()
+
+
+def test_unregister_then_reregister_cannot_drop_approval(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        registry = ToolRegistry(store)
+        registry.register(Tool(_schema(), execute=lambda a: "g", permission="write", approval="always", scope="global"))
+        registry.unregister("echo")
+        with pytest.raises(ToolShadowingError):
+            registry.register(Tool(_schema(), execute=lambda a: "x", permission="write", approval="never", scope="global"))
+    finally:
+        store.close()
+
+
+def test_token_is_bound_to_its_session(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        registry = ToolRegistry(store)
+        registry.register(Tool(_schema("w"), execute=lambda a: "ok", permission="write", approval="always"))
+        token = registry.grant_approval("w", {"text": "x"}, approver_id="u", session_id="alice")
+        # alice's token must not authorise bob's call.
+        with pytest.raises(ToolApprovalRequired):
+            registry.request("w", {"text": "x"}, session_id="bob", approval_token=token)
+        # ...but it works for alice.
+        assert registry.request("w", {"text": "x"}, session_id="alice", approval_token=token)["output"] == "ok"
+    finally:
+        store.close()
+
+
+def test_failed_execution_returns_the_token(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        registry = ToolRegistry(store)
+        calls = {"n": 0}
+        def flaky(args):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient")
+            return "ok"
+        registry.register(Tool(_schema("w"), execute=flaky, permission="write", approval="always"))
+        token = registry.grant_approval("w", {"text": "x"}, approver_id="u", session_id="s")
+        # First attempt fails; the approval must not be burned.
+        with pytest.raises(ToolError):
+            registry.request("w", {"text": "x"}, session_id="s", approval_token=token)
+        # Retry with the SAME token succeeds -- approval is per-completed-call.
+        assert registry.request("w", {"text": "x"}, session_id="s", approval_token=token)["output"] == "ok"
+    finally:
+        store.close()
+
+
+def test_unserialisable_arguments_are_logged_and_raise_cleanly(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        registry = ToolRegistry(store)
+        registry.register(Tool(_schema(), execute=lambda a: "x", permission="read", approval="never"))
+        with pytest.raises(ToolValidationError):
+            registry.request("echo", {"text": {"a", "b"}}, session_id="s")
+        types = [e.event_type for e in store.list_events("s", limit=10)]
+        assert "tool.validation_failed" in types
+    finally:
+        store.close()

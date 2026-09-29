@@ -43,12 +43,12 @@ from typing import Any, Callable
 
 from .store import HarnessStore
 
-VALID_TOOL_SCOPES = {"global", "agent", "session"}
+VALID_TOOL_SCOPES = {"global", "session"}
 PERMISSION_LEVELS = {"read", "write", "destructive"}
 # Ordered weakest -> strongest so shadowing monotonicity can be enforced.
 _PERMISSION_RANK = {"read": 0, "write": 1, "destructive": 2}
 VALID_APPROVAL_POLICIES = {"never", "always"}
-_SCOPE_RANK = {"global": 0, "agent": 1, "session": 2}
+_SCOPE_RANK = {"global": 0, "session": 1}
 
 
 class ToolError(Exception):
@@ -137,14 +137,33 @@ def _arguments_hash(arguments: dict[str, Any]) -> str:
     return hashlib.sha256(_canonical_arguments(arguments).encode("utf-8")).hexdigest()
 
 
+def _safe_arguments_hash(arguments: Any) -> str:
+    """Hash arguments, converting unserialisable input into a validation error.
+
+    The raw ``TypeError`` from ``json.dumps`` would otherwise escape before any
+    ledger event is written, breaking the "every outcome is logged" invariant.
+    """
+
+    try:
+        return _arguments_hash(arguments)
+    except (TypeError, ValueError) as exc:
+        raise ToolValidationError(f"tool arguments are not JSON-serialisable: {exc}") from exc
+
+
 @dataclass(frozen=True)
 class ApprovalToken:
-    """A one-time, call-bound approval grant.  Verified, never self-asserted."""
+    """A one-time, call-bound approval grant.  Verified, never self-asserted.
+
+    The grant binds the tool, the exact arguments (by hash), the approver and
+    the session it was granted in, so it cannot be replayed for a different
+    call, a different tool, or a different session.
+    """
 
     id: str
     tool_name: str
     arguments_hash: str
     approver_id: str
+    session_id: str
     granted_at: str
 
 
@@ -156,6 +175,11 @@ class ToolRegistry:
     _tools: dict[str, Tool] = field(default_factory=dict)
     # Live (unconsumed) approval tokens, keyed by token id.
     _grants: dict[str, ApprovalToken] = field(default_factory=dict)
+    # Tombstones: the strongest (permission, approval) a name has ever carried.
+    # Unregistering a tool must not let a later, weaker registration slip under
+    # the gate -- monotonicity is enforced against the strongest-ever record,
+    # not just the currently-registered tool.
+    _strongest: dict[str, tuple[int, bool]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Rebuild live grants from the ledger: a grant is durable evidence, so
@@ -171,6 +195,7 @@ class ToolRegistry:
                     tool_name=payload["name"],
                     arguments_hash=payload["arguments_hash"],
                     approver_id=payload["approver_id"],
+                    session_id=payload.get("session_id", ""),
                     granted_at=event.occurred_at,
                 )
             elif event.event_type == "tool.approved":
@@ -192,7 +217,15 @@ class ToolRegistry:
         shadowed = self._tools.get(name)
         if shadowed is not None:
             self._check_shadowing(shadowed, tool)
+        # Even with no live tool (e.g. after unregister), a registration may
+        # not be weaker than the strongest gate this name has ever had.
+        self._check_tombstone(name, tool)
         self._tools[name] = tool
+        rank = _PERMISSION_RANK[tool.permission]
+        gated = tool.requires_approval
+        previous = self._strongest.get(name)
+        if previous is None or (rank, gated) > previous:
+            self._strongest[name] = (rank, gated)
         result = {"registered": name, "scope": tool.scope, "shadowed": None}
         if shadowed is not None:
             result["shadowed"] = {"scope": shadowed.scope, "permission": shadowed.permission}
@@ -241,6 +274,22 @@ class ToolRegistry:
         if old.requires_approval and not new.requires_approval:
             raise ToolShadowingError(
                 "cannot shadow an approval-gated tool with one that needs no approval"
+            )
+
+    def _check_tombstone(self, name: str, new: Tool) -> None:
+        """A re-registration may not be weaker than this name's strongest gate."""
+
+        strongest = self._strongest.get(name)
+        if strongest is None:
+            return
+        rank, gated = strongest
+        if _PERMISSION_RANK[new.permission] < rank:
+            raise ToolShadowingError(
+                f"cannot re-register '{name}' below its strongest-ever permission"
+            )
+        if gated and not new.requires_approval:
+            raise ToolShadowingError(
+                f"cannot re-register '{name}' without the approval it once required"
             )
 
     def unregister(self, name: str) -> bool:
@@ -295,11 +344,14 @@ class ToolRegistry:
         token = ApprovalToken(
             id=self._new_token_id(arguments),
             tool_name=name,
-            arguments_hash=_arguments_hash(arguments),
+            arguments_hash=_safe_arguments_hash(arguments),
             approver_id=approver_id,
+            session_id=session_id,
             granted_at=self._now(),
         )
-        self._grants[token.id] = token
+        # The ledger is the source of truth: record the grant *first*, and only
+        # add the token to the live set once the write succeeded.  A failed
+        # append must never leave a live token with no ledger trace.
         self.store.append_event(
             session_id,
             "tool.approval_granted",
@@ -308,8 +360,10 @@ class ToolRegistry:
                 "name": name,
                 "arguments_hash": token.arguments_hash,
                 "approver_id": approver_id,
+                "session_id": session_id,
             },
         )
+        self._grants[token.id] = token
         return token
 
     # ------------------------------------------------------------------
@@ -370,12 +424,21 @@ class ToolRegistry:
         # Record the request with an arguments *hash*, not the raw content: a
         # not-yet-approved gated call must not persist model-controlled content
         # into the append-only ledger.
+        try:
+            arguments_hash = _safe_arguments_hash(arguments)
+        except ToolValidationError as exc:
+            self.store.append_event(
+                session_id,
+                "tool.validation_failed",
+                {"name": name, "error": str(exc), "actor_id": actor_id},
+            )
+            raise
         self.store.append_event(
             session_id,
             "tool.requested",
             {
                 "name": name,
-                "arguments_hash": _arguments_hash(arguments),
+                "arguments_hash": arguments_hash,
                 "actor_id": actor_id,
                 "scope": tool.scope,
                 "permission": tool.permission,
@@ -407,6 +470,10 @@ class ToolRegistry:
         try:
             raw = tool.execute(arguments)
         except Exception as exc:  # noqa: BLE001 - every failure is logged
+            # Return the reserved token so a failed attempt does not consume the
+            # human's approval; the call may be retried with the same grant.
+            if token is not None:
+                self._grants[token.id] = token
             self.store.append_event(
                 session_id,
                 "tool.failed",
@@ -447,7 +514,7 @@ class ToolRegistry:
                 f"tool '{name}' (permission={tool.permission}) requires an approval token"
             )
         live = self._grants.get(token.id)
-        arguments_hash = _arguments_hash(arguments)
+        arguments_hash = _safe_arguments_hash(arguments)
         if (
             live is None
             or live.tool_name != name
@@ -466,7 +533,24 @@ class ToolRegistry:
             raise ToolApprovalRequired(
                 f"approval token for '{name}' is invalid, consumed, or bound to different arguments"
             )
-        # Single-use: consume the token so it cannot authorise a second call.
+        # A token granted in one session must not authorise a call in another.
+        if live.session_id and live.session_id != session_id:
+            self.store.append_event(
+                session_id,
+                "tool.approval_rejected",
+                {
+                    "name": name,
+                    "token_id": token.id,
+                    "reason": "token bound to a different session",
+                    "actor_id": actor_id,
+                },
+            )
+            raise ToolApprovalRequired(
+                f"approval token for '{name}' was granted in a different session"
+            )
+        # Reserve the token (two-phase): it leaves the live set now but is
+        # returned if execution fails, so a transient error does not burn a
+        # human's approval.  It is only consumed for good on success.
         del self._grants[token.id]
         self.store.append_event(
             session_id,
