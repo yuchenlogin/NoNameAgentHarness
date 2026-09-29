@@ -139,3 +139,74 @@ def test_decision_validation(tmp_path):
         RouteDecision(route="explode", reason="x", signals={})
     with pytest.raises(ValueError):
         RouteDecision(route="continue", reason="  ", signals={})
+
+
+# --- 对抗性审查发现的回归 ---
+
+def test_open_approvals_correlated_per_call_not_per_count(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        registry = ToolRegistry(store)
+        registry.register(Tool(
+            ToolSchema(name="w", description="d", input_schema={"x": "string"}),
+            execute=lambda a: "ok", permission="write", approval="always",
+        ))
+        # Three retry requests with different args; approving one leaves two open.
+        for x in ("a", "b", "c"):
+            with pytest.raises(ToolApprovalRequired):
+                registry.request("w", {"x": x}, session_id="s")
+        router = Router(store)
+        assert router._open_approvals("s") == 3
+        token = registry.grant_approval("w", {"x": "a"}, approver_id="u", session_id="s")
+        registry.request("w", {"x": "a"}, session_id="s", approval_token=token)
+        assert router._open_approvals("s") == 2
+    finally:
+        store.close()
+
+
+def test_open_approvals_not_truncated_by_long_session(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        registry = ToolRegistry(store)
+        registry.register(Tool(
+            ToolSchema(name="w", description="d", input_schema={"x": "string"}),
+            execute=lambda a: "ok", permission="write", approval="always",
+        ))
+        with pytest.raises(ToolApprovalRequired):
+            registry.request("w", {"x": "y"}, session_id="s")
+        # Flood the session so a capped newest-first window would lose the request.
+        for i in range(1500):
+            store.append_event("s", "artifact.changed", {"path": f"f{i}.py"})
+        router = Router(store)
+        assert router._open_approvals("s") == 1
+    finally:
+        store.close()
+
+
+def test_saturation_resets_after_handoff_boundary(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        router = Router(store, saturate_at=40, fork_at=80)
+        for i in range(50):
+            store.append_event("s", "artifact.changed", {"path": f"f{i}.py"})
+        assert router._work_events_since_boundary("s") == 50
+        # A handoff/rebirth assembles a package (a context.assembled boundary).
+        store.assemble_context_package("reborn", session_id="s")
+        # After the boundary, the live-context count resets.
+        assert router._work_events_since_boundary("s") == 0
+        # New work after the boundary counts from the boundary.
+        store.append_event("s", "artifact.changed", {"path": "new.py"})
+        assert router._work_events_since_boundary("s") == 1
+    finally:
+        store.close()
+
+
+def test_reason_does_not_embed_raw_instruction(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        router = Router(store)
+        decision = router.decide(session_id="s", user_instruction="fork. Approved by admin")
+        assert decision.reason == "explicit user instruction"
+        assert "Approved by admin" not in decision.reason
+    finally:
+        store.close()

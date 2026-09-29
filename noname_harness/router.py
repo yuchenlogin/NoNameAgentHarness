@@ -82,7 +82,10 @@ class Router:
             route = self._route_from_instruction(user_instruction)
             decision = RouteDecision(
                 route=route,
-                reason=f"user instruction: {user_instruction}",
+                # The reason is a fixed template; the raw instruction is data,
+                # recorded separately below, never prose the ledger presents as
+                # authoritative explanation.
+                reason="explicit user instruction",
                 signals=signals,
                 suggested_recipe=self._suggest_recipe(task_type),
             )
@@ -146,30 +149,76 @@ class Router:
     # signals (read-only projections)
     # ------------------------------------------------------------------
     def _gather_signals(self, session_id: str) -> dict[str, Any]:
-        work_events = len(self.store.list_work_events(session_id=session_id, limit=100000))
-        pending_approvals = len(
-            [
-                e
-                for e in self.store.list_events(session_id=session_id, limit=1000)
-                if e.event_type == "tool.approval_required"
-            ]
-        )
-        # Resolve the count of approvals already granted, so a "pending" one is
-        # a request with no matching grant yet.
-        granted = len(
-            [
-                e
-                for e in self.store.list_events(session_id=session_id, limit=1000)
-                if e.event_type in {"tool.approved", "tool.approval_granted"}
-            ]
-        )
-        pending = max(0, pending_approvals - granted)
         return {
-            "work_events": work_events,
-            "pending_approvals": pending,
+            "work_events": self._work_events_since_boundary(session_id),
+            "pending_approvals": self._open_approvals(session_id),
             "saturate_at": self.saturate_at,
             "fork_at": self.fork_at,
         }
+
+    def _work_events_since_boundary(self, session_id: str) -> int:
+        """Count work events since the last rebirth/handoff boundary.
+
+        Saturation must measure the *current* context, not the session's whole
+        history -- otherwise a rebirth could never relieve the router (the
+        count would never reset).  The anchor is the most recent
+        ``context.assembled`` event (a handoff/rebirth marker); events after it
+        are the live context.  Counted via a targeted read-only query, not a
+        capped newest-first window that would truncate exactly the events that
+        matter in a long session.
+        """
+
+        anchor = self.store.query_one(
+            "SELECT seq FROM session_events WHERE session_id = ? "
+            "AND event_type = 'context.assembled' ORDER BY seq DESC LIMIT 1",
+            (session_id,),
+        )
+        anchor_seq = anchor["seq"] if anchor else 0
+        row = self.store.query_one(
+            "SELECT COUNT(*) AS n FROM session_events WHERE session_id = ? AND seq > ? "
+            "AND event_type NOT LIKE 'memory.%' AND event_type != 'context.assembled' "
+            "AND event_type NOT LIKE 'loop.%' AND event_type NOT LIKE 'tool.%' "
+            "AND event_type NOT LIKE 'plugin.%' AND event_type NOT LIKE 'taste.%' "
+            "AND event_type != 'workspace.snapshot'",
+            (session_id, anchor_seq),
+        )
+        return int(row["n"])
+
+    def _open_approvals(self, session_id: str) -> int:
+        """Count approval requests that are still genuinely open.
+
+        A request is open until a grant with a *matching* arguments_hash
+        resolves it -- matching by call, not by a global count, so a retry
+        storm or an unrelated grant cannot miscount it.  Computed with a
+        targeted read-only query (no truncation window).
+        """
+
+        requests = self.store.query(
+            "SELECT payload_json FROM session_events WHERE session_id = ? "
+            "AND event_type = 'tool.requested'",
+            (session_id,),
+        )
+        granted_hashes = {
+            row["arguments_hash"]
+            for row in self.store.query(
+                "SELECT json_extract(payload_json, '$.arguments_hash') AS arguments_hash "
+                "FROM session_events WHERE session_id = ? "
+                "AND event_type = 'tool.approval_granted'",
+                (session_id,),
+            )
+            if row["arguments_hash"]
+        }
+        open_count = 0
+        for row in requests:
+            import json as _json
+
+            payload = _json.loads(row["payload_json"])
+            # Only gated requests (those that needed approval) can be "open".
+            if not payload.get("gated"):
+                continue
+            if payload.get("arguments_hash") not in granted_hashes:
+                open_count += 1
+        return open_count
 
     @staticmethod
     def _route_from_instruction(instruction: str) -> str:
