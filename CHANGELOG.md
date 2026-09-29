@@ -2,6 +2,26 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.4.1] - 2026-09-29
+
+### Features
+
+- 对抗性审查修复轮（skeptic / architect / minimalist 三视角）：在不改变公开契约的前提下收紧内核。
+- 品味生命周期改为显式状态机：`candidate → {adopt, retire}`、`active → {edit, pause, retire}`、`paused → {edit, resume, retire}`、`retired → {}`（终态）。
+- 品味 review 仅作用于 lineage head，并由 `taste_records(supersedes_id)` 唯一索引在结构上杜绝分叉。
+- bitemporal 从「只写不读」变为真正生效：`active_state` / 接续包投影按 `as_of` 过滤有效期，过期与未生效的事实自动退出；`retire` 默认以审核时刻闭合 `valid_to`；`valid_from` / `valid_to` 经严格 ISO-8601 解析并归一化到 UTC。
+- store 暴露公开服务 API（`transaction` / `record_event` / `query` / `query_one` / `check_event_ids`），TasteService 不再访问任何私有成员。
+
+### Design Rationale
+
+- **为什么状态机必须显式**：原转移表把 `edit` / `resume` 都映射到 `active`，使一条 adopted 候选可以绕过强制 `adopt` 直接激活——这正是「adopted 必须显式审核」要防的事。把转移写成表格后，「edit 不能激活候选」「retire 不可逆」成为结构事实而非约定。
+- **为什么 bitemporal 必须有读侧语义**：只记录 `valid_from` / `valid_to` 而不在投影中使用，会让一条昨天就过期的约束仍被当作当前法典交给新会话。有效期只有在投影层真正过滤时才成立；supersede 链与冲突检测则用 `apply_validity=False` 看到全量历史，保证链不因有效期而断裂。
+
+### Notes & Caveats
+
+- 新增 10 个对抗性回归测试，逐一钉死每个已修复漏洞，含「关闭并重开数据库后凭接续包接管」的真实新会话场景。
+- 品味卡片 / 聚类 / 视觉仍未做；品味层为纯文字双轨。
+
 ## [0.4.0] - 2026-09-29
 
 ### Features
