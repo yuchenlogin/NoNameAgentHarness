@@ -27,6 +27,7 @@ from typing import Any, Iterable, Sequence
 from .store import (
     VALID_TASTE_ACTIONS,
     VALID_TASTE_SCOPES,
+    VALID_TASTE_STATUSES,
     VALID_TASTE_TRACKS,
     HarnessStore,
     _decode,
@@ -64,7 +65,7 @@ class TasteService:
 
         self._validate(scope=scope, track="authored")
         if source_event_ids:
-            self.store._check_event_ids(source_event_ids)
+            self.store.check_event_ids(source_event_ids)
         return self._insert_taste(
             track="authored",
             scope=scope,
@@ -95,7 +96,7 @@ class TasteService:
         self._validate(scope=scope, track="adopted")
         if not source_event_ids:
             raise ValueError("adopted taste must cite at least one source event")
-        self.store._check_event_ids(source_event_ids)
+        self.store.check_event_ids(source_event_ids)
         return self._insert_taste(
             track="adopted",
             scope=scope,
@@ -132,25 +133,40 @@ class TasteService:
         if not reviewer_id.strip():
             raise ValueError("reviewer_id cannot be empty")
         row = self._get_row(taste_id)
+
+        # Reviews only ever apply to the current head of a lineage.  Acting on
+        # a superseded record would fork the chain, so refuse it up front.
+        if self._has_child(taste_id):
+            raise ValueError(
+                f"taste record {taste_id} has been superseded; review the current head"
+            )
+
+        # A strict lifecycle machine.  This is the enforcement point for the
+        # invariant that an adopted candidate becomes active *only* through an
+        # explicit ``adopt`` -- ``edit`` can never silently activate one, and
+        # ``retired`` is terminal.
+        transitions: dict[str, dict[str, str]] = {
+            "candidate": {"adopt": "active", "retire": "retired"},
+            "active": {"edit": "active", "pause": "paused", "retire": "retired"},
+            "paused": {"edit": "active", "resume": "active", "retire": "retired"},
+            "retired": {},
+        }
+        allowed = transitions.get(row["status"], {})
+        if action not in allowed:
+            raise ValueError(
+                f"cannot '{action}' a taste in status '{row['status']}'"
+            )
         if action == "adopt" and row["track"] != "adopted":
             raise ValueError("only adopted taste can be adopted")
-        if action == "adopt" and row["status"] != "candidate":
-            raise ValueError("only a candidate can be adopted")
         if action == "edit" and edited_content is None:
             raise ValueError("edited_content is required for edit")
 
         new_content = edited_content if action == "edit" else _decode(row["content_json"])
-        new_status = {
-            "adopt": "active",
-            "edit": "active",
-            "pause": "paused",
-            "resume": "active",
-            "retire": "retired",
-        }[action]
+        new_status = allowed[action]
 
         review_id = _id("trv")
         reviewed_at = _now()
-        with self.store._transaction() as connection:
+        with self.store.transaction() as connection:
             connection.execute(
                 "INSERT INTO taste_reviews "
                 "(id, taste_id, action, reviewer_id, edited_content_json, reason, reviewed_at) "
@@ -189,7 +205,7 @@ class TasteService:
             )
             # Keep the ledger honest: every taste transition is also an event.
             source_session = self._source_session(connection, row)
-            self.store._insert_event(
+            self.store.record_event(
                 connection,
                 source_session,
                 "taste.reviewed",
@@ -211,10 +227,10 @@ class TasteService:
     # ------------------------------------------------------------------
     def get(self, taste_id: str) -> dict[str, Any]:
         row = self._get_row(taste_id)
-        reviews = self.store._connection.execute(
+        reviews = self.store.query(
             "SELECT * FROM taste_reviews WHERE taste_id = ? ORDER BY reviewed_at, rowid",
             (taste_id,),
-        ).fetchall()
+        )
         return {
             "id": row["id"],
             "track": row["track"],
@@ -252,35 +268,34 @@ class TasteService:
 
         return self._latest_by_status("candidate", scope=None)
 
+    def by_status(self, status: str, scope: str | None = None) -> list[dict[str, Any]]:
+        """Return the projection for any lifecycle status.
+
+        ``paused`` and ``retired`` records are first-class states, so they must
+        be auditable, not just writable.
+        """
+
+        if status not in VALID_TASTE_STATUSES:
+            raise ValueError(f"invalid taste status: {status}")
+        return self._latest_by_status(status, scope=scope)
+
     def _latest_by_status(
         self, status: str, scope: str | None
     ) -> list[dict[str, Any]]:
-        rows = self.store._connection.execute(
-            "SELECT * FROM taste_records ORDER BY recorded_at, rowid"
-        ).fetchall()
+        rows = self.store.query("SELECT * FROM taste_records ORDER BY recorded_at, rowid")
         superseded = {row["supersedes_id"] for row in rows if row["supersedes_id"]}
-        latest: dict[str, Any] = {}
+        # Reviews are restricted to chain heads, so a non-superseded row is the
+        # unique head of its lineage -- no fork-merging or tie-breaking needed.
+        result = []
         for row in rows:
             if row["id"] in superseded:
                 continue
-            # The newest non-superseded row per (track, scope, content-root)
-            # wins.  Because every version supersedes its parent, following
-            # the chain leaves exactly one head per logical taste line.
-            key = self._lineage_key(row)
-            previous = latest.get(key)
-            if previous is None or (row["recorded_at"], row["id"]) > (
-                previous["recorded_at"],
-                previous["id"],
-            ):
-                latest[key] = row
-        result = []
-        for row in latest.values():
             if row["status"] != status:
                 continue
             if scope is not None and row["scope"] != scope:
                 continue
             result.append(self.get(row["id"]))
-        return sorted(result, key=lambda item: (item["track"], item["id"]))
+        return sorted(result, key=lambda item: (item["recorded_at"], item["track"]))
 
     # ------------------------------------------------------------------
     # internals
@@ -299,7 +314,7 @@ class TasteService:
     ) -> dict[str, Any]:
         taste_id = _id("tst")
         recorded_at = _now()
-        with self.store._transaction() as connection:
+        with self.store.transaction() as connection:
             connection.execute(
                 "INSERT INTO taste_records "
                 "(id, track, scope, content_json, status, source_event_ids_json, "
@@ -323,7 +338,7 @@ class TasteService:
                 if source_event_ids
                 else "user"
             )
-            self.store._insert_event(
+            self.store.record_event(
                 connection,
                 source_session,
                 "taste.proposed",
@@ -340,28 +355,20 @@ class TasteService:
         return self.get(taste_id)
 
     def _get_row(self, taste_id: str) -> Any:
-        row = self.store._connection.execute(
-            "SELECT * FROM taste_records WHERE id = ?", (taste_id,)
-        ).fetchone()
+        row = self.store.query_one("SELECT * FROM taste_records WHERE id = ?", (taste_id,))
         if row is None:
             raise KeyError(f"unknown taste record: {taste_id}")
         return row
 
-    def _lineage_key(self, row: Any) -> str:
-        """Return the id of the root record of this taste's version chain."""
+    def _has_child(self, taste_id: str) -> bool:
+        """Return whether any record supersedes ``taste_id`` (i.e. it is not a head)."""
 
-        current = row
-        seen = {row["id"]}
-        while current["supersedes_id"] is not None:
-            parent = self.store._connection.execute(
-                "SELECT * FROM taste_records WHERE id = ?",
-                (current["supersedes_id"],),
-            ).fetchone()
-            if parent is None or parent["id"] in seen:  # pragma: no cover - defensive
-                break
-            seen.add(parent["id"])
-            current = parent
-        return current["id"]
+        return (
+            self.store.query_one(
+                "SELECT 1 FROM taste_records WHERE supersedes_id = ? LIMIT 1", (taste_id,)
+            )
+            is not None
+        )
 
     @staticmethod
     def _validate(*, scope: str, track: str) -> None:

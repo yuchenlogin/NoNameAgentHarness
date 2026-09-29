@@ -56,6 +56,28 @@ def _decode(value: str) -> Any:
     return json.loads(value)
 
 
+def _parse_instant(value: str, field: str) -> str:
+    """Parse an ISO-8601 instant and return its normalised UTC form.
+
+    Bitemporal bounds are compared chronologically, not lexicographically, so
+    they must be real timestamps.  Naive input is assumed to be UTC; aware
+    input is converted.  Anything unparseable is rejected rather than stored.
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty ISO-8601 string")
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"{field} is not a valid ISO-8601 instant: {value!r}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 class HarnessStore:
     """The local fact base for one NoName project."""
 
@@ -77,6 +99,13 @@ class HarnessStore:
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         self.close()
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Public write transaction for services built on the store."""
+
+        with self._transaction() as connection:
+            yield connection
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -273,6 +302,9 @@ class HarnessStore:
         BEGIN
             SELECT RAISE(ABORT, 'context_packages is append-only');
         END;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS taste_records_one_child_per_parent
+            ON taste_records(supersedes_id) WHERE supersedes_id IS NOT NULL;
 
         CREATE TRIGGER IF NOT EXISTS taste_records_append_only_update
         BEFORE UPDATE ON taste_records
@@ -528,6 +560,35 @@ class HarnessStore:
             )
         return Event(event_id, session_id, seq, event_type, payload, timestamp, event_hash)
 
+    def record_event(
+        self,
+        connection: sqlite3.Connection,
+        session_id: str,
+        event_type: str,
+        payload: Any,
+        occurred_at: str | None = None,
+    ) -> Event:
+        """Append an event inside an existing transaction.
+
+        This is the sanctioned way for a service (taste, inbox) to write ledger
+        events atomically with its own table writes, without touching private
+        store internals.
+        """
+
+        return self._insert_event(
+            connection, session_id, event_type, payload, (), occurred_at
+        )
+
+    def query(self, sql: str, args: Sequence[Any] = ()) -> list[sqlite3.Row]:
+        """Run a read-only query against the store for service projections."""
+
+        return self._connection.execute(sql, tuple(args)).fetchall()
+
+    def query_one(self, sql: str, args: Sequence[Any] = ()) -> sqlite3.Row | None:
+        """Run a read-only query expected to return at most one row."""
+
+        return self._connection.execute(sql, tuple(args)).fetchone()
+
     def get_event(self, event_id: str) -> Event:
         row = self._connection.execute(
             "SELECT * FROM session_events WHERE id = ?", (event_id,)
@@ -730,6 +791,15 @@ class HarnessStore:
             )
         return True
 
+    def check_event_ids(self, source_event_ids: Sequence[str]) -> None:
+        """Public contract: assert every cited source event exists.
+
+        Services layered on the store (for example the taste service) call this
+        instead of reaching into private internals.
+        """
+
+        self._check_event_ids(source_event_ids)
+
     def _check_event_ids(self, source_event_ids: Sequence[str]) -> None:
         if not source_event_ids:
             raise ValueError("a durable proposal must cite at least one source event")
@@ -759,12 +829,37 @@ class HarnessStore:
                 return True
         return False
 
-    def _active_revisions(self, layer: str | None = None) -> list[dict[str, Any]]:
+    def _active_revisions(
+        self,
+        layer: str | None = None,
+        as_of: str | None = None,
+        *,
+        apply_validity: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Project current durable state, honouring bitemporal validity.
+
+        ``as_of`` defaults to now.  When ``apply_validity`` is true a revision
+        is only projected when it is ``active`` *and* valid at ``as_of``:
+        ``valid_from <= as_of`` and (``valid_to`` is NULL or ``as_of <=
+        valid_to``).  This is what makes validity behavioural rather than
+        write-only: an expired constraint drops out of the projection and
+        therefore out of any context package.
+
+        Internal callers that resolve supersede chains or detect conflicts set
+        ``apply_validity=False`` so a not-yet-valid or already-expired head is
+        still found and correctly superseded rather than silently orphaned.
+        """
+
+        if layer is not None and layer not in VALID_LAYERS:
+            raise ValueError(f"invalid layer: {layer}")
+        moment = (
+            _parse_instant(as_of, "as_of")
+            if as_of is not None
+            else (_now() if apply_validity else None)
+        )
         query = "SELECT * FROM state_revisions"
         args: tuple[Any, ...] = ()
         if layer is not None:
-            if layer not in VALID_LAYERS:
-                raise ValueError(f"invalid layer: {layer}")
             query += " WHERE layer = ?"
             args = (layer,)
         rows = self._connection.execute(query, args).fetchall()
@@ -798,12 +893,19 @@ class HarnessStore:
             }
             for row in latest.values()
             if row["status"] == "active"
+            and (
+                not apply_validity
+                or (
+                    (row["valid_from"] is None or row["valid_from"] <= moment)
+                    and (row["valid_to"] is None or moment <= row["valid_to"])
+                )
+            )
         ]
 
     def _conflicts(self, layer: str, logical_key: str, content: Any) -> list[str]:
         return [
             item["id"]
-            for item in self._active_revisions(layer)
+            for item in self._active_revisions(layer, apply_validity=False)
             if item["logical_key"] == logical_key and item["content"] != content
         ]
 
@@ -989,7 +1091,7 @@ class HarnessStore:
         return next(
             (
                 item
-                for item in self._active_revisions(layer)
+                for item in self._active_revisions(layer, apply_validity=False)
                 if item["logical_key"] == logical_key
             ),
             None,
@@ -1013,6 +1115,10 @@ class HarnessStore:
         proposal = self.get_proposal(proposal_id)
         if action == "edit" and edited_content is None:
             raise ValueError("edited_content is required for edit")
+        if valid_from is not None:
+            valid_from = _parse_instant(valid_from, "valid_from")
+        if valid_to is not None:
+            valid_to = _parse_instant(valid_to, "valid_to")
         if valid_from is not None and valid_to is not None and valid_to < valid_from:
             raise ValueError("valid_to cannot precede valid_from")
         review_id = _id("rev")
@@ -1039,6 +1145,11 @@ class HarnessStore:
             if action in {"accept", "edit", "retire"}:
                 previous = self._latest_revision(proposal["layer"], proposal["logical_key"])
                 status = "retired" if action == "retire" else "active"
+                # Retiring invalidates a fact: unless the reviewer said when it
+                # stopped being true, close its valid interval at the review
+                # moment so as-of queries learn it is no longer current.
+                if action == "retire" and valid_to is None:
+                    valid_to = reviewed_at
                 revision_id = _id("stt")
                 supersedes_id = previous["id"] if previous else None
                 revision_status = status
@@ -1085,9 +1196,11 @@ class HarnessStore:
             )
         return self.get_proposal(proposal_id)
 
-    def active_state(self, layer: str | None = None) -> list[dict[str, Any]]:
+    def active_state(
+        self, layer: str | None = None, as_of: str | None = None
+    ) -> list[dict[str, Any]]:
         return sorted(
-            self._active_revisions(layer),
+            self._active_revisions(layer, as_of=as_of),
             key=lambda item: (item["layer"], item["logical_key"]),
         )
 

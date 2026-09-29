@@ -131,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
     inbox = sub.add_parser("inbox", parents=[_db_parent()], help="show the review inbox (pending canon, task and taste)")
 
     taste_list = sub.add_parser("taste", parents=[_db_parent()], help="list taste records")
-    taste_list.add_argument("--status", choices=["active", "candidate"], default="active")
+    taste_list.add_argument("--status", choices=["active", "candidate", "paused", "retired"], default="active")
     taste_list.add_argument("--scope", choices=["user", "project"])
 
     return parser
@@ -283,10 +283,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _print(store.review_inbox())
             elif args.command == "taste":
                 service = TasteService(store)
-                if args.status == "active":
-                    _print(service.active(scope=args.scope))
-                else:
-                    _print(service.pending())
+                _print(service.by_status(args.status, scope=args.scope))
             else:  # pragma: no cover - argparse guarantees a known command
                 raise AssertionError(args.command)
         return 0
