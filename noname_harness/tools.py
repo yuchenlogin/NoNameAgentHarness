@@ -154,9 +154,32 @@ class ToolRegistry:
 
     store: HarnessStore
     _tools: dict[str, Tool] = field(default_factory=dict)
-    # Live (unconsumed) approval tokens, keyed by token id.  Rebuilt from the
-    # ledger's tool.approval_granted events, so a grant is verifiable.
+    # Live (unconsumed) approval tokens, keyed by token id.
     _grants: dict[str, ApprovalToken] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Rebuild live grants from the ledger: a grant is durable evidence, so
+        # an unconsumed token must survive a restart.  Grants recorded by
+        # tool.approval_granted minus those consumed by tool.approved are live.
+        consumed: set[str] = set()
+        granted: dict[str, ApprovalToken] = {}
+        for event in self.store.list_events(session_id=None, limit=100000):
+            if event.event_type == "tool.approval_granted":
+                payload = event.payload
+                granted[payload["token_id"]] = ApprovalToken(
+                    id=payload["token_id"],
+                    tool_name=payload["name"],
+                    arguments_hash=payload["arguments_hash"],
+                    approver_id=payload["approver_id"],
+                    granted_at=event.occurred_at,
+                )
+            elif event.event_type == "tool.approved":
+                token_id = event.payload.get("approval_token_id") or event.payload.get("token_id")
+                if token_id:
+                    consumed.add(token_id)
+        self._grants = {
+            token_id: token for token_id, token in granted.items() if token_id not in consumed
+        }
 
     # ------------------------------------------------------------------
     # registration
@@ -270,8 +293,7 @@ class ToolRegistry:
         if not approver_id.strip():
             raise ValueError("approver_id cannot be empty")
         token = ApprovalToken(
-            id=f"apr_{hashlib.sha256(_canonical_arguments(arguments).encode('utf-8')).hexdigest()[:16]}"
-               f"_{len(self._grants)}",
+            id=self._new_token_id(arguments),
             tool_name=name,
             arguments_hash=_arguments_hash(arguments),
             approver_id=approver_id,
@@ -461,6 +483,19 @@ class ToolRegistry:
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------
+    def _new_token_id(self, arguments: dict[str, Any]) -> str:
+        """A unique, unguessable token id.
+
+        It embeds the argument hash (so a token is self-describing) plus a
+        random component, so ids never collide across restarts and cannot be
+        predicted from the arguments alone.
+        """
+
+        import uuid
+
+        digest = hashlib.sha256(_canonical_arguments(arguments).encode("utf-8")).hexdigest()[:12]
+        return f"apr_{digest}_{uuid.uuid4().hex[:16]}"
+
     @staticmethod
     def _now() -> str:
         from datetime import datetime, timezone

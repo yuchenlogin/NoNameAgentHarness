@@ -295,3 +295,45 @@ def test_unregister_and_invalid_declarations(tmp_path):
             registry.grant_approval("write2", {}, approver_id="  ", session_id="s")
     finally:
         store.close()
+
+
+# --- grant durability across restarts -----------------------------------------
+
+def test_unconsumed_token_survives_restart_and_stays_single_use(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    db = root / ".noname" / "harness.db"
+    schema = ToolSchema("w", "d", {"text": "string"})
+
+    with HarnessStore(db) as store:
+        store.initialize_project(root, "restart project")
+        registry = ToolRegistry(store)
+        registry.register(Tool(schema, execute=lambda a: "ok", permission="write", approval="always"))
+        token = registry.grant_approval("w", {"text": "x"}, approver_id="user", session_id="s")
+
+    # Reopen: the grant is durable evidence, so the token must still verify.
+    with HarnessStore(db) as store2:
+        registry2 = ToolRegistry(store2)
+        registry2.register(Tool(schema, execute=lambda a: "ok", permission="write", approval="always"))
+        assert registry2.request("w", {"text": "x"}, session_id="s", approval_token=token)["output"] == "ok"
+
+    # Reopen again: the consumed token must stay consumed.
+    with HarnessStore(db) as store3:
+        registry3 = ToolRegistry(store3)
+        registry3.register(Tool(schema, execute=lambda a: "ok", permission="write", approval="always"))
+        with pytest.raises(ToolApprovalRequired):
+            registry3.request("w", {"text": "x"}, session_id="s", approval_token=token)
+
+
+def test_token_ids_are_unique_across_grants(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        registry = ToolRegistry(store)
+        registry.register(Tool(_schema("w"), execute=lambda a: "ok", permission="write", approval="always"))
+        ids = {
+            registry.grant_approval("w", {"text": "x"}, approver_id="u", session_id="s").id
+            for _ in range(5)
+        }
+        assert len(ids) == 5  # identical arguments still get distinct tokens
+    finally:
+        store.close()
