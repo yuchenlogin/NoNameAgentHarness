@@ -2,6 +2,32 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.9.0] - 2026-09-29
+
+### Features
+
+- 品味卡片层落地（schema 到 v6）：新增 `noname_harness/taste_cards.py`（`TasteCardService`）与新表 `taste_cards`——append-only、版本化、`supersedes` 链、INSERT 边界防护、`one_child_per_parent` 唯一索引。定位与 docs/taste-cards.md 一致：卡片是品味证据的视图与复核体验（「还是我吗」），不是新事实格式，绝不进入上下文包事实层。
+- 确定性聚类替身：`propose_clusters` 按 `(scope, track)` 分组已审核活跃品味，可解释、无意外合并；未来语义/embedding 聚类器可替换，但不绕过同一存储/审核契约。
+- 卡片内容完整：标题 / 一句态度 / `track`（authored | adopted | mixed）/ `scope` / `taste_ids` / 代表证据 / 张力 / 影响范围 / 状态 / 图像元数据。
+- 生命周期状态机：`candidate→{accept,edit,retire,split}`、`active→{edit,pause,retire,split}`、`paused→{edit,resume,retire,split}`、`retired` 终态；仅 head 可审；review 在事务内写锁下重检 head 防并发分叉；edit 重跑创建时的校验。
+- split 原子：全部校验前置，退休原卡 + 创建互斥候选子卡在单一事务内完成（要么全写要么全不写）；子卡继承图像契约；校验完备且互不相交。
+- 图像契约：image 仅为视觉隐喻，记录 `model / prompt / seed / version` 保证可重建；默认纯排版（`None`）；绝不用图像反推品味；本层不做真实生成。
+- 复核队列确定性：候选优先（`recorded_at` 最久优先、`id` 决胜），active 按最久未确认排序；无随机稀有度、无赌博机制。
+- stale 标注：卡片分组 taste 不再全是活跃 head 时，`_project` 标注 stale，提示复核而不阻断、不自动修改。
+
+### Design Rationale
+
+- **为什么卡片是视图而非新事实**：品味卡片帮助你复核，不替你定义永远正确的画像。它只做分组与提示——事实仍在 taste 层，卡片对同一证据可以合并、拆分、退休而事实不动；若卡片本身成为事实格式，复核层的编辑就会反向污染证据层，溯源随之分叉。所以卡片绝不进入上下文包事实层，它只是「这还是我吗」的提问界面。
+- **为什么 split 必须原子且图像只记契约**：split 非原子会让账本永久不一致——原卡已退休、子卡残缺，事件流里出现悬空的 supersedes 链；所以全部校验前置、退休与创建在单一事务内完成。图像只是视觉隐喻：记录 `model / prompt / seed / version` 已足以保证可重建，但绝不用图像反推品味，默认纯排版——最准确画出用户的卡不是目标，最容易帮助用户思考的卡才是。
+
+### Notes & Caveats
+
+- 聚类是确定性替身：`(scope, track)` 分组，无语义/embedding；替换聚类器不得绕过同一存储与审核契约。
+- 本层不做真实图像生成，只记录可重建元数据契约。
+- stale 仅标注提示复核，不自动处理、不自动修改卡片。
+- 新增 16 个测试，总数到 139。
+
+
 ## [0.8.0] - 2026-09-29
 
 ### Features

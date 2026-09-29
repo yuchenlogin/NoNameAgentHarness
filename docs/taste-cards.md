@@ -95,3 +95,12 @@ embedding 只用于「哪些记录可能属于一组」的召回。最终分组�
 - 用户可选择纯排版、摄影拼贴、抽象图形或关闭生成图。
 
 最好的卡片不是最准确地「画出用户」，而是最容易帮助用户思考：这还是现在的我吗？
+
+## 8. 原型落地状态
+
+- 卡片层已落地：`noname_harness/taste_cards.py`（`TasteCardService`）+ `taste_cards` 表（schema v6，append-only、版本化、supersedes 链、INSERT 边界防护、`one_child_per_parent` 唯一索引）。
+- 聚类为确定性替身：按 `(scope, track)` 分组已审核活跃品味，无语义/embedding；未来聚类器可替换，但不绕过同一存储与审核契约。
+- 生命周期状态机已实现：`candidate / active / paused / retired` 及合法转移表，仅 head 可审，review 在事务内写锁下重检 head；split 原子（退休原卡 + 创建互斥候选子卡在同一事务，校验前置且互不相交）。
+- 图像仅记录可重建元数据契约（`model / prompt / seed / version`），默认无图（纯排版），不做真实生成，不用图像反推品味。
+- 复核队列确定性：候选优先（`recorded_at` 最久优先、`id` 决胜），active 按最久未确认排序；无随机稀有度。
+- stale 仅标注：分组 taste 不再全是活跃 head 时投影标注 stale，提示复核，不阻断、不自动修改。
