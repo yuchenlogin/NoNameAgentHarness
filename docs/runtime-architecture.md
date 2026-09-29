@@ -141,6 +141,16 @@ IDLE
 
 停止条件必须明确：任务完成、用户暂停、轮次上限、预算上限、不可恢复错误、等待批准。恢复时从事件流重建状态，而不是依赖进程内对象。
 
+### 原型落地状态
+
+`noname_harness/agent_loop.py` 已实现本节核心（schema v5）：
+
+- 状态机已落地，含合法转移表，非法转移即 `AgentLoopError`；`STREAMING_OUTPUT` / `COMPACTING` 因原型层无驱动可达暂未实现，待真实驱动接入后恢复；
+- 每次状态转移都是 `loop.transition` 事件，转移全入账；停止条件即本节所列六项；
+- 驱动异常与契约违反（矛盾 `LoopResult`、未知 `stop_reason`）统一归一为 `FAILED`，经 `_force_fail` 写真实 transition（`forced: true`）到终态；
+- `reconstruct()` 从事件流重建状态 / 轮次 / limits（从 `loop.started` 读回），不依赖进程内对象；
+- driver 为注入的 `SessionDriver` 协议：原型用确定性 stub，生产接 Model Adapter；loop 不路由模型、不写记忆、不判权限，复用 `assemble_context_package` / `resolve_recipe` / `ToolRegistry`。
+
 ## 7. Router 与 Context Assembler
 
 Router 决定：继续当前上下文、fork、压缩后重生、切换 recipe、派生子 agent。它输出带理由的决定，不直接修改长期记忆。

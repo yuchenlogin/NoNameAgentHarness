@@ -2,6 +2,26 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.8.0] - 2026-09-29
+
+### Features
+
+- Agent Loop 显式状态机（schema 不变，仍为 v5）：新增 `noname_harness/agent_loop.py`，状态序列 `IDLE → ASSEMBLING_CONTEXT → SELECTING_MODEL → CALLING_MODEL → WAITING_TOOL → APPLYING_RESULT → CHECKING_STOP → COMPLETED / FAILED / CANCELLED`，含合法转移表，非法转移即 `AgentLoopError`；`STREAMING_OUTPUT` / `COMPACTING` 因原型层无驱动可达已删，状态表与代码严格一致。
+- loop 只驱动：不路由模型、不写记忆、不判权限——上下文组装复用 `assemble_context_package`、配方选择复用 `resolve_recipe`、工具调用经 `ToolRegistry`；`CALLING_MODEL` 委托给注入的 `SessionDriver` 协议，原型用确定性 stub，生产接 Model Adapter。
+- 转移全入账：每次状态变化都是 `loop.transition` 事件；停止条件明确（任务完成 / 用户暂停 / 轮次上限 / 预算上限 / 不可恢复错误 / 等待批准）。
+- 失败归一化与可恢复：驱动异常与契约违反（矛盾 `LoopResult`、未知 `stop_reason`）统一归一为 `FAILED`，经 `_force_fail` 写真实 transition（`forced: true`）到终态；`reconstruct()` 从事件流重建状态 / 轮次 / limits（从 `loop.started` 读回），不靠进程内对象，致命失败可恢复、不留僵尸。
+- `LoopResult` 边界校验：`tool_call` 不得与 `task_complete` / `stop_reason` 共存，`task_complete` 不得与非 `task_complete` 的 `stop_reason` 共存；`max_rounds` / `budget_rounds` ≥ 1。
+
+### Design Rationale
+
+- **为什么 loop 只驱动，不路由、不写记忆、不判权限**：把路由、记忆、权限全塞进一个巨大驱动函数是 agent loop 的病——行为藏在隐式控制流里，无法回放、无法单测、职责无归属。显式状态机让每一步推进都是一个可入账的转移，上下文组装、配方选择、工具执行各自复用已有服务，每个职责有单一归属；loop 退化为薄而可审计的驱动层，正符合「内核薄而不可谈判」。
+- **为什么致命失败也要写真实 transition 而非只改进程内状态**：恢复从事件流重建，不靠进程内对象。若异常路径只把内存里的状态标成 FAILED 而不落事件，重建会从最后一个正常事件把死运行复活成中途状态——一个看似可继续的僵尸。`_force_fail` 写下的 `forced: true` transition 让恢复看到终态、让审计看到「机器是被中止的，而非被正常驱动到 FAILED」，事件流在失败路径上依然是事实来源。
+
+### Notes & Caveats
+
+- 本层使用确定性 stub driver，不含真实模型调用、流式输出与压缩逻辑；`STREAMING_OUTPUT` / `COMPACTING` 待真实驱动可达时再恢复。
+- 新增 17 个测试，总数到 123。
+
 ## [0.7.0] - 2026-09-29
 
 ### Features
