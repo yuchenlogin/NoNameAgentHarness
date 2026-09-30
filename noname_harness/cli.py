@@ -14,6 +14,7 @@ from .models import EvidenceInput, ModelCapability, ModelProfile
 from .recipes import DEFAULT_RECIPES, resolve_recipe
 from .router import Router
 from .ledger_view import build_ledger_model, render_ledger_html
+from .extractor import MemoryExtractor
 from .taste import TasteService
 from .taste_cards import TasteCardService
 from .store import HarnessStore, WorkspaceBoundaryError
@@ -59,6 +60,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     snapshot = sub.add_parser("snapshot", parents=[_db_parent()], help="record a read-only workspace/git snapshot")
     snapshot.add_argument("--session", required=True, dest="session_id")
+
+    extract = sub.add_parser("extract", parents=[_db_parent()], help="run memory extraction over a session's events")
+    extract.add_argument("--session", required=True, dest="session_id")
+    extract.add_argument("--limit", type=int, default=200)
+    extract.add_argument("--no-proposals", action="store_true", help="only report, don't create proposals")
 
     curate = sub.add_parser("curate", parents=[_db_parent()], help="turn structured hints into proposals")
     curate.add_argument("--event-id")
@@ -227,6 +233,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _print(_event_dict(event))
             elif args.command == "snapshot":
                 _print(_event_dict(store.append_workspace_snapshot(args.session_id)))
+            elif args.command == "extract":
+                extractor = MemoryExtractor(store)
+                report = extractor.scan(
+                    session_id=args.session_id,
+                    limit=args.limit,
+                    create_proposals=not args.no_proposals,
+                )
+                _print(report.describe())
             elif args.command == "curate":
                 curator = CuratorService(store)
                 if args.event_id:
