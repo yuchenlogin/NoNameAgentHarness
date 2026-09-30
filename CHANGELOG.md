@@ -2,6 +2,28 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.20.0] - 2026-09-30
+
+### Features
+
+- 品味卡片图像（多模态视觉层）落地（taste-cards §7，此前只有可重建元数据契约、无真实生成，经一轮对抗性审查——CONTESTED 后修复——schema 不变，仍为 v7）：新增 `noname_harness/card_images.py`。`ImageGenerator` 协议（结构化文本摘要 → 图像字节 + 元数据，可注入）；确定性无网络的 `local_typographic_image`（纯抽象排版 SVG，无人脸/摄影/敏感视觉元素，seed 含 track 完全可复现）；`image_metadata_contract`（`model / prompt / seed / version` 可重建）。真实图像模型（imagegen）按同一协议以插件注入。
+- 多模态风险防控内建（§7）：图像始终标注「视觉解释·非事实」；默认抽象排版规避敏感视觉推断；生成器只接收卡片文本（title / attitude / track），绝不接触其它用户数据；不用图像反推品味；`abstract / no_faces` 来自生成器自身元数据（service 不替插件做虚假声明）。
+- 原子持久化：图像字节先作为 append-only evidence span 记入 `card.image.generated` 事件（账本天然原子可溯源），文件系统仅是便利缓存，卡片版本化引用 `event_id + path`；`store.write_bytes_nofollow` 二进制安全写文件（工作区边界 + O_NOFOLLOW），扩展名从 `media_type` 派生。
+- CLI：`card-image --card-id --reviewer`。
+- 审查加固：upper 顺序不腐实体；控制字符下 XML 仍良好；`fill-opacity` 合法；seed 含 track 完全可复现；review 失败不留孤儿文件。
+
+### Design Rationale
+
+- **为什么图像必须是「视觉解释」且生成器只接收文本**：生成图像可能把抽象品味过度具体化、制造刻板印象。让生成器只从卡片的文字证据工作（无人脸/摄影/敏感元素），图像才是帮助复核「这还是我吗」的隐喻，而不是对用户的画像；且绝不用图像反推品味——视觉层是复核的脚手架，不是新的推断来源。
+- **为什么图像字节要存为 evidence span 而非只写文件**：文件系统会漂移——review 失败留孤儿、重新生成留死文件；而 append-only evidence span 天然原子、可溯源、可校验（`content_hash`），视觉解释本身也成为证据链的一环。文件系统只是便利缓存，真相永远在账本里。
+
+### Notes & Caveats
+
+- 默认渲染器是抽象排版（`local_typographic_image`），不是真实图像模型；真实 imagegen 插件待注入，按同一 `ImageGenerator` 协议接入。
+- `abstract / no_faces` 声明来自生成器自身元数据：默认渲染器诚实自报，service 不替插件做虚假声明——插件渲染器的风险标注取决于其自报元数据。
+- 新增 15 个测试，总数到 304。
+
+
 ## [0.19.0] - 2026-09-29
 
 ### Features
