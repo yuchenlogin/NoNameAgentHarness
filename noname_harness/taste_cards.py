@@ -496,6 +496,52 @@ class TasteCardService:
         ordered = candidates + active
         return [self._project(row) for row in ordered[:limit]]
 
+    def generate_image(
+        self,
+        card_id: str,
+        reviewer_id: str,
+        *,
+        generator: Any = None,
+    ) -> dict[str, Any]:
+        """Generate (or regenerate) the card's visual metaphor and record it.
+
+        The image is written to the workspace (``.noname/card-images/``) and the
+        card is versioned to reference it with its rebuildable metadata.  This
+        is a review-like action: it produces a new card head whose ``image``
+        carries the generator contract, so the visual explanation is itself
+        traceable and rebuildable.  The default generator is the deterministic
+        typographic renderer; a real image model plugs in behind the same
+        protocol.
+        """
+
+        from .card_images import card_image_for
+
+        row = self._get_row(card_id)
+        if self._has_child(card_id):
+            raise ValueError(f"card {card_id} has been superseded; generate on the current head")
+        card = self._project(row)
+        generated = card_image_for(card, generator)
+
+        # Persist the image bytes inside the workspace (never outside it).
+        filename = f".noname/card-images/{card_id}.svg"
+        self.store.write_text_nofollow(
+            filename, generated.image_bytes.decode("utf-8")
+        )
+        image = {
+            **generated.metadata,
+            "media_type": generated.media_type,
+            "path": filename,
+            "abstract": True,
+            "no_faces": True,
+            "note": "visual explanation, not evidence; never used to infer taste",
+        }
+        return self.review(
+            card_id,
+            "edit",
+            reviewer_id,
+            edited={"image": image},
+        )
+
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------

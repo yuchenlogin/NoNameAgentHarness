@@ -10,6 +10,7 @@ from .router import RouteDecision, Router
 from .openai_adapter import OpenAIAdapter, load_openai_adapter
 from .anthropic_adapter import AnthropicAdapter, load_anthropic_adapter
 from .embeddings import local_hash_embedding, cosine_similarity
+from .card_images import GeneratedImage, local_typographic_image, card_image_for
 from .adapters import (
     AdapterDriver,
     LocalEchoAdapter,
@@ -56,6 +57,9 @@ __all__ = [
     "load_anthropic_adapter",
     "local_hash_embedding",
     "cosine_similarity",
+    "GeneratedImage",
+    "local_typographic_image",
+    "card_image_for",
     "load_openai_adapter",
     "LocalEchoAdapter",
     "ModelAdapterError",

@@ -185,6 +185,10 @@ def build_parser() -> argparse.ArgumentParser:
     card_queue = sub.add_parser("card-queue", parents=[_db_parent()], help="show the deterministic card review queue")
     card_queue.add_argument("--limit", type=int, default=5)
 
+    card_image = sub.add_parser("card-image", parents=[_db_parent()], help="generate a card's visual metaphor image")
+    card_image.add_argument("--card-id", required=True)
+    card_image.add_argument("--reviewer", required=True, dest="reviewer_id")
+
     card_list = sub.add_parser("card", parents=[_db_parent()], help="list taste cards by status")
     card_list.add_argument("--status", choices=["candidate", "active", "paused", "retired"], default="active")
     card_list.add_argument("--scope", choices=["user", "project"])
@@ -439,6 +443,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             elif args.command == "card-queue":
                 service = TasteCardService(store)
                 _print(service.review_queue(limit=args.limit))
+            elif args.command == "card-image":
+                service = TasteCardService(store)
+                _print(service.generate_image(args.card_id, args.reviewer_id))
             elif args.command == "card":
                 service = TasteCardService(store)
                 _print(service.by_status(args.status, scope=args.scope))
