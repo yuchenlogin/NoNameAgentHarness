@@ -135,7 +135,7 @@ CREATE TABLE memory_reviews (
 
 检查结果同样进入账本。没有候选也是一个有理由的结果。
 
-**原型落地状态**：抽取管线已落地（`noname_harness/extractor.py`：`ExtractorFn` 协议 + 确定性无网络的 `rule_based_extractor` 替身 + `MemoryExtractor` 驱动）。两阶段结构不变：覆盖提取 → 长期门控，提取器绝不写长期状态、绝不自我确认，所有候选经既有人工审核门。§4.3 类别覆盖：明确要求记住 / 项目决策 / 任务阻塞 / 失败教训。`memory.extracted` 审计事件记录每次运行，含失败与零候选。真实 LLM 抽取器经 ModelAdapter 驱动、按同一协议注入。
+**原型落地状态**：抽取管线已落地（`noname_harness/extractor.py`：`ExtractorFn` 协议 + 确定性无网络的 `rule_based_extractor` 替身 + `MemoryExtractor` 驱动）。两阶段结构不变：覆盖提取 → 长期门控，提取器绝不写长期状态、绝不自我确认，所有候选经既有人工审核门。§4.3 类别覆盖：明确要求记住 / 项目决策 / 任务阻塞 / 失败教训。`memory.extracted` 审计事件记录每次运行，含失败与零候选。真实 LLM 抽取器经 ModelAdapter 驱动、按同一协议注入。LLM 抽取器已落地（`noname_harness/llm_extractor.py`：`LLMExtractor` 驱动任意 `ModelAdapter`，fail-closed 解析 + 幻觉防护 + prompt 注入缓解 + payload 截断），规则抽取器与 LLM 抽取器共用同一 `ExtractorFn` 协议。
 
 ## 5. 用户审核契约
 
