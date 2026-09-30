@@ -38,6 +38,7 @@
 | 证据/记忆 | append-only 事件与证据、候选提案、人工审核、版本化分层状态（高/中/低） | `event` `curate` `propose` `review` `state` |
 | 双时序 | valid_from/valid_to 区分「事实何时为真」与「系统何时知道」，失效即版本化 | `review --valid-from/--valid-to` |
 | 审核收件箱 | 待审法典、任务态、品味、卡片的统一聚合投影 | `inbox` |
+| 记忆抽取 | 候选而非事实、提取器不自我确认、类别化确定性替身、可注入 LLM 抽取器 | `extract` |
 | 品味 | Authored（自述即激活）/ Adopted（采纳需显式审核），只进独立 preference section | `taste-add` `taste-propose` `taste-review` `taste` |
 | 品味卡片 | 确定性聚类、复核生命周期、图像视觉隐喻（抽象排版、可注入生成器）、确定性复核队列 | `card-propose` `card-create` `card-review` `card-queue` `card` `card-image` |
 | 跨模型投影 | 同一事实基座为不同模型裁剪低层证据窗口，事实与状态溯源对所有模型一致 | `package --model-id/--budget/--task-type` |
@@ -61,7 +62,7 @@ pytest -q
 ## 尚未做（诚实边界）
 
 - 真实外部模型调用的流式、计费与自动模型切换——真实供应商适配器（OpenAI/Anthropic）已以插件接入并经确定性 replay 端到端验证，但未经真实网络调用，且适配器是可选插件而非内核依赖；
-- 自然语言记忆抽取（LLM 提取器）、语义重排与真实 embedding 服务——向量检索已落地（词面级默认嵌入 + 可重建投影），未做的是这三项；当前抽取仍是结构化提示，文字检索为 FTS5；
+- 真实 LLM 抽取器插件待注入（确定性规则抽取器已落地，按同一 `ExtractorFn` 协议接入）、语义重排与真实 embedding 服务——向量检索已落地（词面级默认嵌入 + 可重建投影），文字检索为 FTS5；
 - 真实图像模型插件待注入（品味卡片多模态视觉层已落地，默认渲染器为确定性抽象排版）；
 - 网络隔离与资源限额（沙箱当前为文件边界 + 命令允许列表 + 进程组超时）；
 - 暂停后 resume（恢复当前为只读重建终态，waiting_approval 后需开启新 run）。

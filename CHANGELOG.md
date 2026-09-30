@@ -2,6 +2,28 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.21.0] - 2026-09-30
+
+### Features
+
+- 记忆抽取管线落地（memory-model §4 提取管线 / vision 原则二「规范即记忆」，经一轮对抗性审查——CONTESTED 后修复；审核门本身确认不可绕过——schema 不变，仍为 v7）：新增 `noname_harness/extractor.py`。`ExtractorFn` 协议（事件批 → 候选列表，可注入）；确定性无网络的 `rule_based_extractor`（按 §4.3 完整性检查类别扫描：明确要求记住、项目决策、任务阻塞、失败教训）；`MemoryExtractor` 驱动运行。真实 LLM 抽取器经 ModelAdapter 驱动、按同一 `ExtractorFn` 协议以插件注入，保守契约不变。
+- 结构性规则（管线不变式）：提取器绝不写长期状态——只产候选（每条带 `source_event` / `extraction_reason` / `confidence` / `category`），每个候选经 `store.create_proposal` 走既有人工审核门；提取器与审核分离，绝不自我确认；「没有候选」也是一个有理由的结果（`memory.extracted` 审计事件入账）。
+- 审查加固：失败运行也记 `memory.extracted(status=failed)`；explicit-remember 的 key 派生自 content hash（不再塌缩到同一 key 互相 supersede 丢数据）；dedup 用 any-overlap + pending-key，报告区分「全是重复」与「未发现候选」；marker 匹配否定感知（不/别/勿/never/not）+ ASCII 词边界（remembering/disremember 不误判）+ 裸子串匹配置信度降为 0.55；`limit` 截断诚实标注（total vs scanned）+ 扫描排除自身 `memory.*` 簿记；category 透传到 proposal reason。
+- CLI：`extract --session [--limit] [--no-proposals]`。
+- 端到端验证：一次扫描抽取 4 个候选进入审核收件箱（active=0，不直接改写为法典）→ 经人工审核才成为法典。
+
+### Design Rationale
+
+- **为什么提取器必须绝不写长期状态、且与审核分离**：提取是高召回（尽量多找），审核是高精度（决定永久写入）；同一个模型/组件不应既找又批，否则提取器会自我确认、把臆测写成事实。提取器只产带来源/理由/置信度的候选，法典的写入仍是人对法典的签署。
+- **为什么「没有候选」也要入账**：账本要能回答「这里有没有值得记住的事」。一次扫描零候选（或失败）和有很多候选一样是有理由的结果——不记录就无法区分「没扫描」与「扫描了但没有」。
+
+### Notes & Caveats
+
+- `rule_based_extractor` 是确定性替身（规则保守、偏高召回），真实 LLM 抽取器待经 ModelAdapter 按同一 `ExtractorFn` 协议注入。
+- 裸子串 marker 匹配的候选置信度仅 0.55（高召回）；只有结构化 payload（explicit_remember / decision / blocker / lesson）才给 0.9。
+- 新增 15 个测试，总数到 319。
+
+
 ## [0.20.0] - 2026-09-30
 
 ### Features
