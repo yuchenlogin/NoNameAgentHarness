@@ -36,11 +36,6 @@ class GeneratedImage:
     metadata: dict[str, Any]  # model / prompt / seed / version (+ renderer notes)
 
 
-class ImageGeneratorProtocol(Protocol):
-    def __call__(self, summary: dict[str, Any]) -> GeneratedImage:
-        ...
-
-
 def image_metadata_contract(generator_id: str, prompt: str, seed: int, version: int) -> dict[str, Any]:
     """The rebuildable metadata contract recorded on the card."""
 
@@ -55,7 +50,7 @@ def image_metadata_contract(generator_id: str, prompt: str, seed: int, version: 
 def _seed_for(summary: dict[str, Any]) -> int:
     """A deterministic seed from the card content (reproducible)."""
 
-    key = f"{summary.get('title','')}|{summary.get('attitude','')}"
+    key = f"{summary.get('title','')}|{summary.get('attitude','')}|{summary.get('track','')}"
     return int.from_bytes(hashlib.sha256(key.encode("utf-8")).digest()[:4], "big") % (2**31)
 
 
@@ -92,20 +87,38 @@ def local_typographic_image(
     )
 
 
-def _render_svg(*, title: str, attitude: str, track: str, hue: int) -> str:
+def _xml_safe(text: str) -> str:
+    """Escape for XML text context AND drop characters illegal in XML 1.0.
+
+    html.escape handles <, >, & but leaves control characters (\\x00 etc.)
+    that make the document malformed XML.  Strip everything outside the XML
+    1.0 legal set so the SVG is always well-formed.
+    """
+
     import html
 
-    t = html.escape(title)
-    a = html.escape(attitude)
-    tr = html.escape(track)
+    escaped = html.escape(text)
+    return "".join(
+        ch
+        for ch in escaped
+        if ch in ("\t", "\n", "\r") or ord(ch) >= 0x20
+    )
+
+
+def _render_svg(*, title: str, attitude: str, track: str, hue: int) -> str:
+    # Escape AFTER .upper(): escaping first would corrupt entities (e.g. an
+    # escaped "&amp;" becomes "&AMP;" on .upper(), breaking the reference).
+    t = _xml_safe(title)
+    a = _xml_safe(attitude)
+    tr = _xml_safe(track.upper())
     return f"""<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" viewBox="0 0 640 400">
   <rect width="640" height="400" fill="#0b0d10"/>
   <circle cx="540" cy="70" r="180" fill="hsl({hue},55%,32%)" opacity="0.12"/>
   <circle cx="80" cy="340" r="140" fill="hsl({hue},55%,32%)" opacity="0.07"/>
-  <text x="48" y="80" fill="#e07a5f" font-family="ui-monospace,monospace" font-size="13" letter-spacing="6">{tr.upper()}</text>
+  <text x="48" y="80" fill="#e07a5f" font-family="ui-monospace,monospace" font-size="13" letter-spacing="6">{tr}</text>
   <text x="48" y="170" fill="#f2efe9" font-family="Georgia,serif" font-size="44" font-weight="bold">{t}</text>
   <line x1="48" y1="200" x2="240" y2="200" stroke="#e07a5f" stroke-width="1"/>
-  <text x="48" y="250" fill="rgba(242,239,233,0.72)" font-family="Georgia,serif" font-size="20">{a}</text>
+  <text x="48" y="250" fill="#f2efe9" fill-opacity="0.72" font-family="Georgia,serif" font-size="20">{a}</text>
   <text x="48" y="372" fill="#8a8f98" font-family="ui-monospace,monospace" font-size="11">视觉解释 · 非事实 · visual explanation, not evidence</text>
 </svg>"""
 

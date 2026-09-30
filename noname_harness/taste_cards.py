@@ -38,6 +38,12 @@ from .store import (
 )
 from .taste import TasteService
 
+_MEDIA_SUFFIX = {
+    "image/svg+xml": ".svg",
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+}
+
 # Lifecycle transitions for a card.  ``split`` produces new cards and retires
 # the original; it is handled specially rather than as a single status change.
 _CARD_TRANSITIONS: dict[str, set[str]] = {
@@ -522,17 +528,52 @@ class TasteCardService:
         card = self._project(row)
         generated = card_image_for(card, generator)
 
-        # Persist the image bytes inside the workspace (never outside it).
-        filename = f".noname/card-images/{card_id}.svg"
-        self.store.write_text_nofollow(
-            filename, generated.image_bytes.decode("utf-8")
+        # The abstract/no_faces attestation must come from the generator's own
+        # metadata, never stamped by the service on a plugin it knows nothing
+        # about (a photorealistic generator must not be mislabelled no_faces).
+        metadata = dict(generated.metadata)
+        metadata.setdefault("abstract", False)
+        metadata.setdefault("no_faces", False)
+        # Derive the file extension from the media type, so a binary payload
+        # (PNG/JPEG) is never saved under a misleading ".svg" name.
+        suffix = _MEDIA_SUFFIX.get(generated.media_type, ".bin")
+
+        # Atomic persistence: record the image bytes as an append-only evidence
+        # span on a card.image.generated event FIRST (inside the ledger), then
+        # export a workspace file as a convenience cache.  The card version
+        # references the event id + path, so the visual explanation is itself
+        # traceable evidence and the filesystem can never be the source of
+        # truth.  If the later review fails, the image file is just an
+        # unreferenced cache entry -- the ledger stays consistent.
+        from .models import EvidenceInput
+
+        image_event = self.store.append_event(
+            "system",
+            "card.image.generated",
+            {
+                "card_id": card_id,
+                "model": metadata.get("model"),
+                "seed": metadata.get("seed"),
+                "media_type": generated.media_type,
+            },
+            [EvidenceInput(
+                generated.image_bytes.decode("utf-8", errors="replace")
+                if generated.media_type == "image/svg+xml"
+                else generated.image_bytes.hex(),
+                f"card-image://{card_id}",
+            )],
+        )
+        filename = f".noname/card-images/{card_id}{suffix}"
+        written = self.store.write_bytes_nofollow(
+            filename, generated.image_bytes, media_suffix=suffix
         )
         image = {
-            **generated.metadata,
+            **metadata,
             "media_type": generated.media_type,
-            "path": filename,
-            "abstract": True,
-            "no_faces": True,
+            "path": str(written.relative_to(self.store.project()["workspace_root"]))
+            if str(written).startswith(str(self.store.project()["workspace_root"]))
+            else str(written),
+            "event_id": image_event.id,
             "note": "visual explanation, not evidence; never used to infer taste",
         }
         return self.review(

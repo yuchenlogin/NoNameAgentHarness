@@ -1938,6 +1938,39 @@ class HarnessStore:
             "bad_evidence_ids": bad_evidence,
         }
 
+    def write_bytes_nofollow(
+        self, path: str | Path, content: bytes, *, media_suffix: str | None = None
+    ) -> Path:
+        """Write raw bytes inside the workspace without following a final symlink.
+
+        Binary-safe sibling of :meth:`write_text_nofollow`, for generated image
+        bytes (PNG/JPEG) that are not UTF-8 text.  ``media_suffix`` (e.g.
+        ".png") replaces the path's suffix so a binary payload is never saved
+        under a misleading ".svg" name.
+        """
+
+        destination = self.validate_output_path(path)
+        if media_suffix is not None:
+            destination = destination.with_suffix(media_suffix)
+            destination = self.validate_output_path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        else:
+            raise WorkspaceBoundaryError(
+                "O_NOFOLLOW is unavailable; refusing to write without symlink protection"
+            )
+        try:
+            fd = os.open(str(destination), flags, 0o644)
+        except OSError as exc:
+            raise WorkspaceBoundaryError(
+                f"refusing to write through a symlink or unreadable path: {destination}"
+            ) from exc
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+        return destination
+
     def get_context_package(self, package_id: str) -> dict[str, Any]:
         row = self._connection.execute(
             "SELECT package_json FROM context_packages WHERE id = ?", (package_id,)
