@@ -12,7 +12,7 @@ from .anthropic_adapter import AnthropicAdapter, load_anthropic_adapter
 from .embeddings import local_hash_embedding, cosine_similarity
 from .card_images import GeneratedImage, local_typographic_image, card_image_for
 from .extractor import ExtractionCandidate, MemoryExtractor, rule_based_extractor
-from .llm_extractor import LLMExtractor, make_llm_extractor
+from .llm_extractor import LLMExtractor
 from .adapters import (
     AdapterDriver,
     LocalEchoAdapter,
@@ -66,7 +66,6 @@ __all__ = [
     "MemoryExtractor",
     "rule_based_extractor",
     "LLMExtractor",
-    "make_llm_extractor",
     "load_openai_adapter",
     "LocalEchoAdapter",
     "ModelAdapterError",
