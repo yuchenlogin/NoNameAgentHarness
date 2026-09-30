@@ -13,6 +13,7 @@ from .embeddings import local_hash_embedding, cosine_similarity
 from .card_images import GeneratedImage, local_typographic_image, card_image_for
 from .extractor import ExtractionCandidate, MemoryExtractor, rule_based_extractor
 from .llm_extractor import LLMExtractor
+from .embedding_service import OpenAIEmbedding, load_openai_embedding
 from .adapters import (
     AdapterDriver,
     LocalEchoAdapter,
@@ -66,6 +67,8 @@ __all__ = [
     "MemoryExtractor",
     "rule_based_extractor",
     "LLMExtractor",
+    "OpenAIEmbedding",
+    "load_openai_embedding",
     "load_openai_adapter",
     "LocalEchoAdapter",
     "ModelAdapterError",
