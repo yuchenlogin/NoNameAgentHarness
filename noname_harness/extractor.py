@@ -92,6 +92,50 @@ _FAILURE_TYPES = {"test.failed", "tool.failed"}
 _EXPLICIT_REMEMBER_MARKERS = ("记住", "remember", "记一下", "别忘了")
 
 
+_NEGATIONS = ("不", "别", "勿", "莫", "never", "not", "don't", "dont")
+
+
+def _is_explicit_remember(text: str) -> bool:
+    """Return whether the text is an explicit "remember this" instruction.
+
+    Substring markers give high recall, but a marker immediately preceded by a
+    negation (不/别/勿/never/not) is the opposite instruction, so those are
+    excluded.  Matching is case-insensitive for the English markers.
+    """
+
+    lowered = text.lower()
+    for marker in _EXPLICIT_REMEMBER_MARKERS:
+        needle = marker.lower()
+        index = lowered.find(needle)
+        while index != -1:
+            # Word-boundary: an ASCII marker must not be part of a longer word
+            # ("remembering", "remembered", "disremember"), so the character
+            # after it (and before it) must not be a letter.
+            after = lowered[index + len(needle):index + len(needle) + 1]
+            before = lowered[index - 1:index] if index > 0 else ""
+            is_ascii_word = needle.isascii()
+            boundary_ok = not is_ascii_word or (
+                (not after.isalpha()) and (not before.isalpha())
+            )
+            prefix = lowered[max(0, index - 4):index]
+            if boundary_ok and not any(neg in prefix for neg in _NEGATIONS):
+                return True
+            index = lowered.find(needle, index + 1)
+    return False
+
+
+def _key_for_content(content: Any) -> str:
+    """A stable per-fact key derived from the content (never a constant)."""
+
+    import hashlib
+    import json
+
+    digest = hashlib.sha256(
+        json.dumps(content, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"explicit_memory_{digest}"
+
+
 def rule_based_extractor(events: list[dict[str, Any]]) -> list[ExtractionCandidate]:
     """A deterministic, network-free coverage extractor (§4.3 categories).
 
@@ -109,17 +153,25 @@ def rule_based_extractor(events: list[dict[str, Any]]) -> list[ExtractionCandida
         if not event_id:
             continue
 
-        # Category: explicit "remember this" instructions (highest priority).
+        # Category: explicit "remember this" instructions.  Negation-aware: a
+        # marker preceded by a negation (不/别/勿/never/not) is NOT an
+        # instruction to remember.  Confidence is deliberately moderate for a
+        # bare substring match (high recall, not high precision); a structured
+        # payload (explicit key+content) carries the higher confidence.
         text = str(payload.get("text", "")) + str(payload.get("content", ""))
-        if any(marker in text for marker in _EXPLICIT_REMEMBER_MARKERS):
+        if _is_explicit_remember(text):
+            content_value = payload.get("content", payload.get("text"))
+            # Derive a stable per-fact key so distinct remembered facts do NOT
+            # collapse onto one key and supersede each other on accept.
+            logical_key = str(payload.get("key") or _key_for_content(content_value))
             candidates.append(
                 ExtractionCandidate(
                     layer="high",
-                    logical_key=str(payload.get("key", "explicit_memory")),
-                    content=payload.get("content", payload.get("text")),
+                    logical_key=logical_key,
+                    content=content_value,
                     source_event_ids=[event_id],
                     extraction_reason="用户明确要求记住这条内容",
-                    confidence=0.95,
+                    confidence=0.9 if payload.get("key") else 0.55,
                     category="explicit_remember",
                 )
             )
@@ -198,6 +250,14 @@ class MemoryExtractor:
         for the same source event and key are skipped.
         """
 
+        # Exclude extraction/review bookkeeping from the scan input, so a run
+        # does not re-scan its own audit trail (cf. list_work_events).
+        all_events = [
+            event
+            for event in self.store.list_events(session_id=session_id, limit=100000)
+            if not event.event_type.startswith("memory.")
+        ]
+        total_events = len(all_events)
         events = [
             {
                 "id": event.id,
@@ -206,52 +266,100 @@ class MemoryExtractor:
                 "payload": event.payload,
                 "occurred_at": event.occurred_at,
             }
-            for event in self.store.list_events(session_id=session_id, limit=limit)
+            for event in all_events[:limit]
         ]
-        raw_candidates = list(self.extractor(events))
-        # Deduplicate against existing proposals for the same source+key.
-        candidates: list[ExtractionCandidate] = []
-        proposals_created = 0
-        for candidate in raw_candidates:
-            if self.store.proposal_exists_for_event(
-                candidate.source_event_ids[0], logical_key=candidate.logical_key
-            ):
-                continue
-            candidates.append(candidate)
-            if create_proposals:
-                self.store.create_proposal(
-                    candidate.layer,
-                    candidate.logical_key,
-                    candidate.content,
-                    candidate.source_event_ids,
-                    kind=candidate.kind,
-                    proposed_by=proposed_by,
-                    confidence=candidate.confidence,
-                    reason=candidate.extraction_reason,
-                )
-                proposals_created += 1
+        truncated = total_events > len(events)
 
-        notes = (
-            f"扫描 {len(events)} 个事件，产出 {len(candidates)} 个候选"
-            f"（新建 {proposals_created} 个审核提案）"
-            if candidates
-            else f"扫描 {len(events)} 个事件，未发现值得进入长期层的候选（这也是有理由的结果）"
-        )
+        def _audit(status: str, **extra: Any) -> None:
+            self.store.append_event(
+                session_id,
+                "memory.extracted",
+                {
+                    "status": status,
+                    "scanned_events": len(events),
+                    "total_events": total_events,
+                    "truncated": truncated,
+                    "extractor": getattr(self.extractor, "__name__", "custom"),
+                    **extra,
+                },
+            )
+
+        try:
+            raw_candidates = list(self.extractor(events))
+        except Exception as exc:  # noqa: BLE001 - audit the failed run, then re-raise
+            _audit("failed", error=str(exc))
+            raise
+
+        # Deduplicate: a candidate is a duplicate if ANY of its source events
+        # already backs a proposal for the same key, OR a pending proposal for
+        # the same layer+key already exists (regardless of source).
+        pending_keys = {
+            (p["layer"], p["logical_key"]) for p in self.store.list_proposals(pending_only=True)
+        }
+        candidates: list[ExtractionCandidate] = []
+        skipped_duplicates = 0
+        try:
+            proposals_created = 0
+            for candidate in raw_candidates:
+                is_dupe = (candidate.layer, candidate.logical_key) in pending_keys or any(
+                    self.store.proposal_exists_for_event(eid, logical_key=candidate.logical_key)
+                    for eid in candidate.source_event_ids
+                )
+                if is_dupe:
+                    skipped_duplicates += 1
+                    continue
+                candidates.append(candidate)
+                if create_proposals:
+                    reason = f"[{candidate.category}] {candidate.extraction_reason}"
+                    self.store.create_proposal(
+                        candidate.layer,
+                        candidate.logical_key,
+                        candidate.content,
+                        candidate.source_event_ids,
+                        kind=candidate.kind,
+                        proposed_by=proposed_by,
+                        confidence=candidate.confidence,
+                        reason=reason,
+                    )
+                    proposals_created += 1
+                    pending_keys.add((candidate.layer, candidate.logical_key))
+        except Exception as exc:
+            # A failed run is audited too -- the ledger must be able to answer
+            # "did extraction run here, and what happened?" even on failure.
+            _audit(
+                "failed",
+                error=str(exc),
+                candidate_count=len(candidates),
+                proposals_created=proposals_created,
+                skipped_duplicates=skipped_duplicates,
+            )
+            raise
+
+        if candidates:
+            notes = (
+                f"扫描 {len(events)} 个事件，产出 {len(candidates)} 个候选"
+                f"（新建 {proposals_created} 个审核提案，跳过 {skipped_duplicates} 个重复）"
+            )
+        elif skipped_duplicates:
+            notes = (
+                f"扫描 {len(events)} 个事件，{skipped_duplicates} 个候选已是待审提案，"
+                "无新增（与『未发现候选』不同）"
+            )
+        else:
+            notes = f"扫描 {len(events)} 个事件，未发现值得进入长期层的候选（这也是有理由的结果）"
+        if truncated:
+            notes += f"；注意：会话共 {total_events} 事件，仅扫描最近 {len(events)} 个（已截断）"
+
         report = ExtractionReport(
             scanned_events=len(events),
             candidates=tuple(candidates),
             notes=notes,
         )
-        # Audit the run: coverage extraction is part of the ledger.
-        self.store.append_event(
-            session_id,
-            "memory.extracted",
-            {
-                "scanned_events": report.scanned_events,
-                "candidate_count": len(candidates),
-                "proposals_created": proposals_created,
-                "extractor": getattr(self.extractor, "__name__", "custom"),
-                "notes": notes,
-            },
+        _audit(
+            "ok",
+            candidate_count=len(candidates),
+            proposals_created=proposals_created,
+            skipped_duplicates=skipped_duplicates,
+            notes=notes,
         )
         return report
