@@ -126,7 +126,7 @@ def test_integrates_with_semantic_recall(tmp_path, monkeypatch):
             return [0.0, 1.0, 0.0, 0.0]
         def transport(url, headers, body, timeout):
             text = json.loads(body.decode())["input"]
-            return 200, json.dumps({"id": "e", "model": "m", "data": [{"embedding": fake_embed_vec(text)}], "usage": {}}).encode()
+            return 200, json.dumps({"id": "e", "model": "text-embedding-3-small", "data": [{"embedding": fake_embed_vec(text)}], "usage": {}}).encode()
         service = OpenAIEmbedding(transport=transport)
         # Build the index with the real (replay) embedding service.
         result = store.build_embedding_index(service)
@@ -149,5 +149,110 @@ def test_loads_as_a_plugin(tmp_path, monkeypatch):
         assert service.model_id == "text-embedding-3-large"
         event = next(e for e in store.list_events("system", limit=50) if e.event_type == "plugin.loaded")
         assert set(event.payload["side_effects"]) == {"network-egress", "billing"}
+    finally:
+        store.close()
+
+
+# --- 对抗性审查发现的回归 ---
+
+def test_api_key_not_in_repr():
+    service = OpenAIEmbedding(api_key="sk-emb-SECRETKEY")
+    assert "sk-emb-SECRETKEY" not in repr(service)
+    from noname_harness.openai_adapter import OpenAIAdapter
+    from noname_harness.anthropic_adapter import AnthropicAdapter
+    assert "sk-x" not in repr(OpenAIAdapter(api_key="sk-x"))
+    assert "sk-x" not in repr(AnthropicAdapter(api_key="sk-x"))
+
+
+def test_non_dict_data_item_fails_with_model_error_not_attribute_error(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    for bad_item in [None, "not-a-dict", 42]:
+        service = OpenAIEmbedding(
+            transport=replay_transport(payload={"id": "e", "model": "text-embedding-3-small", "data": [bad_item]})
+        )
+        with pytest.raises(ModelAdapterError):
+            service("text")
+
+
+def test_oversized_input_rejected_locally(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    calls = []
+    service = OpenAIEmbedding(transport=lambda *a: calls.append(a) or (200, b"{}"))
+    with pytest.raises(ModelAdapterError) as exc_info:
+        service("x" * 100_000)
+    assert exc_info.value.error_class == "invalid_request"
+    assert calls == []  # rejected before any network call
+
+
+def test_dimension_drift_refused(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    responses = [
+        {"id": "e", "model": "text-embedding-3-small", "data": [{"embedding": [0.1, 0.2, 0.3]}], "usage": {}},
+        {"id": "e", "model": "text-embedding-3-small", "data": [{"embedding": [0.1, 0.2, 0.3, 0.4, 0.5]}], "usage": {}},
+    ]
+    service = OpenAIEmbedding(transport=replay_transport(payload=None))
+    service.transport = lambda u, h, b, t: (200, json.dumps(responses.pop(0)).encode())
+    service("first")  # pins 3 dims
+    with pytest.raises(ModelAdapterError) as exc_info:
+        service("second")  # 5 dims -> drift refused
+    assert "dimension changed" in str(exc_info.value)
+
+
+def test_vendor_model_mismatch_refused(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    service = OpenAIEmbedding(
+        transport=replay_transport(payload={"id": "e", "model": "text-embedding-3-large", "data": [{"embedding": [0.1]}], "usage": {}})
+    )
+    with pytest.raises(ModelAdapterError) as exc_info:
+        service("text")
+    assert "expected" in str(exc_info.value)
+
+
+def test_bool_vector_component_rejected(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    service = OpenAIEmbedding(
+        transport=replay_transport(payload={"id": "e", "model": "text-embedding-3-small", "data": [{"embedding": [True, False]}], "usage": {}})
+    )
+    with pytest.raises(ModelAdapterError):
+        service("text")
+
+
+def test_cross_space_guard_fires_before_embedding_query(tmp_path, monkeypatch):
+    """A mismatched query must be refused WITHOUT sending text to the vendor."""
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    store, _ = make_store(tmp_path)
+    try:
+        store.append_event("s", "note", {"text": "secret query text"})
+        ok = {"id": "e", "model": "text-embedding-3-small", "data": [{"embedding": [1.0, 0.0]}], "usage": {}}
+        builder = OpenAIEmbedding(transport=replay_transport(payload=ok))
+        store.build_embedding_index(builder)
+        # Query with a DIFFERENT model: refused before any network call.
+        calls = []
+        querier = OpenAIEmbedding(model_id="text-embedding-3-large",
+                                  transport=lambda *a: calls.append(a) or (200, json.dumps(ok).encode()))
+        with pytest.raises(ValueError):
+            store.search_events_semantic("secret query text", querier)
+        assert calls == []  # no network call for a refused query
+    finally:
+        store.close()
+
+
+def test_heterogeneous_index_refused(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    store, _ = make_store(tmp_path)
+    try:
+        store.append_event("s1", "note", {"text": "x"})
+        ok = {"id": "e", "model": "text-embedding-3-small", "data": [{"embedding": [1.0, 0.0]}], "usage": {}}
+        # Build one session with model A, another with model B -> heterogeneous.
+        ok_small = ok
+        ok_large = {**ok, "model": "text-embedding-3-large"}
+        store.build_embedding_index(OpenAIEmbedding(transport=replay_transport(payload=ok_small)), session_id="s1")
+        store.append_event("s2", "note", {"text": "y"})
+        store.build_embedding_index(
+            OpenAIEmbedding(model_id="text-embedding-3-large", transport=replay_transport(payload=ok_large)),
+            session_id="s2",
+        )
+        with pytest.raises(ValueError):
+            store.search_events_semantic("x", OpenAIEmbedding(transport=replay_transport(payload=ok_small)))
     finally:
         store.close()

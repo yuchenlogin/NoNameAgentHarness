@@ -1134,22 +1134,30 @@ class HarnessStore:
             "local_hash" if embedding_fn is None or embedding_fn is local_hash_embedding
             else getattr(embedding_fn, "__name__", "custom")
         )
-        query_vector = embed(query)
 
-        # Refuse to query across embedding spaces: a vector built by one
-        # embedding function is meaningless against an index built by another.
+        # Guard BEFORE embedding the query: a vector built by one embedding
+        # function is meaningless against an index built by another, and a real
+        # embedding service would otherwise send the query text to the vendor
+        # (and bill for it) on a call that is guaranteed to be refused.  A
+        # heterogeneous index (more than one model) is never queryable.
         index_models = {
             row["model_id"]
             for row in self._connection.execute(
                 "SELECT DISTINCT model_id FROM event_embeddings"
             ).fetchall()
         }
+        if len(index_models) > 1:
+            raise ValueError(
+                f"the embedding index is heterogeneous (built with {sorted(index_models)}); "
+                "rebuild it with a single embedding function"
+            )
         if index_models and model_id not in index_models:
             raise ValueError(
                 f"query embedding '{model_id}' does not match the index "
                 f"(built with {sorted(index_models)}); rebuild the index with the "
                 "same embedding function"
             )
+        query_vector = embed(query)
 
         clauses = []
         args: list[Any] = []

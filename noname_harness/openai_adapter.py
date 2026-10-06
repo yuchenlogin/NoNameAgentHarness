@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 from .adapters import (
@@ -66,7 +66,8 @@ class OpenAIAdapter:
     timeout: float = 60.0
     transport: Transport = secure_transport
     base_url: str | None = None
-    api_key: str | None = None
+    # repr=False: the credential must never appear in a repr/log/traceback.
+    api_key: str | None = field(default=None, repr=False)
     # Opt-in escape hatch for plaintext HTTP (e.g. a local model server).
     allow_insecure: bool = False
 
