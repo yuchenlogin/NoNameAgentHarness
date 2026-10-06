@@ -71,10 +71,15 @@ class ImageBlock:
     url: str | None = None
 
     def __post_init__(self) -> None:
-        if self.data is None and self.url is None:
-            raise ValueError("an image block needs data or a url")
+        # Exactly one source: data XOR url.  Both-or-neither is ambiguous
+        # caller intent and must not be silently resolved one way.
+        if (self.data is None) == (self.url is None):
+            raise ValueError("an image block needs exactly one of data or url")
         if not self.media_type.startswith("image/"):
             raise ValueError(f"invalid image media_type: {self.media_type}")
+        # A conservative payload bound (real APIs cap images at a few MB).
+        if self.data is not None and len(self.data) > 20_000_000:
+            raise ValueError("image data exceeds the 20MB payload limit")
 
     @property
     def kind(self) -> str:
@@ -104,6 +109,8 @@ class ModelMessage:
         if not isinstance(self.content, (str, list)):
             raise ValueError("content must be a string or a list of content blocks")
         if isinstance(self.content, list):
+            if not self.content:
+                raise ValueError("content block list cannot be empty")
             for block in self.content:
                 if not isinstance(block, (TextBlock, ImageBlock)):
                     raise ValueError(f"invalid content block type: {type(block).__name__}")
@@ -120,7 +127,9 @@ class ModelMessage:
 
         if isinstance(self.content, str):
             return self.content
-        return "".join(block.text for block in self.content if isinstance(block, TextBlock))
+        # Join text blocks with a newline (not concatenated), so token
+        # estimates and tool-result flattening don't fuse words together.
+        return "\n".join(block.text for block in self.content if isinstance(block, TextBlock))
 
 
 @dataclass(frozen=True)
@@ -218,6 +227,14 @@ class LocalEchoAdapter:
         )
 
     def complete(self, request: ModelRequest) -> ModelResponse:
+        # The reference implementation honours the same invariant: vision=False
+        # must reject image content, never silently drop it.
+        for message in request.messages:
+            if message.is_multimodal():
+                raise ModelAdapterError(
+                    "invalid_request",
+                    f"model {self.model_id} does not support image content (vision=False)",
+                )
         reply = self._respond(request)
         if isinstance(reply, dict) and "tool_call" in reply:
             return ModelResponse(

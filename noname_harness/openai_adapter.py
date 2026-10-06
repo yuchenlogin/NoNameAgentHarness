@@ -95,6 +95,10 @@ class OpenAIAdapter:
     api_key: str | None = field(default=None, repr=False)
     # Opt-in escape hatch for plaintext HTTP (e.g. a local model server).
     allow_insecure: bool = False
+    # Whether this model accepts image content (multimodal).  Declared in
+    # config like model_id/context_window, so a text-only model can be
+    # declared vision=False and image blocks are rejected locally.
+    vision: bool = True
     # Optional SSE stream transport for true incremental streaming.  When
     # set, stream() consumes the vendor's SSE endpoint incrementally; when
     # None, stream() falls back to a complete-then-re-emit replay.
@@ -108,7 +112,7 @@ class OpenAIAdapter:
     def capability(self) -> ModelCapability:
         return ModelCapability(
             reasoning=True,
-            vision=True,
+            vision=self.vision,
             tool_calling=True,
             streaming=True,
             context_window=self.context_window,
@@ -143,19 +147,17 @@ class OpenAIAdapter:
 
         if isinstance(message.content, str):
             mapped: dict[str, Any] = {"role": message.role, "content": message.content}
+        elif message.role == "tool":
+            # [OI] tool messages carry string content, not a part array; image
+            # content is rejected upstream by the unified vision check when
+            # vision=False, and flattened to text otherwise.
+            mapped = {"role": message.role, "content": message.text()}
         else:
             parts: list[dict[str, Any]] = []
             for block in message.content:
                 if block.kind == "text":
                     parts.append({"type": "text", "text": block.text})
                 elif block.kind == "image":
-                    if not self.capability().vision:
-                        from .adapters import ModelAdapterError
-
-                        raise ModelAdapterError(
-                            "invalid_request",
-                            f"model {self.model_id} does not support image content (vision=False)",
-                        )
                     source = (
                         f"data:{block.media_type};base64,{block.data}"
                         if block.data is not None
@@ -168,6 +170,15 @@ class OpenAIAdapter:
         return mapped
 
     def _build_body(self, request: ModelRequest) -> bytes:
+        # Unified invariant: a vision=False model must never receive image
+        # content, on ANY role or path (not just the user-message mapper).
+        if not self.vision:
+            for message in request.messages:
+                if message.is_multimodal():
+                    raise ModelAdapterError(
+                        "invalid_request",
+                        f"model {self.model_id} does not support image content (vision=False)",
+                    )
         payload: dict[str, Any] = {
             "model": self.model_id,
             "messages": [self._map_message(m) for m in request.messages],

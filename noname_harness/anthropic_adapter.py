@@ -62,6 +62,8 @@ class AnthropicAdapter:
     api_key: str | None = field(default=None, repr=False)
     allow_insecure: bool = False
     max_output_tokens: int = 4096
+    # Whether this model accepts image content (multimodal).
+    vision: bool = True
     # Optional SSE stream transport for true incremental streaming.
     # Defaults to the real secure SSE transport; pass None to use the
     # complete-then-re-emit replay (tests / offline).
@@ -73,7 +75,7 @@ class AnthropicAdapter:
     def capability(self) -> ModelCapability:
         return ModelCapability(
             reasoning=True,
-            vision=True,
+            vision=self.vision,
             tool_calling=True,
             streaming=True,
             context_window=self.context_window,
@@ -132,6 +134,23 @@ class AnthropicAdapter:
     def _build_body(self, request: ModelRequest) -> bytes:
         # Anthropic: system is a top-level field, not a message; content is a
         # list of blocks; tools have an input_schema object.
+        # Unified invariant: a vision=False model must never receive image
+        # content, on ANY role or path (user, tool, or system).
+        if not self.vision:
+            for message in request.messages:
+                if message.is_multimodal():
+                    raise ModelAdapterError(
+                        "invalid_request",
+                        f"model {self.model_id} does not support image content (vision=False)",
+                    )
+        # System content must be plain text: a multimodal system message is a
+        # caller error, classified (not a raw TypeError from a newline-join on a list).
+        for message in request.messages:
+            if message.role == "system" and not isinstance(message.content, str):
+                raise ModelAdapterError(
+                    "invalid_request",
+                    "system message content must be a plain string, not content blocks",
+                )
         system_parts = [m.content for m in request.messages if m.role == "system"]
         messages = []
         for message in request.messages:

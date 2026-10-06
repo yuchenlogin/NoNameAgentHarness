@@ -156,11 +156,12 @@ def test_anthropic_plain_text_stays_plain_string(monkeypatch):
 def test_vision_false_adapter_rejects_image_not_drops_it():
     adapter = LocalEchoAdapter()  # capability.vision == False
     request = ModelRequest(messages=(
-        ModelMessage(role="user", content=[ImageBlock("image/png", data="x")]),
+        ModelMessage(role="user", content=[TextBlock("hi"), ImageBlock("image/png", data="x")]),
     ))
-    # LocalEchoAdapter.complete doesn't call _build_body's multimodal map; it must
-    # reject at the adapter level, not silently drop the image.
-    # LocalEcho just echoes text; verify its capability is False (the contract).
+    # The reference adapter REJECTS the image (classified), never silently drops it.
+    with pytest.raises(ModelAdapterError) as exc_info:
+        adapter.complete(request)
+    assert exc_info.value.error_class == "invalid_request"
     assert adapter.capability().vision is False
 
 
@@ -171,3 +172,83 @@ def test_token_counting_uses_text_not_blocks():
     from noname_harness.vendor_http import word_count_cost
     cost = word_count_cost("m", request)
     assert cost["estimated_input_words"] == 3
+
+
+# --- 对抗性审查发现的回归 ---
+
+def test_vision_false_openai_rejects_multimodal_on_any_role(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    adapter = OpenAIAdapter(vision=False, transport=replay_transport())
+    # tool role with an image: rejected too (not just user role).
+    request = ModelRequest(messages=(
+        ModelMessage(role="tool", content=[TextBlock("t"), ImageBlock("image/png", data="x")], name="tid"),
+    ))
+    with pytest.raises(ModelAdapterError) as exc_info:
+        adapter.complete(request)
+    assert exc_info.value.error_class == "invalid_request"
+
+
+def test_vision_false_anthropic_rejects_multimodal_tool_and_system(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    adapter = AnthropicAdapter(vision=False, transport=replay_transport())
+    # tool role with image.
+    with pytest.raises(ModelAdapterError):
+        adapter.complete(ModelRequest(messages=(
+            ModelMessage(role="tool", content=[TextBlock("t"), ImageBlock("image/png", data="x")], name="tid"),
+        )))
+    # system role with image.
+    with pytest.raises(ModelAdapterError):
+        adapter.complete(ModelRequest(messages=(
+            ModelMessage(role="system", content=[TextBlock("s"), ImageBlock("image/png", data="x")]),
+            ModelMessage(role="user", content="hi"),
+        )))
+
+
+def test_anthropic_multimodal_system_is_classified_not_typeerror(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    adapter = AnthropicAdapter(transport=replay_transport())  # vision=True (default)
+    # A multimodal system message is a caller error, classified (not raw TypeError).
+    with pytest.raises(ModelAdapterError) as exc_info:
+        adapter.complete(ModelRequest(messages=(
+            ModelMessage(role="system", content=[TextBlock("sys"), ImageBlock("image/png", data="x")]),
+            ModelMessage(role="user", content="hi"),
+        )))
+    assert "system message content must be a plain string" in str(exc_info.value)
+
+
+def test_image_block_requires_exactly_one_source():
+    with pytest.raises(ValueError):
+        ImageBlock("image/png", data="x", url="https://example.com/i.png")  # both
+    with pytest.raises(ValueError):
+        ImageBlock("image/png")  # neither
+    # exactly one is fine
+    ImageBlock("image/png", data="x")
+    ImageBlock("image/png", url="https://example.com/i.png")
+
+
+def test_image_block_size_limit():
+    with pytest.raises(ValueError):
+        ImageBlock("image/png", data="x" * 21_000_000)
+
+
+def test_empty_content_block_list_rejected():
+    with pytest.raises(ValueError):
+        ModelMessage(role="user", content=[])
+
+
+def test_text_joins_blocks_with_newline():
+    msg = ModelMessage(role="user", content=[TextBlock("hello"), TextBlock("world")])
+    assert msg.text() == "hello\nworld"
+
+
+def test_openai_tool_message_flattened_to_text(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    transport = replay_transport(payload=ok_openai())
+    adapter = OpenAIAdapter(transport=transport)  # vision=True default
+    request = ModelRequest(messages=(
+        ModelMessage(role="tool", content=[TextBlock("result text")], name="tid"),
+    ))
+    adapter.complete(request)
+    body = json.loads(transport.calls[0].decode("utf-8"))
+    # [OI] tool messages carry string content, not a part array.
+    assert body["messages"][0]["content"] == "result text"
