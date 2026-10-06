@@ -1269,6 +1269,41 @@ class HarnessStore:
             for item in ranked[:limit]
         ]
 
+    def state_history(self, layer: str, logical_key: str) -> list[dict[str, Any]]:
+        """Return the full revision chain for a durable-state key, oldest first.
+
+        Follows the supersedes chain backwards from the current head to the
+        original revision, so a State Diff can show "what changed between v11
+        and v12" -- which revision added it, which retired it, and what
+        superseded what.  Pure projection: reads only.
+        """
+
+        if layer not in VALID_LAYERS:
+            raise ValueError(f"invalid layer: {layer}")
+        rows = self._connection.execute(
+            "SELECT * FROM state_revisions WHERE layer = ? AND logical_key = ? "
+            "ORDER BY created_at, rowid",
+            (layer, logical_key),
+        ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "layer": row["layer"],
+                "logical_key": row["logical_key"],
+                "kind": row["kind"],
+                "content": _decode(row["content_json"]),
+                "status": row["status"],
+                "source_event_ids": _decode(row["source_event_ids_json"]),
+                "origin_proposal_id": row["origin_proposal_id"],
+                "supersedes_id": row["supersedes_id"],
+                "approved_by": row["approved_by"],
+                "valid_from": row["valid_from"],
+                "valid_to": row["valid_to"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
     def _evidence_counts(self, event_ids: list[str]) -> dict[str, int]:
         """Evidence span counts per event id, in a single aggregate query."""
 

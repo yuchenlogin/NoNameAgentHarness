@@ -26,6 +26,7 @@ import json
 from typing import Any
 
 from .causal_map import build_causal_model, render_causal_html
+from .state_diff import build_state_diff_model, render_state_diff_html
 from .store import HarnessStore
 from .taste import TasteService
 from .taste_cards import TasteCardService
@@ -104,12 +105,14 @@ def build_ledger_model(
     }
 
     causal = build_causal_model(store, session_id=session_id, limit=fetch_limit)
+    state_diff = build_state_diff_model(store)
 
     return {
         "project": store.project(),
         "session_id": session_id,
         "timeline": timeline,
         "causal": causal,
+        "state_diff": state_diff,
         "folded_low_signal": folded,
         "truncated": truncated,
         "limit": limit,
@@ -236,6 +239,7 @@ def render_ledger_html(model: dict[str, Any]) -> str:
         else ""
     )
     causal_html = render_causal_html(model["causal"])
+    state_diff_html = render_state_diff_html(model["state_diff"])
     return _PAGE_TEMPLATE.format(
         project=project,
         session_note=session_note,
@@ -246,6 +250,7 @@ def render_ledger_html(model: dict[str, Any]) -> str:
         inbox_html=inbox_html,
         state_html=state_html,
         taste_html=taste_html,
+        state_diff_html=state_diff_html,
         causal_html=causal_html,
         timeline_rows="".join(timeline_rows) or '<p class="empty">暂无高信号事件</p>',
     )
@@ -297,6 +302,17 @@ details summary::-webkit-details-marker{{color:var(--accent)}}
 .dep-label{{font-family:var(--mono)}}
 .dep-detail{{color:var(--muted);font-size:.76rem;margin-left:8px}}
 .taste-note{{background:rgba(224,122,95,.06);border-left:2px solid var(--accent);padding:8px 12px;color:var(--fg-dim);font-size:.85rem;margin-bottom:14px}}
+.diff-list{{list-style:none}}
+.diff-group{{padding:6px 0;border-bottom:1px solid var(--hairline)}}
+.diff-group summary{{cursor:pointer;padding:6px 0}}
+.versions{{list-style:none;margin:8px 0 8px 24px;display:flex;flex-direction:column;gap:6px}}
+.version{{font-size:.85rem;padding:6px 10px;border-left:2px solid var(--hairline)}}
+.version.retired{{opacity:.55;border-left-color:var(--muted)}}
+.version.active{{border-left-color:var(--accent)}}
+.vnum{{font-family:var(--mono);color:var(--accent);margin-right:8px}}
+.vstatus{{font-family:var(--mono);font-size:.72rem;color:var(--muted);margin-right:8px}}
+.delta{{color:var(--muted);font-size:.78rem;margin-left:8px}}
+.delta.added{{color:var(--accent)}}
 .inbox-banner{{background:rgba(224,122,95,.08);border:1px solid rgba(224,122,95,.3);border-radius:8px;padding:12px 16px;margin-bottom:20px;color:var(--fg-dim);font-size:.9rem}}
 .inbox-banner strong{{color:var(--accent)}}
 </style>
@@ -319,6 +335,8 @@ details summary::-webkit-details-marker{{color:var(--accent)}}
 {state_html}
 {taste_html}
 </section>
+
+{state_diff_html}
 
 {causal_html}
 
