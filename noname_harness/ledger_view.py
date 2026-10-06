@@ -25,6 +25,7 @@ import html
 import json
 from typing import Any
 
+from .causal_map import build_causal_model, render_causal_html
 from .store import HarnessStore
 from .taste import TasteService
 from .taste_cards import TasteCardService
@@ -102,10 +103,13 @@ def build_ledger_model(
         "mid": store.active_state("mid"),
     }
 
+    causal = build_causal_model(store, session_id=session_id, limit=fetch_limit)
+
     return {
         "project": store.project(),
         "session_id": session_id,
         "timeline": timeline,
+        "causal": causal,
         "folded_low_signal": folded,
         "truncated": truncated,
         "limit": limit,
@@ -231,6 +235,7 @@ def render_ledger_html(model: dict[str, Any]) -> str:
         if model.get("truncated")
         else ""
     )
+    causal_html = render_causal_html(model["causal"])
     return _PAGE_TEMPLATE.format(
         project=project,
         session_note=session_note,
@@ -241,6 +246,7 @@ def render_ledger_html(model: dict[str, Any]) -> str:
         inbox_html=inbox_html,
         state_html=state_html,
         taste_html=taste_html,
+        causal_html=causal_html,
         timeline_rows="".join(timeline_rows) or '<p class="empty">暂无高信号事件</p>',
     )
 
@@ -282,6 +288,15 @@ ul{{list-style:none}}
 .low-fold details ul{{margin-top:6px}}
 .trunc{{color:var(--accent)}}
 details summary::-webkit-details-marker{{color:var(--accent)}}
+.causal-list{{list-style:none}}
+.causal-node{{padding:6px 0;border-bottom:1px solid var(--hairline)}}
+.causal-node summary{{cursor:pointer;padding:6px 0}}
+.deps{{list-style:none;margin:8px 0 8px 24px;display:flex;flex-direction:column;gap:4px}}
+.dep{{font-size:.84rem;color:var(--fg-dim)}}
+.dep-role{{color:var(--accent);font-family:var(--mono);font-size:.72rem;margin-right:6px}}
+.dep-label{{font-family:var(--mono)}}
+.dep-detail{{color:var(--muted);font-size:.76rem;margin-left:8px}}
+.taste-note{{background:rgba(224,122,95,.06);border-left:2px solid var(--accent);padding:8px 12px;color:var(--fg-dim);font-size:.85rem;margin-bottom:14px}}
 .inbox-banner{{background:rgba(224,122,95,.08);border:1px solid rgba(224,122,95,.3);border-radius:8px;padding:12px 16px;margin-bottom:20px;color:var(--fg-dim);font-size:.9rem}}
 .inbox-banner strong{{color:var(--accent)}}
 </style>
@@ -304,6 +319,8 @@ details summary::-webkit-details-marker{{color:var(--accent)}}
 {state_html}
 {taste_html}
 </section>
+
+{causal_html}
 
 <section>
 <h2>时间线 · 发生了什么</h2>
