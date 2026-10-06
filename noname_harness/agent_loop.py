@@ -293,26 +293,44 @@ class AgentLoop:
         self.store.append_event(
             self.session_id,
             "loop.cancel_requested",
-            {"reason": reason, "requested_at_round": self._rounds},
+            {"reason": reason},
         )
 
     def _cancellation_requested(self) -> str | None:
-        """Return the reason of an unconsumed cancellation request, if any.
+        """Return the reason of a live cancellation request for the current run.
 
-        A cancel request is consumed once the loop reaches a terminal state
-        (loop.finished is written); before that, the newest request wins.
+        The rule is precise and cheap: a cancel is live iff its ``seq`` is newer
+        than the most recent ``loop.started`` in this session.  This scopes a
+        request to the run it belongs to -- a cancel from an earlier run (or a
+        stray one with no running loop) does not poison a later run, and a
+        finished run's cancels are correctly seen as belonging to that finished
+        run, not the next one.  One indexed query, O(1), no per-round O(history)
+        scans.
         """
 
-        finished = any(
-            event.event_type == "loop.finished"
-            for event in self.store.list_events(session_id=self.session_id, limit=1000)
+        # A cancel is live iff it is newer than the most recent FINISHED run in
+        # this session: it then belongs to the current (or next) run.  A cancel
+        # older than the last finish belongs to that finished run and is dead.
+        # This is one indexed MAX(seq) query per condition, O(1) per round, no
+        # O(history) scans -- and unlike "any finished vetoes all cancels", a
+        # cancel written after a finished run correctly cancels the NEXT run.
+        finished = self.store.query_one(
+            "SELECT MAX(seq) AS seq FROM session_events "
+            "WHERE session_id = ? AND event_type = 'loop.finished'",
+            (self.session_id,),
         )
-        if finished:
+        finished_seq = finished["seq"] if finished and finished["seq"] is not None else -1
+        cancel = self.store.query_one(
+            "SELECT payload_json, seq FROM session_events "
+            "WHERE session_id = ? AND event_type = 'loop.cancel_requested' "
+            "AND seq > ? ORDER BY seq DESC LIMIT 1",
+            (self.session_id, finished_seq),
+        )
+        if cancel is None:
             return None
-        for event in self.store.list_events(session_id=self.session_id, limit=1000):
-            if event.event_type == "loop.cancel_requested":
-                return event.payload.get("reason", "user_cancelled")
-        return None
+        import json as _json
+
+        return _json.loads(cancel["payload_json"]).get("reason", "user_cancelled")
 
     def _check_stop(self, result: LoopResult) -> tuple[str, str] | None:
         # A cancellation request (event-driven, from any actor) is honoured

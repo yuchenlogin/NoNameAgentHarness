@@ -106,3 +106,73 @@ def test_reconstruct_sees_cancelled_terminal_state(tmp_path):
         assert recovered.state == "CANCELLED"
     finally:
         store.close()
+
+
+# --- 对抗性审查发现的回归 ---
+
+def test_cancel_after_finished_cancels_next_run_not_ignored(tmp_path):
+    """A cancel written after a finished run must cancel the NEXT run (not be vetoed)."""
+    store, _ = make_store(tmp_path)
+    try:
+        # First run completes.
+        loop1 = AgentLoop(store=store, session_id="s", driver=SlowDriver(rounds=1))
+        assert loop1.run("task")["final_state"] == "COMPLETED"
+        # A NEW cancel after that finish belongs to the next run.
+        store.append_event("s", "loop.cancel_requested", {"reason": "停止下一次"})
+        # The next run honours it (it is not vetoed by the first run's finish).
+        loop2 = AgentLoop(store=store, session_id="s", driver=SlowDriver(rounds=10), max_rounds=20)
+        summary = loop2.run("task2")
+        assert summary["final_state"] == "CANCELLED"
+        assert summary["stop_reason"] == "停止下一次"
+    finally:
+        store.close()
+
+
+def test_cancel_works_across_store_connections(tmp_path):
+    """A cancel from a SEPARATE HarnessStore connection (true cross-actor) works."""
+    root = tmp_path / "project"
+    root.mkdir()
+    db = root / ".noname" / "harness.db"
+    with HarnessStore(db) as store:
+        store.initialize_project(root, "x")
+        loop = AgentLoop(store=store, session_id="s", driver=SlowDriver(rounds=10), max_rounds=20)
+        # A separate connection (another actor/process) writes the cancel.
+        with HarnessStore(db) as other:
+            other.append_event("s", "loop.cancel_requested", {"reason": "跨连接中断"})
+        summary = loop.run("task")
+        assert summary["final_state"] == "CANCELLED"
+        assert summary["stop_reason"] == "跨连接中断"
+
+
+def test_cancellation_check_is_o1_not_history_scan(tmp_path):
+    """The cancel check must not decode the whole event history per round."""
+    store, _ = make_store(tmp_path)
+    try:
+        for i in range(100):
+            store.append_event("s", "note", {"text": f"event {i}"})
+        loop = AgentLoop(store=store, session_id="s", driver=SlowDriver(rounds=2), max_rounds=5)
+        # Instrument list_events to detect any full-history scan.
+        calls = []
+        original = store.list_events
+        def spy(*args, **kwargs):
+            calls.append((args, kwargs))
+            return original(*args, **kwargs)
+        store.list_events = spy
+        loop.run("task")
+        # _cancellation_requested uses targeted MAX(seq) queries, not list_events scans.
+        scan_calls = [c for c in calls if c[1].get("limit", 0) >= 1000]
+        assert scan_calls == []
+    finally:
+        store.close()
+
+
+def test_cli_cancel_validates_reason(tmp_path, capsys):
+    from noname_harness.cli import main
+    root = tmp_path / "project"
+    root.mkdir()
+    db = root / ".noname" / "harness.db"
+    assert main(["init", "--db", str(db), "--root", str(root)]) == 0
+    capsys.readouterr()
+    # A blank reason is rejected (same validation as AgentLoop.cancel).
+    assert main(["cancel", "--db", str(db), "--session", "s", "--reason", "   "]) == 2
+    capsys.readouterr()

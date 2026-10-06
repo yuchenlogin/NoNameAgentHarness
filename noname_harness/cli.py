@@ -435,10 +435,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                 )
             elif args.command == "cancel":
+                # Route through the same validation as AgentLoop.cancel so the
+                # ledger stays clean whichever door the request comes through.
+                from .agent_loop import AgentLoop
+
+                if not args.reason.strip():
+                    raise ValueError("cancel reason cannot be empty")
                 store.append_event(
                     args.session_id,
                     "loop.cancel_requested",
-                    {"reason": args.reason, "requested_at_round": None},
+                    {"reason": args.reason},
                 )
                 _print({"cancel_requested": args.session_id, "reason": args.reason})
             elif args.command == "route":

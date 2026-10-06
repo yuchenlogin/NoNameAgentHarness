@@ -139,7 +139,16 @@ def _is_read_only_sql(sql: str) -> bool:
 
 
 class HarnessStore:
-    """The local fact base for one NoName project."""
+    """The local fact base for one NoName project.
+
+    Concurrency note: a HarnessStore wraps a single SQLite connection.  SQLite
+    serializes writers across connections (WAL), so **each actor (thread,
+    process, CLI, agent) should open its own HarnessStore on the same database
+    file** -- events written by one connection are visible to the others, which
+    is exactly how cross-actor cancellation and cross-session handoffs work.
+    Do not share one HarnessStore (one connection) across threads: use one per
+    actor.
+    """
 
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
