@@ -275,7 +275,52 @@ class AgentLoop:
             summary.update(error_detail)
             return summary
 
+    def cancel(self, reason: str = "user_cancelled") -> None:
+        """Request cancellation of this loop, as an append-only ledger event.
+
+        Cancellation is *event-driven*, not a process-internal flag: the
+        request is recorded as ``loop.cancel_requested`` so any actor (a person
+        via the CLI, another agent, or the loop's own driver) can cancel a
+        running loop from outside its thread/process, and the request is
+        replayable -- a reconstructed loop can see that cancellation was
+        requested.  The loop honours the request cooperatively at the next
+        round boundary (_check_stop); a synchronous loop cannot preempt a
+        blocked driver mid-call, but it will not start another round.
+        """
+
+        if not reason.strip():
+            raise ValueError("cancel reason cannot be empty")
+        self.store.append_event(
+            self.session_id,
+            "loop.cancel_requested",
+            {"reason": reason, "requested_at_round": self._rounds},
+        )
+
+    def _cancellation_requested(self) -> str | None:
+        """Return the reason of an unconsumed cancellation request, if any.
+
+        A cancel request is consumed once the loop reaches a terminal state
+        (loop.finished is written); before that, the newest request wins.
+        """
+
+        finished = any(
+            event.event_type == "loop.finished"
+            for event in self.store.list_events(session_id=self.session_id, limit=1000)
+        )
+        if finished:
+            return None
+        for event in self.store.list_events(session_id=self.session_id, limit=1000):
+            if event.event_type == "loop.cancel_requested":
+                return event.payload.get("reason", "user_cancelled")
+        return None
+
     def _check_stop(self, result: LoopResult) -> tuple[str, str] | None:
+        # A cancellation request (event-driven, from any actor) is honoured
+        # first at the round boundary: the loop stops cleanly instead of
+        # starting another round.
+        cancel_reason = self._cancellation_requested()
+        if cancel_reason is not None:
+            return ("CANCELLED", cancel_reason)
         if result.stop_reason is not None:
             if result.stop_reason not in STOP_REASONS:
                 raise AgentLoopError(f"unknown stop reason: {result.stop_reason}")

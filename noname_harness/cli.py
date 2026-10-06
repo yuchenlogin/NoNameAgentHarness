@@ -156,6 +156,10 @@ def build_parser() -> argparse.ArgumentParser:
     taste_review.add_argument("--content", dest="edited_content")
     taste_review.add_argument("--reason")
 
+    cancel = sub.add_parser("cancel", parents=[_db_parent()], help="request cancellation of a session's running loop")
+    cancel.add_argument("--session", required=True, dest="session_id")
+    cancel.add_argument("--reason", default="user_cancelled", help="cancellation reason")
+
     route = sub.add_parser("route", parents=[_db_parent()], help="decide how a session's context should proceed")
     route.add_argument("--session", required=True, dest="session_id")
     route.add_argument("--task-type", dest="task_type")
@@ -430,6 +434,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                         reason=args.reason,
                     )
                 )
+            elif args.command == "cancel":
+                store.append_event(
+                    args.session_id,
+                    "loop.cancel_requested",
+                    {"reason": args.reason, "requested_at_round": None},
+                )
+                _print({"cancel_requested": args.session_id, "reason": args.reason})
             elif args.command == "route":
                 router = Router(store)
                 _print(
