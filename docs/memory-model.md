@@ -158,7 +158,7 @@ CREATE TABLE memory_reviews (
 2. **重排**：任务相关性、来源质量、审核状态、新鲜度、冲突；
 3. **构造**：输出稳定的 prompt 片段，每条带短引用 id，必要时可下钻原文。
 
-**原型落地状态**：语义召回已落地（可注入 embedding + 可重建的 `event_embeddings` 向量投影，schema v7）。默认的 `local_hash_embedding` 是词面重叠而非语义（CJK 靠字符 3-gram），真实 embedding 服务按同一 `EmbeddingFn` 协议以插件注入。FTS5 仍是默认检索，向量是可选的语义增强，只作用事件/证据事实层。三阶段（召回 / 重排 / 构造）均已实现，`_searchable_text` 与 FTS 索引文本保持统一。
+**原型落地状态**：语义召回已落地（可注入 embedding + 可重建的 `event_embeddings` 向量投影，schema v7）。默认的 `local_hash_embedding` 是词面重叠而非语义（CJK 靠字符 3-gram），真实 embedding 服务按同一 `EmbeddingFn` 协议以插件注入。FTS5 仍是默认检索，向量是可选的语义增强，只作用事件/证据事实层。三阶段（召回 / 重排 / 构造）均已实现，`_searchable_text` 与 FTS 索引文本保持统一。真实 embedding 服务已落地（`embedding_service.py`：`OpenAIEmbedding` 复用 vendor_http 凭证安全基类，维度钉住 + model 校验 + 跨空间守卫前置），真语义召回可用（词面级 `local_hash_embedding` 仍是默认，真实 embedding 按同一 `EmbeddingFn` 协议以插件注入）。
 
 品味检索与事实检索分开运行，最后在上下文组装层合并。这样才能保证态度不会被误当成事实。
 

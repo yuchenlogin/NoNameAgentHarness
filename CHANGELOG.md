@@ -2,6 +2,28 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.23.0] - 2026-10-07
+
+### Features
+
+- 真实 embedding 服务插件落地（memory-model §6 检索与上下文投影，语义检索从词面升级为真语义，经一轮对抗性审查——CONTESTED 后修复——schema 不变，仍为 v7）：新增 `noname_harness/embedding_service.py`。`OpenAIEmbedding`（+ `load_openai_embedding`）是 `EmbeddingFn` 协议的一个实现，调用 OpenAI embeddings API；复用 vendor_http 凭证安全基类（无重定向、HTTPS 强制、安全 vendor_ref、按因错误分类），与 `OpenAIAdapter` 共享同一基类不重复。
+- 契约不变：`EmbeddingFn` 签名不变；`model_id` 作为嵌入空间标识记入投影（防跨空间查询）；向量索引仍是可重建投影、永远不是事实来源。
+- 凭证安全：API key 从环境变量读取、只用于请求头；三个适配器（embedding / openai / anthropic）的 `api_key` 均 `field(repr=False)`（repr / log / traceback 不泄露）；vendor_ref 只存响应引用，错误体不落盘。
+- 审查加固：`data[0]` 非 dict 归一化为 `ModelAdapterError`；输入上限 32000 字符本地拒绝（零网络）；service 首次成功调用钉住维度、漂移即 fail；响应 model 不匹配即 fail；跨空间守卫前置（先查 index_models 含异构索引即拒绝、后 embed——被拒查询零网络零计费）；bool 排除为向量分量；`last_usage` 捕获供成本审计。
+- 端到端验证（replay 无网络）：真语义召回——「database connection pool exhaustion」（英文）召回中文「数据库连接池在高并发下耗尽」，「deploy freeze」召回「部署流水线在周五下午冻结」（词面嵌入做不到的语义相关）；跨空间守卫正确拒绝。
+
+### Design Rationale
+
+- **为什么 embedding 服务复用 vendor_http 基类而非新写凭证安全**：重定向拒绝 / HTTPS 校验 / vendor_ref 白名单 / 错误分类是硬赢的保障；新写一套会让两处漂移——embedding 初版就漏了 repr 泄露。集中一处加固，一次全部受益。
+- **为什么跨空间守卫必须前置**：被拒的查询若先 embed 再检查，会把查询文本发给 vendor 且计费。先查 `index_models`（含异构索引即拒绝）后 embed，让拒绝零网络零计费。
+
+### Notes & Caveats
+
+- 真实 embedding 需要 API key 与网络；当前经确定性 replay 验证契约，未经真实网络调用。
+- 输入上限 32000 字符，超长文本本地拒绝（零网络）。
+- 维度钉住与 model 校验防 vendor / proxy 静默腐败投影。
+- 新增 21 个测试，总数到 355。
+
 ## [0.22.0] - 2026-09-30
 
 ### Features
