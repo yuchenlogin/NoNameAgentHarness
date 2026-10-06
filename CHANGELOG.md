@@ -2,6 +2,27 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.25.0] - 2026-10-07
+
+### Features
+
+- 真流式 SSE 落地——两个真实供应商适配器的增量流式输出（runtime-architecture §3，经一轮对抗性审查——REJECT 后修复——schema 不变，仍为 v7）：`vendor_http` 新增 `secure_stream_transport`（流式 POST 逐行读取，禁用重定向、HTTPS 强制、错误按因分类，返回字节行迭代器）与 `iter_sse_json_lines`（vendor wire format 单行 JSON 解析器：`data:{...}`→JSON、`data:[DONE]` 停止、畸形行 classified 错误、CRLF/BOM/空白处理；别名 `iter_sse` 兼容）。
+- `OpenAIAdapter._stream_sse`：`stream: true` 请求 → 按 `call["index"]` 累积 tool_call arguments 片段（真实 OpenAI 只在首个 delta 发 name/id，后续只发片段）→ 逐 chunk 发 `text_delta` / `tool_call` → `completed`（usage 读最终 chunk 顶层字段、`safe_usage_ref` 白名单）；`_parse_tool_arguments` 带 1MB cap + raw fallback。
+- `AnthropicAdapter._stream_sse`：按 Anthropic SSE 事件类型解析（`content_block_start/delta/stop`、`message_delta/start`）；`tool_use` 的 `partial_json` 片段累积；orphan blocks（流提前结束无 stop）flush 发 `tool_call` 不崩溃；缺 index classified 错误；`finish_reason` 归一化。
+- `secure_stream_transport` 设为默认 `stream_transport`（显式 `None` 回退 complete 重放 replay）；注入 transport 的异常分类。
+- 端到端验证（replay 无网络）：真实 OpenAI 分片 wire 形状下，文本增量流 + 分片 tool_call arguments 正确累积解析。
+
+### Design Rationale
+
+- **为什么 OpenAI tool_call 必须按 index 累积片段**：真实 OpenAI 把 arguments 分片发送，name 只在首个 delta 出现一次；只在有 name 时记录会丢光全部片段。按 index 累积让流式 tool-calling 对真实响应真正工作，而不是只对测试里的理想形状工作。
+- **为什么 secure_stream_transport 要设为默认**：「可注入但默认 None」等于没有真实流式——零代码路径到达。设为默认让真实 SSE 开箱可用；显式 `None` 才是回退 replay 的逃生口。
+
+### Notes & Caveats
+
+- `iter_sse_json_lines` 是 vendor wire format 单行 JSON 解析器，非完整 SSE spec 的多行 `data:` 拼接——OpenAI/Anthropic 当前均为单行 JSON。
+- 真流式需要真实 API key 与网络；当前经确定性 replay 验证解析与累积逻辑，未经真实网络调用。
+- 新增 14 个测试，总数到 381。
+
 ## [0.24.0] - 2026-10-07
 
 ### Features

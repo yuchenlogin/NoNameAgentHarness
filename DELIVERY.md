@@ -64,6 +64,7 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 - **两个真实供应商适配器**（OpenAI + Anthropic），共享 `vendor_http` 凭证安全基类（无重定向、HTTPS 强制、vendor_ref 白名单、错误按因分类、api_key repr=False）。
 - **协议通用性实证**：同一 `AdapterDriver` + `AgentLoop`，仅替换适配器实例即可驱动两家完成完整多轮工具循环，业务逻辑零改动。
 - **真实能力以插件接入**：模型适配器、embedding 服务、（未来的图像模型）都按"能力结晶成插件"加载审计，内核不依赖任何供应商。
+- **真流式 SSE 已落地**：`secure_stream_transport`（逐行读取、无重定向、HTTPS 强制、错误按因分类）+ `iter_sse_json_lines` 解析；OpenAI 按 index 累积 tool_call 片段、Anthropic 按事件类型解析并 flush orphan blocks；默认真实流式，显式 `None` 回退 complete 重放 replay。
 
 ## CLI · 29 个命令
 
@@ -77,7 +78,6 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 
 - **真实图像模型插件**：品味卡片默认抽象排版渲染器已落地，真实 imagegen 插件待注入。
 - **Causal Map 独立交互图**：账本目前以时间线节点带来源标注，独立的因果交互图属下一步。
-- **真流式 SSE**：`stream()` 目前是 complete 重放的诚实占位，非真实供应商流式。
 - **取消机制**：`cancelled` 错误分类已有，无 cancel API。
 - **多模态消息格式**：`ModelMessage.content` 仅文本。
 - **并行 tool_call**：Agent Loop 单 tool_call/轮，并行响亮拒绝。
@@ -93,7 +93,7 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 
 ```bash
 python3 -m noname_harness init --db .noname/harness.db --root . --name "我的项目"
-pytest -q   # 355 passed
+pytest -q   # 381 passed
 ```
 
 ## 演进
