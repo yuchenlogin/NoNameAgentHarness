@@ -49,7 +49,7 @@
 | Agent Loop | 显式状态机，工具调用路由过审批门，从事件流恢复 | Python API `AgentLoop` |
 | 插件运行时 | 能力结晶的加载/校验/原子生命周期/审计，绝不绕过内核 | Python API `PluginRuntime` |
 | 执行世界/沙箱 | 文件操作强制工作区约束 + O_NOFOLLOW，纯只读命令允许列表 + argv 路径扫描 + 进程组超时 | Python API `Sandbox` |
-| 交互式账本 | 四视图（收件箱/状态/因果图/时间线）+ 渐进披露的离线 HTML | `ledger-html` |
+| 交互式账本 | 五视图（收件箱/状态/版本演进/因果图/时间线）+ 渐进披露的离线 HTML | `ledger-html` |
 
 完整命令、边界与已知限制见 [docs/prototype.md](docs/prototype.md)；每个版本的设计依据见 [CHANGELOG.md](CHANGELOG.md)。
 

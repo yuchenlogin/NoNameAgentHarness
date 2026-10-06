@@ -22,7 +22,7 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 | **一、上下文是资产** | ✅ 已证实 | append-only 事件/证据（全表 UPDATE+DELETE 触发器物理强制）、分层投影（高/中/低）、跨模型接续包（`assemble_context_package`）、双时序（valid_from/valid_to）。测试：`test_prototype.py`、`test_rebirth.py`、`test_model_projection.py`、`test_memory_semantics.py` |
 | **二、规范即记忆** | ✅ 已证实 | 法典由模型观察后提出（`extractor.py` 规则替身 + `llm_extractor.py` LLM 抽取）、由人罕见批准（`review_proposal`）、版本化可回滚（supersedes 链 + bitemporal）。提取器**绝不写长期状态、绝不自我确认**——候选而非事实。测试：`test_extractor.py`、`test_llm_extractor.py` |
 | **三、核心不可谈判，能力可以涌现** | ✅ 已证实 | 审批门（`tools.py` 账本支撑的一次性令牌，绑定参数哈希+session+工具实例代）、沙箱（`sandbox.py` 工作区约束+纯只读命令允许列表+argv 路径扫描+进程组超时，两层独立防线）。物理强制，非模型不做。测试：`test_tools.py`、`test_sandbox.py`、`test_cross_module_hardening.py` |
-| **四、界面是一张地图，不是控制面板** | ✅ 已证实 | 交互式账本（`ledger_view.py` 单文件离线 HTML：审核收件箱/状态/因果图/时间线四视图 + `<details>` 渐进披露），纯投影可重建，克制暗色设计（与 site 一致）。测试：`test_ledger_view.py`，并经 Chrome headless 截图核验 |
+| **四、界面是一张地图，不是控制面板** | ✅ 已证实 | 交互式账本（`ledger_view.py` 单文件离线 HTML：审核收件箱/状态/版本演进/因果图/时间线五视图 + `<details>` 渐进披露），纯投影可重建，克制暗色设计（与 site 一致）。测试：`test_ledger_view.py`，并经 Chrome headless 截图核验 |
 
 ## vision §12 五步验证顺序 · 全部落地
 

@@ -2,6 +2,27 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.27.0] - 2026-10-07
+
+### Features
+
+- State Diff 并排视图落地——账本三视图（收件箱/状态/版本演进）全部实现（ledger §2.3，经一轮对抗性审查——CONTESTED 后修复，含一个 critical 链条反转风险——schema 不变，仍为 v7）：新增 `noname_harness/state_diff.py`。`build_state_diff_model` 从 supersedes 链派生版本演进（纯投影、可重建）；`render_state_diff_html` 渲染为 `<details>` 渐进披露，嵌入账本成为第五视图（审核收件箱/状态/版本演进/因果图/时间线）。
+- `store.state_history`：沿 `supersedes_id` 从真 head 回溯某 key 的完整 revision 历史（oldest → head，含被 supersede 的旧版与 retired），不信时间序——时钟回拨不会反转链条（critical 修复）。
+- 版本演进视图：每 key 显示 v1→v2→…——哪版新增（首版）、哪版被新版本取代（edit supersede）、哪版失效（retired 保留历史；retire 且内容同时变更时标「内容同时变更」）；每版带 approved_by/created_at + 双时序；首版即 retire 标「新增即失效」不标「新增」。
+- 品味卡演进链：沿卡片 supersedes 链显示版本（root title 或「原名 → 新名」）。
+- 审查加固：supersede guard 强制同 layer+key（cross-key 拒绝）；断链标 `broken_lineage`；State Diff 从所有有历史的 key（含 retired）开始；卡片链一次查询+本地过滤。
+
+### Design Rationale
+
+- **为什么 state_history 必须沿 supersedes 链回溯而非按时间排序**：`created_at` 是墙钟，时钟回拨会让 parent 排在 child 之后，diff 就会把被取代的旧版当成「当前」——链反转，视图说谎。只有沿 `supersedes_id` 从真 head 回溯，链在任何时钟行为下都保持正确。
+- **为什么 State Diff 必须包含 retired 的 key**：retired 正是「旧记忆被新证据取代/失效」的故事，是 State Diff 存在的理由；从 active projection 开始会把最重要的演进（失效）漏掉。
+
+### Notes & Caveats
+
+- split 产生的卡片是新 root——split 故事「这张卡被拆成哪几张」暂不可见，属已知数据模型限制。
+- 新增 11 个测试，总数到 405。
+
+
 ## [0.26.0] - 2026-10-07
 
 ### Features

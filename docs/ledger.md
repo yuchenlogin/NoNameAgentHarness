@@ -95,7 +95,8 @@
 
 - **三种核心视图 Timeline / State / 审核收件箱 + Causal Map 第四视图**：时间线默认高信号节点，低层簿记以 `<details>` 折叠组嵌入、可展开（渐进披露而非删除）；状态视图展示法典/任务态/品味并带来源事件数与审批人；审核收件箱聚合待审候选，以暖色左边框与普通浏览视觉区分。
 - **Causal Map 已落地**：`noname_harness/causal_map.py` 从 append-only 事件与 provenance 派生「结果→依赖」投影，`<details>` 渐进披露，嵌入账本 HTML 为第四视图。三类结果节点：法典 revision（依赖 source_event_ids 的用户指令/证据 + 审核提案批准人）、上下文包（依赖选中的证据/记忆 + 模型配方 + 目标模型）、受审批工具执行（依赖审批令牌 + 工具结果）。品味引用的「model moment」事件标为「影响了排序/表达」软影响而非事实依据（从「选中的证据/记忆」中减去）；审批令牌对照账本中的 `tool.approval_granted` 核实，未匹配标「未在账本中核实」；canon 依赖按 id 单独解析，不受 display window 限制。
+- **State Diff 已落地**：`noname_harness/state_diff.py` 从 supersedes 链派生版本演进投影——`state_history` 沿 `supersedes_id` 从真 head 回溯（不信时间序，时钟回拨不反转链条）；从所有有历史的 key（含 retired）开始，标注新增/被取代/失效/内容同时变更；每版带 approved_by/created_at + 双时序；`<details>` 渐进披露，嵌入账本为第五视图（审核收件箱/状态/版本演进/因果图/时间线）。
 - **纯投影、可重建**：视图模型与因果模型都永不写入，随时可从事件流重建；账本自身不创造事实。
 - **视觉原则已遵守**：干净时间线、类型用色不表价值、无巨量统计面板、克制暗色设计（与 site 一致）。
 
-尚未实现：State Diff 的并排 diff 视图、时间缩放与回放/比较等高级交互——属下一步。
+尚未实现：时间缩放与回放/比较等高级交互——属下一步。
