@@ -2,6 +2,27 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.29.0] - 2026-10-07
+
+### Features
+
+- 多模态消息格式落地——runtime-architecture §3 的最后一块（经一轮对抗性审查——CONTESTED 后修复：核心安全声明「vision=False 拒绝图像」在多条路径可被绕过——schema 不变，仍为 v7）：`adapters.py` 新增 `TextBlock` / `ImageBlock` / `ContentBlock`；`ModelMessage.content` 从 `str` 扩展为 `str | list[ContentBlock]`，纯文本字符串完全向后兼容；`is_multimodal()` 与 `text()` 统一访问（`text()` 用 `"\n".join`）。
+- 供应商映射：`[OI]Adapter._map_message` 把多模态映射为 [OI] content-part 数组（`{"type":"text"}` / `{"type":"image_url"}`，data base64 → data: URL，url → 直接引用），纯文本仍是纯字符串，tool 消息用 `.text()` 展平（真实 [OI] tool 消息要求 string content）；`AnthropicAdapter._map_content` 把多模态映射为 Anthropic block 数组（`{"type":"text"}` / `{"type":"image"}`，base64 source 或 url source），system 内容非 `str` 时 classified `invalid_request`（而非原始 `TypeError`）。
+- capability 一致：`vision: bool = True` 构造字段（可配置声明，像 `model_id` / `context_window`）；`vision=False` 时任何 role（user / tool / system）的多模态消息统一拒绝 `invalid_request`——集中在 `_build_body` 顶层一处，不可按 role 绕过；`LocalEchoAdapter` 同样拒绝多模态（参考实现执行契约）。
+- `ImageBlock` 校验：XOR（`data` 与 `url` 恰好一个）、20MB 上限；空 content list 拒绝。
+- 端到端验证：[OI] `image_url` data: URL、Anthropic image base64 source、system 顶层字段正确；`vision=False` 两适配器统一拒绝。
+
+### Design Rationale
+
+- **为什么 `vision=False` 的拒绝必须统一在 `_build_body` 顶层而非各 role 的 mapper 里**：把校验散在 user / tool / system 各自的 mapper 里，任何一条路径漏了就会被绕过（Anthropic tool 曾静默丢弃图像）。集中在 `_build_body` 顶层一处，任何 role 的多模态消息都不可绕过。
+- **为什么 `vision` 是构造字段而非硬编码**：capability 声明必须与格式能力一致。硬编码 `vision=True` 让「vision=False 拒绝图像」永远不可达，等于没有这条安全声明；可配置声明（像 `model_id` / `context_window`）让纯文本模型能诚实地声明 `vision=False` 并在本地拒绝，而非被 vendor 400 才发现。
+
+### Notes & Caveats
+
+- 多模态内容（图像）不计入 word-count token 估算——真实视觉 token 是主要成本，估算仍是词数启发式。
+- 图像数据（base64）是内容不是凭证，不入 `vendor_ref`。
+- 新增 19 个测试，总数到 434。
+
 ## [0.28.0] - 2026-10-07
 
 ### Features

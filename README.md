@@ -47,6 +47,7 @@
 | Router | 显式带理由的上下文路由（继续/fork/重生/切换配方），按调用配对的挂起审批与边界锚定的饱和度 | `route` |
 | 工具注册表 | 模型可见面与宿主执行面分离，审批为账本支撑的一次性令牌（绑定参数哈希+session+工具实例代） | Python API `ToolRegistry` |
 | Agent Loop | 显式状态机，工具调用路由过审批门，从事件流恢复，事件驱动取消（跨 actor，轮次边界协作式检测） | Python API `AgentLoop`，`cancel` |
+| 模型适配器 | 统一契约与错误分类、两个真实供应商适配器（OpenAI/Anthropic）、真流式 SSE、多模态消息格式（`vision=False` 统一拒绝不可绕过） | Python API `ModelAdapter`，`OpenAIAdapter`，`AnthropicAdapter` |
 | 插件运行时 | 能力结晶的加载/校验/原子生命周期/审计，绝不绕过内核 | Python API `PluginRuntime` |
 | 执行世界/沙箱 | 文件操作强制工作区约束 + O_NOFOLLOW，纯只读命令允许列表 + argv 路径扫描 + 进程组超时 | Python API `Sandbox` |
 | 交互式账本 | 五视图（收件箱/状态/版本演进/因果图/时间线）+ 渐进披露的离线 HTML | `ledger-html` |
