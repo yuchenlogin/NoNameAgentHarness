@@ -1,6 +1,7 @@
 """A small, local-first prototype for evidence-backed agent handoffs."""
 
 from .models import EvidenceInput, Event, ModelCapability, ModelProfile
+from .adapters import ContentBlock, ImageBlock, TextBlock
 from .curator import CuratorService
 from .taste import TasteService
 from .taste_cards import TasteCardService
@@ -80,6 +81,9 @@ __all__ = [
     "ModelResponse",
     "ModelCapability",
     "ModelProfile",
+    "ContentBlock",
+    "ImageBlock",
+    "TextBlock",
     "Recipe",
     "RoleSpec",
     "resolve_recipe",

@@ -46,16 +46,81 @@ class ModelAdapterError(Exception):
 
 
 @dataclass(frozen=True)
+class TextBlock:
+    """A text content block."""
+
+    text: str
+
+    @property
+    def kind(self) -> str:
+        return "text"
+
+
+@dataclass(frozen=True)
+class ImageBlock:
+    """An image content block (for vision-capable models).
+
+    ``data`` is base64-encoded image bytes and ``url`` an optional remote
+    reference; exactly one source is used.  ``media_type`` is e.g. image/png.
+    Image payloads are content, never credentials, and are never recorded into
+    a vendor_ref.
+    """
+
+    media_type: str
+    data: str | None = None
+    url: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.data is None and self.url is None:
+            raise ValueError("an image block needs data or a url")
+        if not self.media_type.startswith("image/"):
+            raise ValueError(f"invalid image media_type: {self.media_type}")
+
+    @property
+    def kind(self) -> str:
+        return "image"
+
+
+# A content block is a text or image part of a multimodal message.
+ContentBlock = TextBlock | ImageBlock
+
+
+@dataclass(frozen=True)
 class ModelMessage:
-    """A single message in a vendor-neutral conversation."""
+    """A single message in a vendor-neutral conversation.
+
+    ``content`` is either a plain string (text-only, the common case) or a list
+    of content blocks for multimodal messages (text + images).  Plain strings
+    stay fully backwards compatible.
+    """
 
     role: str  # "system" | "user" | "assistant" | "tool"
-    content: str
+    content: str | list[ContentBlock]
     name: str | None = None
 
     def __post_init__(self) -> None:
         if self.role not in {"system", "user", "assistant", "tool"}:
             raise ValueError(f"invalid message role: {self.role}")
+        if not isinstance(self.content, (str, list)):
+            raise ValueError("content must be a string or a list of content blocks")
+        if isinstance(self.content, list):
+            for block in self.content:
+                if not isinstance(block, (TextBlock, ImageBlock)):
+                    raise ValueError(f"invalid content block type: {type(block).__name__}")
+
+    def is_multimodal(self) -> bool:
+        """Return whether this message carries non-text content."""
+
+        return isinstance(self.content, list) and any(
+            isinstance(block, ImageBlock) for block in self.content
+        )
+
+    def text(self) -> str:
+        """The text content of this message (blocks joined, or the string)."""
+
+        if isinstance(self.content, str):
+            return self.content
+        return "".join(block.text for block in self.content if isinstance(block, TextBlock))
 
 
 @dataclass(frozen=True)
@@ -198,12 +263,12 @@ class LocalEchoAdapter:
         last_user = next(
             (m for m in reversed(request.messages) if m.role == "user"), None
         )
-        return f"echo: {last_user.content if last_user else ''}"
+        return f"echo: {last_user.text() if last_user else ''}"
 
     @staticmethod
     def _count_tokens(request: ModelRequest) -> int:
         # A coarse, deterministic token estimate (words), not a vendor count.
-        return sum(len(message.content.split()) for message in request.messages)
+        return sum(len(message.text().split()) for message in request.messages)
 
 
 # ---------------------------------------------------------------------------

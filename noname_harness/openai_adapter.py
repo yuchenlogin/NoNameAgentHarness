@@ -132,13 +132,45 @@ class OpenAIAdapter:
             "Authorization": f"Bearer {key}",
         }
 
+    def _map_message(self, message: ModelMessage) -> dict[str, Any]:
+        """Map a ModelMessage to the [OI] message shape.
+
+        Plain-text content stays a plain string; multimodal content becomes a
+        content-part array ({"type": "text"} / {"type": "image_url"}).  A
+        vision-capable adapter must not silently drop an image; a text-only
+        message never produces the part array (backwards compatible).
+        """
+
+        if isinstance(message.content, str):
+            mapped: dict[str, Any] = {"role": message.role, "content": message.content}
+        else:
+            parts: list[dict[str, Any]] = []
+            for block in message.content:
+                if block.kind == "text":
+                    parts.append({"type": "text", "text": block.text})
+                elif block.kind == "image":
+                    if not self.capability().vision:
+                        from .adapters import ModelAdapterError
+
+                        raise ModelAdapterError(
+                            "invalid_request",
+                            f"model {self.model_id} does not support image content (vision=False)",
+                        )
+                    source = (
+                        f"data:{block.media_type};base64,{block.data}"
+                        if block.data is not None
+                        else block.url
+                    )
+                    parts.append({"type": "image_url", "image_url": {"url": source}})
+            mapped = {"role": message.role, "content": parts}
+        if message.name is not None:
+            mapped["name"] = message.name
+        return mapped
+
     def _build_body(self, request: ModelRequest) -> bytes:
         payload: dict[str, Any] = {
             "model": self.model_id,
-            "messages": [
-                {k: v for k, v in {"role": m.role, "content": m.content, "name": m.name}.items() if v is not None}
-                for m in request.messages
-            ],
+            "messages": [self._map_message(m) for m in request.messages],
         }
         if request.tools:
             payload["tools"] = [

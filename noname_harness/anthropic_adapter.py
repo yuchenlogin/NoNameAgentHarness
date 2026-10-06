@@ -96,6 +96,39 @@ class AnthropicAdapter:
             "anthropic-version": _API_VERSION,
         }
 
+    def _map_content(self, content: Any) -> Any:
+        """Map ModelMessage content to Anthropic content blocks.
+
+        Plain-text stays a plain string; multimodal content becomes Anthropic's
+        block array ({"type": "text"} / {"type": "image"} with a base64 source).
+        A vision=False adapter must not silently drop an image.
+        """
+
+        if isinstance(content, str):
+            return content
+        from .adapters import ModelAdapterError, TextBlock
+
+        blocks = []
+        for block in content:
+            if isinstance(block, TextBlock):
+                blocks.append({"type": "text", "text": block.text})
+            else:
+                if not self.capability().vision:
+                    raise ModelAdapterError(
+                        "invalid_request",
+                        f"model {self.model_id} does not support image content (vision=False)",
+                    )
+                if block.data is not None:
+                    source = {
+                        "type": "base64",
+                        "media_type": block.media_type,
+                        "data": block.data,
+                    }
+                else:
+                    source = {"type": "url", "url": block.url}
+                blocks.append({"type": "image", "source": source})
+        return blocks
+
     def _build_body(self, request: ModelRequest) -> bytes:
         # Anthropic: system is a top-level field, not a message; content is a
         # list of blocks; tools have an input_schema object.
@@ -109,6 +142,11 @@ class AnthropicAdapter:
                 # message, carrying the tool_use_id it answers -- a bare user
                 # message is rejected by the real API (and breaks role
                 # alternation).  The id is threaded via message.name.
+                tool_content = (
+                    message.content
+                    if isinstance(message.content, str)
+                    else message.text()
+                )
                 messages.append(
                     {
                         "role": "user",
@@ -116,13 +154,15 @@ class AnthropicAdapter:
                             {
                                 "type": "tool_result",
                                 "tool_use_id": message.name or "unknown",
-                                "content": message.content,
+                                "content": tool_content,
                             }
                         ],
                     }
                 )
             else:
-                messages.append({"role": message.role, "content": message.content})
+                messages.append(
+                    {"role": message.role, "content": self._map_content(message.content)}
+                )
         payload: dict[str, Any] = {
             "model": self.model_id,
             "messages": messages,
@@ -329,7 +369,7 @@ class AnthropicAdapter:
         yield StreamEvent(kind="completed", payload=response)
 
     def estimate_cost(self, request: ModelRequest) -> dict[str, Any]:
-        input_tokens = sum(len(m.content.split()) for m in request.messages)
+        input_tokens = sum(len(m.text().split()) for m in request.messages)
         return {
             "model_id": self.model_id,
             "input_tokens": input_tokens,

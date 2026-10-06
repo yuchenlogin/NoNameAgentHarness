@@ -150,7 +150,7 @@ def json_schema_type(type_name: str) -> str:
 def word_count_cost(model_id: str, request: Any, currency: str = "usd") -> dict[str, Any]:
     """A shared, honest cost estimate from word count (not real tokens)."""
 
-    input_words = sum(len(m.content.split()) for m in request.messages)
+    input_words = sum(len(m.text().split()) for m in request.messages)
     return {
         "model_id": model_id,
         "estimated_input_words": input_words,
