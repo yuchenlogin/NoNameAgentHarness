@@ -239,31 +239,46 @@ def test_malformed_tool_call_is_a_driver_contract_error(tmp_path):
         store.close()
 
 
-def test_parallel_tool_calls_are_rejected_loudly(tmp_path):
+def test_parallel_tool_calls_are_executed_through_the_gate(tmp_path):
     store, _ = make_store(tmp_path)
     try:
-        adapter = LocalEchoAdapter(responder=lambda req: {
-            "tool_calls": [
-                {"name": "a", "arguments": {}},
-                {"name": "b", "arguments": {}},
-            ]
-        })
-        # LocalEchoAdapter.complete only surfaces tool_calls[0] when given a
-        # single tool_call dict; give it a raw multi-call response instead.
+        from noname_harness.tools import Tool, ToolRegistry, ToolSchema
+        registry = ToolRegistry(store)
+        executed = []
+        registry.register(Tool(
+            ToolSchema(name="a", description="d", input_schema={}),
+            execute=lambda args: executed.append("a") or "ra", permission="read", approval="never",
+        ))
+        registry.register(Tool(
+            ToolSchema(name="b", description="d", input_schema={}),
+            execute=lambda args: executed.append("b") or "rb", permission="read", approval="never",
+        ))
+
+        # A model that requests two tools in one turn, then answers.
+        responses = iter([
+            {"tool_calls": [
+                {"name": "a", "arguments": {}, "id": "call_a"},
+                {"name": "b", "arguments": {}, "id": "call_b"},
+            ]},
+            "done",
+        ])
         class MultiAdapter(LocalEchoAdapter):
             def complete(self, request):
                 from noname_harness.adapters import ModelResponse
-                return ModelResponse(
-                    text="", tool_calls=(
-                        {"name": "a", "arguments": {}},
-                        {"name": "b", "arguments": {}},
-                    ), model_id="multi", finish_reason="tool_calls",
-                )
-        driver = AdapterDriver(MultiAdapter())
-        loop = AgentLoop(store=store, session_id="s", driver=driver)
+                reply = next(responses)
+                if isinstance(reply, dict):
+                    return ModelResponse(
+                        text="", tool_calls=tuple(reply["tool_calls"]),
+                        model_id="multi", finish_reason="tool_calls",
+                    )
+                return ModelResponse(text=reply, model_id="multi", finish_reason="stop")
+        driver = AdapterDriver(MultiAdapter(), tool_registry=registry)
+        loop = AgentLoop(store=store, session_id="s", driver=driver, tool_registry=registry)
         summary = loop.run("t")
-        assert summary["final_state"] == "FAILED"
-        assert "one tool call per turn" in summary["error"]
+        # Both parallel calls executed through the gate, then the loop completed.
+        assert summary["final_state"] == "COMPLETED"
+        assert executed == ["a", "b"]
+        assert summary["rounds"] == 2
     finally:
         store.close()
 

@@ -324,10 +324,10 @@ class AdapterDriver:
         # coverage gap for the most core behaviour of all.
         self.store = store
         self.session_id = session_id
-        # The id of the tool call the model last requested, so the tool result
-        # can be correlated back to it on the next turn (required by APIs like
-        # Anthropic's tool_result block).
-        self._last_tool_call_id: str | None = None
+        # The ids of the tool calls the model last requested, so each result
+        # can be correlated back to its call on the next turn (required by APIs
+        # like Anthropic's tool_result block, and [OI] tool messages).
+        self._pending_tool_call_ids: list[str | None] = []
 
     def act(self, context: dict[str, Any], last_tool_result: Any = None) -> Any:
         from .agent_loop import LoopResult
@@ -335,16 +335,13 @@ class AdapterDriver:
         request = self._build_request(context, last_tool_result)
         response = self._complete_with_audit(request)
         if response.tool_calls:
-            if len(response.tool_calls) > 1:
-                # The loop is single-call-per-turn; parallel calls would be
-                # silently dropped, so reject them loudly instead.
-                from .agent_loop import AgentLoopError
-
-                raise AgentLoopError(
-                    f"adapter returned {len(response.tool_calls)} tool calls; "
-                    "the loop executes one tool call per turn"
-                )
-            return LoopResult(tool_call=self._map_tool_call(response.tool_calls[0], context))
+            # Map every tool call (single or parallel).  Each is validated and
+            # gets its own id for result correlation; the loop executes them all
+            # through the approval gate (each gated call needs its own token).
+            mapped = [self._map_tool_call(call, context) for call in response.tool_calls]
+            if len(mapped) == 1:
+                return LoopResult(tool_call=mapped[0])
+            return LoopResult(tool_calls=mapped)
         return LoopResult(output=response.text, task_complete=True)
 
     def _map_tool_call(self, call: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
@@ -385,7 +382,7 @@ class AdapterDriver:
                 raise AgentLoopError(
                     "adapter supplied an unknown or consumed approval token id"
                 )
-        self._last_tool_call_id = call.get("id")
+        self._pending_tool_call_ids.append(call.get("id"))
         return {
             "name": name,
             "arguments": arguments,
@@ -474,15 +471,25 @@ class AdapterDriver:
             ModelMessage(role="user", content=json.dumps(brief, ensure_ascii=False))
         )
         if last_tool_result is not None:
-            messages.append(
-                ModelMessage(
-                    role="tool",
-                    content=json.dumps(last_tool_result, ensure_ascii=False, default=str),
-                    # Correlate the result to the tool call that produced it;
-                    # adapters that need a tool_use_id (Anthropic) use this name.
-                    name=self._last_tool_call_id or "last_tool_result",
+            # Correlate each result to the tool call that produced it.  A single
+            # result pairs with the single pending id; a list of results (from
+            # parallel calls) pairs positionally with the pending ids.
+            results = last_tool_result if isinstance(last_tool_result, list) else [last_tool_result]
+            for index, result in enumerate(results):
+                tool_use_id = (
+                    self._pending_tool_call_ids[index]
+                    if index < len(self._pending_tool_call_ids)
+                    else None
                 )
-            )
+                messages.append(
+                    ModelMessage(
+                        role="tool",
+                        content=json.dumps(result, ensure_ascii=False, default=str),
+                        name=tool_use_id or "last_tool_result",
+                    )
+                )
+            # Pending ids are consumed once the results are fed back.
+            self._pending_tool_call_ids = []
         # Surface the model-visible tool contracts (never the implementations).
         tools = tuple(
             context.get("visible_tools", ())

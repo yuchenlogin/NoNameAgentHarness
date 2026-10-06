@@ -89,6 +89,9 @@ class LoopResult:
 
     output: Any = None
     tool_call: dict[str, Any] | None = None
+    # Parallel tool calls (the model requested several tools in one turn).
+    # ``tool_call`` (single) and ``tool_calls`` (plural) are mutually exclusive.
+    tool_calls: list[dict[str, Any]] | None = None
     task_complete: bool = False
     stop_reason: str | None = None
 
@@ -223,14 +226,31 @@ class AgentLoop:
                 self._rounds += 1
                 self._validate_result(result)
 
-                if result.tool_call is not None:
-                    self._transition("WAITING_TOOL", {"tool": result.tool_call.get("name")})
-                    last_tool_result = self._execute_tool_call(result.tool_call)
-                    if last_tool_result is _WAITING_APPROVAL:
-                        # The tool needs approval: stop and surface it, do not
-                        # fabricate a result or continue as if it ran.
+                if result.tool_call is not None or result.tool_calls is not None:
+                    calls = (
+                        [result.tool_call]
+                        if result.tool_call is not None
+                        else list(result.tool_calls)
+                    )
+                    self._transition("WAITING_TOOL", {"tools": [c.get("name") for c in calls]})
+                    results = []
+                    approval_needed = False
+                    for call in calls:
+                        tool_result = self._execute_tool_call(call)
+                        if tool_result is _WAITING_APPROVAL:
+                            # Conservative: any gated call needing approval stops
+                            # the whole turn -- no partial execution.
+                            approval_needed = True
+                            break
+                        results.append(tool_result)
+                    if approval_needed:
                         self._transition("CANCELLED", {"reason": "waiting_approval"})
                         return self._summary("waiting_approval", context)
+                    # Each result is correlated back to its call by id, so the
+                    # driver can build the right tool_result/tool message.
+                    last_tool_result = (
+                        results[0] if result.tool_call is not None else results
+                    )
                     self._transition("APPLYING_RESULT")
                 else:
                     self._transition("APPLYING_RESULT")
@@ -398,10 +418,18 @@ class AgentLoop:
         conflict by accidental branch order.
         """
 
-        if result.tool_call is not None and (result.task_complete or result.stop_reason is not None):
+        if result.tool_call is not None and result.tool_calls is not None:
             raise AgentLoopError(
-                "contradictory LoopResult: tool_call cannot coexist with task_complete/stop_reason"
+                "contradictory LoopResult: tool_call and tool_calls are mutually exclusive"
             )
+        if (result.tool_call is not None or result.tool_calls is not None) and (
+            result.task_complete or result.stop_reason is not None
+        ):
+            raise AgentLoopError(
+                "contradictory LoopResult: tool call(s) cannot coexist with task_complete/stop_reason"
+            )
+        if result.tool_calls is not None and not result.tool_calls:
+            raise AgentLoopError("tool_calls cannot be an empty list")
         if result.task_complete and result.stop_reason not in (None, "task_complete"):
             raise AgentLoopError(
                 f"contradictory LoopResult: task_complete with stop_reason={result.stop_reason}"
