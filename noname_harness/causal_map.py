@@ -33,9 +33,21 @@ def build_causal_model(store: HarnessStore, *, session_id: str | None = None, li
     by_id = {event.id: event for event in events}
 
     def event_label(event_id: str) -> dict[str, Any]:
+        # Provenance resolution must not be limited by the display window:
+        # durable source events are looked up individually by id, so a canon
+        # created long ago (or in another session) still resolves its "why".
         event = by_id.get(event_id)
         if event is None:
-            return {"id": event_id[:12], "label": event_id[:12], "kind": "event", "missing": True}
+            try:
+                event = store.get_event(event_id)
+            except KeyError:
+                return {
+                    "id": event_id[:12],
+                    "label": event_id[:12],
+                    "kind": "event",
+                    "missing": True,
+                    "detail": "（事件不存在）",
+                }
         payload_text = json.dumps(event.payload, ensure_ascii=False, default=str)
         if len(payload_text) > 80:
             payload_text = payload_text[:80] + "…"
@@ -73,22 +85,37 @@ def build_causal_model(store: HarnessStore, *, session_id: str | None = None, li
             }
         )
 
+    # Taste boundary: an event cited by an ACTIVE taste (the "model moment"
+    # that justified an adoption) is a soft influence on ordering/expression,
+    # never factual evidence.  Collect those ids up front so the package's
+    # dependency list can separate them from real evidence.
+    taste_source_ids = {
+        event_id
+        for record in TasteService(store).active()
+        for event_id in record["source_event_ids"]
+    }
+
     # Results: context assemblies (why was this context assembled this way?).
     for event in events:
         if event.event_type != "context.assembled":
             continue
         payload = event.payload if isinstance(event.payload, dict) else {}
-        dependencies = [
-            {**event_label(event_id), "role": "选中的证据/记忆"}
-            for event_id in payload.get("source_event_ids", [])
-        ]
+        dependencies = []
+        for event_id in payload.get("source_event_ids", []):
+            if event_id in taste_source_ids:
+                # Taste-cited moment: label as soft influence, NOT evidence.
+                dependencies.append(
+                    {**event_label(event_id), "role": "影响了排序/表达", "kind": "taste"}
+                )
+            else:
+                dependencies.append({**event_label(event_id), "role": "选中的证据/记忆"})
         if payload.get("recipe_id"):
             dependencies.append(
                 {
                     "id": payload["recipe_id"],
                     "label": f"模型配方 {payload['recipe_id']}",
                     "kind": "recipe",
-                    "role": "配方与路由理由",
+                    "role": "模型配方",
                 }
             )
         if payload.get("model_id"):
@@ -98,7 +125,7 @@ def build_causal_model(store: HarnessStore, *, session_id: str | None = None, li
         results.append(
             {
                 "id": payload.get("package_id", event.id),
-                "title": f"上下文包 · {payload.get('task', '')[:40]}",
+                "title": f"上下文包 · {str(payload.get('task') or '')[:40]}",
                 "kind": "package",
                 "summary": f"配方 {payload.get('recipe_id') or '无'}",
                 "dependencies": dependencies,
@@ -112,15 +139,31 @@ def build_causal_model(store: HarnessStore, *, session_id: str | None = None, li
             continue
         payload = event.payload if isinstance(event.payload, dict) else {}
         dependencies = []
-        if payload.get("approval_token_id"):
-            dependencies.append(
-                {
-                    "id": payload["approval_token_id"],
-                    "label": "审批令牌",
-                    "kind": "approval",
-                    "role": "人工审批",
-                }
-            )
+        token_id = payload.get("approval_token_id")
+        if token_id:
+            # Verify the token against the ledger: a bare token id on a
+            # tool.completed event is not proof of a human approval (a forged
+            # event could carry any id).  Only label it as human-approved when
+            # a matching grant/approval exists in the ledger.
+            approver = _verify_approval_token(store, token_id, events)
+            if approver is not None:
+                dependencies.append(
+                    {
+                        "id": token_id,
+                        "label": "审批令牌",
+                        "kind": "approval",
+                        "role": f"人工审批（由 {approver} 批准）",
+                    }
+                )
+            else:
+                dependencies.append(
+                    {
+                        "id": token_id,
+                        "label": "审批令牌",
+                        "kind": "approval",
+                        "role": "审批令牌（未在账本中核实）",
+                    }
+                )
         dependencies.append(
             {"id": event.id[:12], "label": f"工具 {payload.get('name', '?')}", "kind": "tool", "role": "工具结果"}
         )
@@ -146,8 +189,19 @@ def build_causal_model(store: HarnessStore, *, session_id: str | None = None, li
         "session_id": session_id,
         "results": results,
         "taste_note": taste_note,
+        "truncated": len(events) >= limit,
+        "limit": limit,
         "counts": {"results": len(results), "events": len(events)},
     }
+
+
+def _verify_approval_token(store: HarnessStore, token_id: str, events: list[Any]) -> str | None:
+    """Return the approver id if a matching approval grant exists, else None."""
+
+    for event in store.list_events(session_id=None, limit=100000):
+        if event.event_type == "tool.approval_granted" and event.payload.get("token_id") == token_id:
+            return event.payload.get("approver_id")
+    return None
 
 
 def render_causal_html(model: dict[str, Any]) -> str:
@@ -186,9 +240,15 @@ def render_causal_html(model: dict[str, Any]) -> str:
         f'<p class="taste-note">品味（{taste["count"]} 条活跃）：<strong>{html.escape(taste["label"])}</strong>'
         f" · {html.escape(taste['warning'])}</p>"
     )
+    trunc = (
+        f'<p class="trunc">仅显示最近 {model["limit"]} 条事件的结果（历史被截断）</p>'
+        if model.get("truncated")
+        else ""
+    )
     return (
         '<section class="causal-map">'
         "<h2>因果图 · 为什么这样做</h2>"
+        f"{trunc}"
         '<p class="meta">点击一个结果，看它依赖什么——识别错误来自证据、记忆、路由、模型还是工具。'
         "品味只标注影响，不是事实依据。</p>"
         f"{taste_banner}"
