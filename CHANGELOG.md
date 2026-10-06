@@ -2,6 +2,27 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.28.0] - 2026-10-07
+
+### Features
+
+- Cancel API 落地——runtime-architecture §3 取消契约的最后一块（经一轮对抗性审查——CONTESTED 后修复——schema 不变，仍为 v7）：`AgentLoop.cancel(reason)` 记 `loop.cancel_requested` append-only 事件。取消是事件驱动而非进程内标志——任何 actor（人 / CLI / 另一个 agent）都能从 loop 的线程/进程外取消一个运行中的 loop；取消请求随事件流可回放，恢复时也能看到。
+- 协作式取消：loop 在轮次边界（`_check_stop`）检测取消请求并转为 `CANCELLED`——同步 loop 无法中断阻塞中的 `driver.act`，但保证不再开始下一轮（诚实语义，不过度声称）。
+- 审查加固：取消规则精确化为 `cancel.seq > MAX(loop.finished.seq)`——finished 之后的新 cancel 正确归属于并取消下一个 run（修正「任何 prior finished 永久中和取消」的 bug）；单次 `MAX(seq)` 索引查询，每轮 O(1)（不再 O(history) 双扫描）；`HarnessStore` docstring 明确「每个 actor 开自己的 HarnessStore」（WAL 跨连接可见，跨 actor 取消正依赖于此）；CLI cancel 复用 `AgentLoop.cancel` 的 reason 校验；删除 `requested_at_round` 死 payload。
+- CLI：`cancel --session [--reason]`。
+- 端到端验证：外部 actor 写入取消请求 → loop 在第 1 轮边界干净停止为 `CANCELLED`（不再继续后续轮）→ `reconstruct()` 从事件流看到终态。
+
+### Design Rationale
+
+- **为什么取消必须是事件驱动而非进程内标志**：取消的价值在于「从 loop 的线程/进程外取消它」——发起者是人、CLI 或另一个 agent，不是持有 loop 对象的代码。进程内标志只对持有者可见；append-only 事件让任何 actor 都能发起取消，且请求随事件流可回放（恢复时也能看到取消发生过的证据）。
+- **为什么取消规则要锚定 `loop.finished` 而非「有无 finished」**：「只要存在 finished 就否决所有 cancel」会让 finished 之后的合法新 cancel 被错误忽略——下一个 run 永远不可取消。正确规则是「cancel 比最近的 finished 新，则属于下一个 run」：既不让旧 cancel 毒化已完成的 run，也不让新 cancel 被误杀。
+
+### Notes & Caveats
+
+- 协作式取消：同步 loop 无法中断阻塞中的 `driver.act`；真实 adapter 的 HTTP 中断属 adapter 层，不在本层。
+- 每个 actor 应开自己的 `HarnessStore`——单连接不跨线程；跨 actor 取消依赖 WAL 的跨连接可见性。
+- 新增 10 个测试，总数到 415。
+
 ## [0.27.0] - 2026-10-07
 
 ### Features

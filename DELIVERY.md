@@ -77,7 +77,6 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 这些都是已明确记录的增强项或更深的系统层，**不是核心缺口**：
 
 - **真实图像模型插件**：品味卡片默认抽象排版渲染器已落地，真实 imagegen 插件待注入。
-- **取消机制**：`cancelled` 错误分类已有，无 cancel API。
 - **多模态消息格式**：`ModelMessage.content` 仅文本。
 - **并行 tool_call**：Agent Loop 单 tool_call/轮，并行响亮拒绝。
 - **暂停后 resume**：恢复为只读重建终态，waiting_approval 后需开启新 run。

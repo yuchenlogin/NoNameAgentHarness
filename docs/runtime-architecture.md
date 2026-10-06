@@ -158,6 +158,7 @@ IDLE
 - 驱动异常与契约违反（矛盾 `LoopResult`、未知 `stop_reason`）统一归一为 `FAILED`，经 `_force_fail` 写真实 transition（`forced: true`）到终态；
 - `reconstruct()` 从事件流重建状态 / 轮次 / limits（从 `loop.started` 读回），不依赖进程内对象；
 - driver 为注入的 `SessionDriver` 协议：原型用确定性 stub，生产接 Model Adapter；loop 不路由模型、不写记忆、不判权限，复用 `assemble_context_package` / `resolve_recipe` / `ToolRegistry`。
+- 取消机制已落地：`AgentLoop.cancel` 事件驱动（`loop.cancel_requested` append-only 事件，任何 actor 可从 loop 线程/进程外发起）、轮次边界协作式检测（`_check_stop` 转为 `CANCELLED`，不中断阻塞中的 `driver.act` 但不再开始下一轮）、规则 `cancel.seq > MAX(loop.finished.seq)`（新 cancel 正确归属下一个 run）、CLI `cancel --session [--reason]`，跨连接（外部 actor 独立 store）端到端验证。
 
 ## 7. Router 与 Context Assembler
 
