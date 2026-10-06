@@ -222,18 +222,23 @@ def secure_stream_transport(url: str, headers: dict[str, str], body: bytes, time
     return _lines()
 
 
-def iter_sse(lines: Any) -> Any:
-    """Parse a Server-Sent-Events byte stream into JSON data payloads.
+def iter_sse_json_lines(lines: Any) -> Any:
+    """Parse a vendor wire-format SSE stream into JSON payloads.
 
-    Yields the parsed JSON object of each ``data: {...}`` line.  Stops at
-    ``data: [DONE]``.  Lines that are not ``data:`` (comments, ``event:``,
-    blanks) are skipped; an unparseable ``data:`` line raises a classified
-    error rather than crashing the consumer.
+    This is deliberately scoped to the OpenAI/Anthropic wire format: **one JSON
+    object per ``data:`` line**, ``data: [DONE]`` terminates.  It is NOT a full
+    SSE-spec parser (the spec also allows an event to span multiple ``data:``
+    lines joined by newlines) -- neither OpenAI nor Anthropic emits multi-line
+    data today, so the simpler line-based shape is used and documented here.
+
+    Handles CRLF, leading/trailing whitespace, and a UTF-8 BOM.  Comment lines
+    (``:``), ``event:`` lines and blanks are skipped; a malformed ``data:``
+    line raises a classified error rather than crashing the consumer.
     """
 
     for raw_line in lines:
         try:
-            line = raw_line.decode("utf-8").strip()
+            line = raw_line.decode("utf-8-sig").strip()
         except UnicodeDecodeError:
             continue
         if not line or not line.startswith("data:"):
@@ -247,4 +252,8 @@ def iter_sse(lines: Any) -> Any:
             raise ModelAdapterError(
                 "unknown", f"malformed SSE data line: {exc}", vendor_ref={"line": payload[:100]}
             ) from exc
+
+
+# Backwards-compatible alias for the line-based vendor wire parser.
+iter_sse = iter_sse_json_lines
 

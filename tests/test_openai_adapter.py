@@ -136,7 +136,7 @@ def test_capability_and_cost_estimate():
 def test_stream_matches_complete(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "k")
     transport = replay_transport(payload=ok_payload(text="full text"))
-    adapter = OpenAIAdapter(transport=transport)
+    adapter = OpenAIAdapter(transport=transport, stream_transport=None)
     events = list(adapter.stream(_req()))
     text = "".join(e.text for e in events if e.kind == "text_delta")
     assert text == "full text"

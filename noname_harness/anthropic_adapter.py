@@ -21,6 +21,7 @@ from .adapters import (
     ModelResponse,
     StreamEvent,
 )
+from .openai_adapter import _parse_tool_arguments
 from .models import ModelCapability
 from .vendor_http import (
     StreamTransport,
@@ -62,7 +63,9 @@ class AnthropicAdapter:
     allow_insecure: bool = False
     max_output_tokens: int = 4096
     # Optional SSE stream transport for true incremental streaming.
-    stream_transport: StreamTransport | None = None
+    # Defaults to the real secure SSE transport; pass None to use the
+    # complete-then-re-emit replay (tests / offline).
+    stream_transport: StreamTransport | None = secure_stream_transport
 
     def id(self) -> str:
         return self.model_id
@@ -245,22 +248,32 @@ class AnthropicAdapter:
         """Consume Anthropic's SSE endpoint, emitting incremental events."""
 
         body = self._build_body(request)
-        import json as _json
-
-        payload = _json.loads(body.decode("utf-8"))
+        payload = json.loads(body.decode("utf-8"))
         payload["stream"] = True
-        body = _json.dumps(payload).encode("utf-8")
-        lines = self.stream_transport(self._endpoint(), self._headers(), body, self.timeout)
+        body = json.dumps(payload).encode("utf-8")
+        try:
+            lines = self.stream_transport(self._endpoint(), self._headers(), body, self.timeout)
+        except ModelAdapterError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - normalised at the vendor seam
+            raise classify_transport_error(exc, self.timeout) from exc
         text_parts: list[str] = []
         tool_blocks: dict[int, dict[str, Any]] = {}
         usage: dict[str, Any] = {}
         stop_reason = "end_turn"
         for data in iter_sse(lines):
             event_type = data.get("type")
+            index = data.get("index")
+            if event_type in {"content_block_start", "content_block_delta", "content_block_stop"} and index is None:
+                raise ModelAdapterError(
+                    "unknown",
+                    f"malformed stream event: {event_type} missing index",
+                    vendor_ref={"type": event_type},
+                )
             if event_type == "content_block_start":
                 block = data.get("content_block", {})
                 if block.get("type") == "tool_use":
-                    tool_blocks[data["index"]] = {
+                    tool_blocks[index] = {
                         "id": block.get("id"),
                         "name": block.get("name"),
                         "arguments_json": "",
@@ -273,16 +286,13 @@ class AnthropicAdapter:
                         text_parts.append(text)
                         yield StreamEvent(kind="text_delta", text=text)
                 elif delta.get("type") == "input_json_delta":
-                    block = tool_blocks.get(data["index"])
+                    block = tool_blocks.get(index)
                     if block is not None:
                         block["arguments_json"] += delta.get("partial_json", "")
             elif event_type == "content_block_stop":
-                block = tool_blocks.pop(data["index"], None)
+                block = tool_blocks.pop(index, None)
                 if block is not None:
-                    try:
-                        arguments = _json.loads(block["arguments_json"] or "{}")
-                    except ValueError:
-                        arguments = {"_raw": block["arguments_json"]}
+                    arguments = _parse_tool_arguments(block["arguments_json"])
                     yield StreamEvent(
                         kind="tool_call",
                         payload={"name": block["name"], "arguments": arguments, "id": block["id"]},
@@ -297,10 +307,16 @@ class AnthropicAdapter:
                 message = data.get("message", {})
                 if message.get("usage"):
                     usage.update(message["usage"])
-        mapped_calls = [
-            {"name": block["name"], "arguments": _json.loads(block["arguments_json"] or "{}") if block["arguments_json"] else {}, "id": block["id"]}
-            for block in tool_blocks.values()
-        ]
+        # Flush any orphaned tool_use blocks (stream ended without a stop):
+        # emit their tool_call events and include them in the completed payload,
+        # using the same capped, non-crashing argument parse as the stop path.
+        mapped_calls = []
+        for index in sorted(tool_blocks):
+            block = tool_blocks[index]
+            arguments = _parse_tool_arguments(block["arguments_json"])
+            call = {"name": block["name"], "arguments": arguments, "id": block["id"]}
+            mapped_calls.append(call)
+            yield StreamEvent(kind="tool_call", payload=call)
         response = ModelResponse(
             text="".join(text_parts),
             tool_calls=tuple(mapped_calls),

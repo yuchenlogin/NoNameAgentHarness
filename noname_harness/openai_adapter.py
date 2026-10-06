@@ -35,7 +35,9 @@ from .adapters import (
 from .models import ModelCapability
 from .vendor_http import (
     StreamTransport,
+    classify_transport_error,
     iter_sse,
+    safe_usage_ref,
     secure_stream_transport,
 )
 from .vendor_http import _NoRedirectHandler  # re-exported for backwards-compatible imports
@@ -55,6 +57,24 @@ from .vendor_http import (
 _DEFAULT_BASE_URL = "https://api.openai.com/v1"
 _ENV_KEY = "OPENAI_API_KEY"
 _ENV_BASE_URL = "OPENAI_BASE_URL"
+
+
+def _parse_tool_arguments(arguments_json: str) -> Any:
+    """Parse accumulated tool-call argument fragments, with a size cap.
+
+    Real streams deliver arguments as a JSON string in fragments; an
+    unparseable or oversized result falls back to a marked raw form (never a
+    crash, never unbounded).
+    """
+
+    import json as _json
+
+    if len(arguments_json) > 1_000_000:
+        return {"_error": "arguments exceed the 1MB limit"}
+    try:
+        return _json.loads(arguments_json) if arguments_json else {}
+    except ValueError:
+        return {"_raw": arguments_json}
 
 
 @dataclass
@@ -78,7 +98,9 @@ class OpenAIAdapter:
     # Optional SSE stream transport for true incremental streaming.  When
     # set, stream() consumes the vendor's SSE endpoint incrementally; when
     # None, stream() falls back to a complete-then-re-emit replay.
-    stream_transport: StreamTransport | None = None
+    # Defaults to the real secure SSE transport; pass None to use the
+    # complete-then-re-emit replay (tests / offline).
+    stream_transport: StreamTransport | None = secure_stream_transport
 
     def id(self) -> str:
         return self.model_id
@@ -264,14 +286,21 @@ class OpenAIAdapter:
 
         body = self._build_body(request)
         # Ask the vendor for a stream.
-        import json as _json
-
-        payload = _json.loads(body.decode("utf-8"))
+        payload = json.loads(body.decode("utf-8"))
         payload["stream"] = True
-        body = _json.dumps(payload).encode("utf-8")
-        lines = self.stream_transport(self._endpoint(), self._headers(), body, self.timeout)
+        body = json.dumps(payload).encode("utf-8")
+        try:
+            lines = self.stream_transport(self._endpoint(), self._headers(), body, self.timeout)
+        except ModelAdapterError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - normalised at the vendor seam
+            raise classify_transport_error(exc, self.timeout) from exc
         text_parts: list[str] = []
-        tool_calls: list[dict[str, Any]] = []
+        # Real OpenAI streams send a tool call's name/id ONCE (first delta at an
+        # index) and then stream function.arguments as fragments in LATER deltas
+        # that carry no name -- so fragments must be accumulated BY INDEX, not
+        # only when a name is present.
+        tool_blocks: dict[int, dict[str, Any]] = {}
         usage: dict[str, Any] = {}
         finish_reason = "stop"
         for data in iter_sse(lines):
@@ -288,26 +317,25 @@ class OpenAIAdapter:
                 text_parts.append(chunk_text)
                 yield StreamEvent(kind="text_delta", text=chunk_text)
             for call in delta.get("tool_calls", []) or []:
+                index = call.get("index", 0)
                 function = call.get("function", {})
-                arguments = function.get("arguments", "")
+                block = tool_blocks.setdefault(index, {"name": None, "id": None, "arguments_json": ""})
                 if function.get("name"):
-                    tool_calls.append(
-                        {"name": function["name"], "arguments": arguments, "id": call.get("id")}
-                    )
-                    yield StreamEvent(
-                        kind="tool_call",
-                        payload={"name": function["name"], "arguments": arguments, "id": call.get("id")},
-                    )
+                    block["name"] = function["name"]
+                if call.get("id"):
+                    block["id"] = call["id"]
+                # arguments arrive as string fragments; concatenate them.
+                block["arguments_json"] += function.get("arguments", "") or ""
             if choices[0].get("finish_reason"):
                 finish_reason = choices[0]["finish_reason"]
-        # Parse accumulated tool-call arguments (SSE streams them as fragments).
+        # Parse accumulated argument fragments (with the shared cap + fallback).
         mapped_calls = []
-        for call in tool_calls:
-            try:
-                arguments = _json.loads(call["arguments"]) if isinstance(call["arguments"], str) else call["arguments"]
-            except ValueError:
-                arguments = {"_raw": call["arguments"]}
-            mapped_calls.append({"name": call["name"], "arguments": arguments, "id": call["id"]})
+        for index in sorted(tool_blocks):
+            block = tool_blocks[index]
+            arguments = _parse_tool_arguments(block["arguments_json"])
+            call = {"name": block["name"], "arguments": arguments, "id": block["id"]}
+            mapped_calls.append(call)
+            yield StreamEvent(kind="tool_call", payload=call)
         response = ModelResponse(
             text="".join(text_parts),
             tool_calls=tuple(mapped_calls),
@@ -315,7 +343,7 @@ class OpenAIAdapter:
             finish_reason=finish_reason,
             input_tokens=usage.get("prompt_tokens"),
             output_tokens=usage.get("completion_tokens"),
-            vendor_ref={"status": 200, "stream": True, "usage": usage},
+            vendor_ref={"status": 200, "stream": True, "usage": safe_usage_ref(usage)},
         )
         yield StreamEvent(kind="completed", payload=response)
 

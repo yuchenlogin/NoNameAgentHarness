@@ -87,7 +87,7 @@ def test_openai_stream_falls_back_to_complete_without_transport(monkeypatch):
             "id": "r", "model": "gpt-4o",
             "choices": [{"message": {"content": "full"}, "finish_reason": "stop"}], "usage": {},
         }).encode()
-    adapter = OpenAIAdapter(transport=http_transport)  # no stream_transport
+    adapter = OpenAIAdapter(transport=http_transport, stream_transport=None)  # explicit replay opt-out
     events = list(adapter.stream(_req()))
     text = "".join(e.text for e in events if e.kind == "text_delta")
     assert text == "full"
@@ -139,6 +139,98 @@ def test_anthropic_stream_falls_back_without_transport(monkeypatch):
             "id": "m", "model": "claude", "content": [{"type": "text", "text": "full"}],
             "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1},
         }).encode()
-    adapter = AnthropicAdapter(transport=http_transport)
+    adapter = AnthropicAdapter(transport=http_transport, stream_transport=None)  # explicit replay opt-out
     events = list(adapter.stream(_req()))
     assert any(e.kind == "text_delta" and "full" in e.text for e in events)
+
+
+# --- 对抗性审查发现的回归 ---
+
+def test_openai_real_fragmented_tool_call_arguments(monkeypatch):
+    """Real OpenAI sends name once, then argument fragments in later deltas."""
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    transport = sse_transport([
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "search", "arguments": ""}}]}}]},
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": '{"q":'}}]}}]},
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": ' "x"}'}}]}}]},
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+    ])
+    adapter = OpenAIAdapter(stream_transport=transport)
+    events = list(adapter.stream(_req()))
+    completed = next(e for e in events if e.kind == "completed")
+    # The fragments are accumulated by index and parsed, NOT dropped.
+    assert completed.payload.tool_calls[0]["name"] == "search"
+    assert completed.payload.tool_calls[0]["arguments"] == {"q": "x"}
+    assert completed.payload.finish_reason == "tool_calls"
+
+
+def test_openai_stream_usage_is_allowlisted(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    transport = sse_transport([
+        {"choices": [{"delta": {"content": "x"}}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "evil": "sk-SECRET"}},
+    ])
+    adapter = OpenAIAdapter(stream_transport=transport)
+    completed = next(e for e in adapter.stream(_req()) if e.kind == "completed")
+    assert "SECRET" not in str(completed.payload.vendor_ref)
+    assert completed.payload.vendor_ref["usage"] == {"prompt_tokens": 1}
+
+
+def test_anthropic_orphan_tool_block_flushed_without_crash(monkeypatch):
+    """Stream ends early (no content_block_stop): orphan tool_use is flushed, not crashed."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    transport = sse_transport([
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t1", "name": "search"}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": '{"q": "x"}'}},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 1}},
+    ])
+    adapter = AnthropicAdapter(stream_transport=transport)
+    events = list(adapter.stream(_req()))
+    # The orphan block is flushed as a tool_call event AND included in completed.
+    tool_events = [e for e in events if e.kind == "tool_call"]
+    assert len(tool_events) == 1
+    assert tool_events[0].payload["name"] == "search"
+    completed = next(e for e in events if e.kind == "completed")
+    assert completed.payload.tool_calls[0]["name"] == "search"
+
+
+def test_anthropic_missing_index_is_classified_not_keyerror(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    transport = sse_transport([
+        {"type": "content_block_start", "content_block": {"type": "tool_use", "id": "t1", "name": "x"}},  # no index
+    ])
+    adapter = AnthropicAdapter(stream_transport=transport)
+    with pytest.raises(ModelAdapterError) as exc_info:
+        list(adapter.stream(_req()))
+    assert "missing index" in str(exc_info.value)
+
+
+def test_sse_bom_does_not_eat_first_event(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    def transport(url, headers, body, timeout):
+        return iter([
+            b'\xef\xbb\xbfdata: {"choices": [{"delta": {"content": "first"}}]}\n',
+            b'data: {"choices": [{"delta": {}, "finish_reason": "stop"}]}\n',
+            b"data: [DONE]\n",
+        ])
+    adapter = OpenAIAdapter(stream_transport=transport)
+    text = "".join(e.text for e in adapter.stream(_req()) if e.kind == "text_delta")
+    assert "first" in text  # BOM did not swallow the first event
+
+
+def test_secure_stream_transport_is_the_default():
+    """secure_stream_transport is the default stream transport (not dead code)."""
+    from noname_harness.vendor_http import secure_stream_transport
+    assert OpenAIAdapter().stream_transport is secure_stream_transport
+    assert AnthropicAdapter().stream_transport is secure_stream_transport
+
+
+def test_injected_transport_error_is_classified(monkeypatch):
+    import socket
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    def transport(url, headers, body, timeout):
+        raise socket.timeout("timed out")
+    adapter = OpenAIAdapter(stream_transport=transport)
+    with pytest.raises(ModelAdapterError) as exc_info:
+        list(adapter.stream(_req()))
+    assert exc_info.value.error_class == "timeout"

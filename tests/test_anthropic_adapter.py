@@ -203,7 +203,7 @@ def test_stream_emits_all_parallel_tool_calls(monkeypatch):
         {"type": "tool_use", "id": "1", "name": "a", "input": {}},
         {"type": "tool_use", "id": "2", "name": "b", "input": {}},
     ]
-    adapter = AnthropicAdapter(transport=replay_transport(payload=payload))
+    adapter = AnthropicAdapter(transport=replay_transport(payload=payload), stream_transport=None)
     events = list(adapter.stream(_req()))
     tool_events = [e for e in events if e.kind == "tool_call"]
     assert len(tool_events) == 2
