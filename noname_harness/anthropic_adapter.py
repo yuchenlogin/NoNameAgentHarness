@@ -23,10 +23,13 @@ from .adapters import (
 )
 from .models import ModelCapability
 from .vendor_http import (
+    StreamTransport,
     Transport,
     classify_http_status,
     classify_transport_error,
+    iter_sse,
     safe_usage_ref,
+    secure_stream_transport,
     secure_transport,
     validate_base_url,
 )
@@ -58,6 +61,8 @@ class AnthropicAdapter:
     api_key: str | None = field(default=None, repr=False)
     allow_insecure: bool = False
     max_output_tokens: int = 4096
+    # Optional SSE stream transport for true incremental streaming.
+    stream_transport: StreamTransport | None = None
 
     def id(self) -> str:
         return self.model_id
@@ -224,11 +229,87 @@ class AnthropicAdapter:
         }
 
     def stream(self, request: ModelRequest) -> Iterator[StreamEvent]:
+        # True SSE streaming when a stream transport is configured; otherwise a
+        # deterministic complete-then-re-emit replay.
+        if self.stream_transport is not None:
+            yield from self._stream_sse(request)
+            return
         response = self.complete(request)
         for call in response.tool_calls:
             yield StreamEvent(kind="tool_call", payload=call)
         if not response.tool_calls and response.text:
             yield StreamEvent(kind="text_delta", text=response.text)
+        yield StreamEvent(kind="completed", payload=response)
+
+    def _stream_sse(self, request: ModelRequest) -> Iterator[StreamEvent]:
+        """Consume Anthropic's SSE endpoint, emitting incremental events."""
+
+        body = self._build_body(request)
+        import json as _json
+
+        payload = _json.loads(body.decode("utf-8"))
+        payload["stream"] = True
+        body = _json.dumps(payload).encode("utf-8")
+        lines = self.stream_transport(self._endpoint(), self._headers(), body, self.timeout)
+        text_parts: list[str] = []
+        tool_blocks: dict[int, dict[str, Any]] = {}
+        usage: dict[str, Any] = {}
+        stop_reason = "end_turn"
+        for data in iter_sse(lines):
+            event_type = data.get("type")
+            if event_type == "content_block_start":
+                block = data.get("content_block", {})
+                if block.get("type") == "tool_use":
+                    tool_blocks[data["index"]] = {
+                        "id": block.get("id"),
+                        "name": block.get("name"),
+                        "arguments_json": "",
+                    }
+            elif event_type == "content_block_delta":
+                delta = data.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    text = delta.get("text", "")
+                    if text:
+                        text_parts.append(text)
+                        yield StreamEvent(kind="text_delta", text=text)
+                elif delta.get("type") == "input_json_delta":
+                    block = tool_blocks.get(data["index"])
+                    if block is not None:
+                        block["arguments_json"] += delta.get("partial_json", "")
+            elif event_type == "content_block_stop":
+                block = tool_blocks.pop(data["index"], None)
+                if block is not None:
+                    try:
+                        arguments = _json.loads(block["arguments_json"] or "{}")
+                    except ValueError:
+                        arguments = {"_raw": block["arguments_json"]}
+                    yield StreamEvent(
+                        kind="tool_call",
+                        payload={"name": block["name"], "arguments": arguments, "id": block["id"]},
+                    )
+            elif event_type == "message_delta":
+                delta = data.get("delta", {})
+                if delta.get("stop_reason"):
+                    stop_reason = delta["stop_reason"]
+                if data.get("usage"):
+                    usage.update(data["usage"])
+            elif event_type == "message_start":
+                message = data.get("message", {})
+                if message.get("usage"):
+                    usage.update(message["usage"])
+        mapped_calls = [
+            {"name": block["name"], "arguments": _json.loads(block["arguments_json"] or "{}") if block["arguments_json"] else {}, "id": block["id"]}
+            for block in tool_blocks.values()
+        ]
+        response = ModelResponse(
+            text="".join(text_parts),
+            tool_calls=tuple(mapped_calls),
+            model_id=self.model_id,
+            finish_reason=_FINISH_REASON_MAP.get(stop_reason, "stop"),
+            input_tokens=usage.get("input_tokens"),
+            output_tokens=usage.get("output_tokens"),
+            vendor_ref={"status": 200, "stream": True, "usage": safe_usage_ref({"prompt_tokens": usage.get("input_tokens"), "completion_tokens": usage.get("output_tokens")})},
+        )
         yield StreamEvent(kind="completed", payload=response)
 
     def estimate_cost(self, request: ModelRequest) -> dict[str, Any]:

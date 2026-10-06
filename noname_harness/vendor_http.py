@@ -172,3 +172,79 @@ def classify_http_status(status: int, raw: bytes) -> ModelAdapterError:
     if status == 400:
         return ModelAdapterError("invalid_request", "vendor rejected request (400)", vendor_ref=ref)
     return ModelAdapterError("unknown", f"vendor error ({status})", vendor_ref=ref)
+
+# A stream transport maps (url, headers, body_bytes, timeout) -> an iterator of
+# raw bytes lines (an SSE byte stream).  Tests inject a deterministic replay.
+StreamTransport = Callable[[str, dict[str, str], bytes, float], Any]
+
+
+def secure_stream_transport(url: str, headers: dict[str, str], body: bytes, timeout: float) -> Any:
+    """The default real SSE transport: a streaming POST that yields raw lines.
+
+    Redirects are refused (credentials never forwarded) and the response body
+    is read line by line as it arrives, so a real SSE stream is consumed
+    incrementally rather than buffered whole.  Errors mid-stream are raised as
+    classified ModelAdapterError.
+    """
+
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    try:
+        response = opener.open(request, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            raise ModelAdapterError(
+                "invalid_request",
+                f"endpoint redirected ({exc.code}); redirects are refused to protect credentials",
+            ) from exc
+        raise classify_http_status(exc.code, exc.read()) from exc
+    except (socket.timeout, TimeoutError) as exc:
+        raise ModelAdapterError("timeout", f"request timed out after {timeout}s") from exc
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (socket.timeout, TimeoutError)):
+            raise ModelAdapterError("timeout", f"request timed out after {timeout}s") from exc
+        raise ModelAdapterError(
+            "overloaded", f"cannot reach the endpoint: {type(exc.reason).__name__}"
+        ) from exc
+
+    def _lines() -> Any:
+        try:
+            with response:
+                for raw_line in response:
+                    yield raw_line
+        except (socket.timeout, TimeoutError) as exc:
+            raise ModelAdapterError("timeout", f"stream timed out after {timeout}s") from exc
+        except urllib.error.URLError as exc:
+            raise ModelAdapterError(
+                "overloaded", f"stream connection failed: {type(exc.reason).__name__}"
+            ) from exc
+
+    return _lines()
+
+
+def iter_sse(lines: Any) -> Any:
+    """Parse a Server-Sent-Events byte stream into JSON data payloads.
+
+    Yields the parsed JSON object of each ``data: {...}`` line.  Stops at
+    ``data: [DONE]``.  Lines that are not ``data:`` (comments, ``event:``,
+    blanks) are skipped; an unparseable ``data:`` line raises a classified
+    error rather than crashing the consumer.
+    """
+
+    for raw_line in lines:
+        try:
+            line = raw_line.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            continue
+        if not line or not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if payload == "[DONE]":
+            return
+        try:
+            yield json.loads(payload)
+        except ValueError as exc:
+            raise ModelAdapterError(
+                "unknown", f"malformed SSE data line: {exc}", vendor_ref={"line": payload[:100]}
+            ) from exc
+

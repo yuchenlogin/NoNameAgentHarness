@@ -33,6 +33,11 @@ from .adapters import (
     StreamEvent,
 )
 from .models import ModelCapability
+from .vendor_http import (
+    StreamTransport,
+    iter_sse,
+    secure_stream_transport,
+)
 from .vendor_http import _NoRedirectHandler  # re-exported for backwards-compatible imports
 from .vendor_http import (
     Transport,
@@ -70,6 +75,10 @@ class OpenAIAdapter:
     api_key: str | None = field(default=None, repr=False)
     # Opt-in escape hatch for plaintext HTTP (e.g. a local model server).
     allow_insecure: bool = False
+    # Optional SSE stream transport for true incremental streaming.  When
+    # set, stream() consumes the vendor's SSE endpoint incrementally; when
+    # None, stream() falls back to a complete-then-re-emit replay.
+    stream_transport: StreamTransport | None = None
 
     def id(self) -> str:
         return self.model_id
@@ -238,14 +247,76 @@ class OpenAIAdapter:
         return classify_http_status(status, raw)
 
     def stream(self, request: ModelRequest) -> Iterator[StreamEvent]:
-        # A minimal honest stream: complete once and re-emit.  True SSE
-        # streaming is a vendor concern layered on the same contract; the
-        # deterministic reference keeps stream == complete for auditability.
+        # True SSE streaming when a stream transport is configured; otherwise a
+        # deterministic complete-then-re-emit replay (still auditable).
+        if self.stream_transport is not None:
+            yield from self._stream_sse(request)
+            return
         response = self.complete(request)
         for call in response.tool_calls:
             yield StreamEvent(kind="tool_call", payload=call)
         if not response.tool_calls and response.text:
             yield StreamEvent(kind="text_delta", text=response.text)
+        yield StreamEvent(kind="completed", payload=response)
+
+    def _stream_sse(self, request: ModelRequest) -> Iterator[StreamEvent]:
+        """Consume the vendor's SSE endpoint, emitting incremental events."""
+
+        body = self._build_body(request)
+        # Ask the vendor for a stream.
+        import json as _json
+
+        payload = _json.loads(body.decode("utf-8"))
+        payload["stream"] = True
+        body = _json.dumps(payload).encode("utf-8")
+        lines = self.stream_transport(self._endpoint(), self._headers(), body, self.timeout)
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        usage: dict[str, Any] = {}
+        finish_reason = "stop"
+        for data in iter_sse(lines):
+            # usage may ride the final chunk's top-level field (OpenAI streams it
+            # separately from the choices array, often with stream_options).
+            if data.get("usage"):
+                usage = data["usage"]
+            choices = data.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {})
+            chunk_text = delta.get("content")
+            if chunk_text:
+                text_parts.append(chunk_text)
+                yield StreamEvent(kind="text_delta", text=chunk_text)
+            for call in delta.get("tool_calls", []) or []:
+                function = call.get("function", {})
+                arguments = function.get("arguments", "")
+                if function.get("name"):
+                    tool_calls.append(
+                        {"name": function["name"], "arguments": arguments, "id": call.get("id")}
+                    )
+                    yield StreamEvent(
+                        kind="tool_call",
+                        payload={"name": function["name"], "arguments": arguments, "id": call.get("id")},
+                    )
+            if choices[0].get("finish_reason"):
+                finish_reason = choices[0]["finish_reason"]
+        # Parse accumulated tool-call arguments (SSE streams them as fragments).
+        mapped_calls = []
+        for call in tool_calls:
+            try:
+                arguments = _json.loads(call["arguments"]) if isinstance(call["arguments"], str) else call["arguments"]
+            except ValueError:
+                arguments = {"_raw": call["arguments"]}
+            mapped_calls.append({"name": call["name"], "arguments": arguments, "id": call["id"]})
+        response = ModelResponse(
+            text="".join(text_parts),
+            tool_calls=tuple(mapped_calls),
+            model_id=self.model_id,
+            finish_reason=finish_reason,
+            input_tokens=usage.get("prompt_tokens"),
+            output_tokens=usage.get("completion_tokens"),
+            vendor_ref={"status": 200, "stream": True, "usage": usage},
+        )
         yield StreamEvent(kind="completed", payload=response)
 
     def estimate_cost(self, request: ModelRequest) -> dict[str, Any]:
