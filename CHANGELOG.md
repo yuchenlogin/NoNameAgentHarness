@@ -2,6 +2,27 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.26.0] - 2026-10-07
+
+### Features
+
+- Causal Map 独立交互图落地——账本 UI 的最后一块（ledger §2.2，经一轮对抗性审查——CONTESTED 后修复，含一次品味边界的真实违反——schema 不变，仍为 v7）：新增 `noname_harness/causal_map.py`。`build_causal_model` 从 append-only 事件与 provenance 派生「结果→依赖」关系（纯投影、可重建，账本自身不创造事实）；`render_causal_html` 渲染为 `<details>` 渐进披露，嵌入账本 HTML 成为第四视图（收件箱/状态/因果图/时间线）。
+- 三类结果节点：法典 revision（依赖 source_event_ids 的用户指令/证据 + 审核提案的批准人）、上下文包（依赖选中的证据/记忆 + 模型配方 + 目标模型）、受审批工具执行（依赖审批令牌 + 工具结果）。
+- 品味边界修复（审查发现的真实违反）：active 品味引用的「model moment」事件在因果图中标为「影响了排序/表达」（kind=taste，软影响），并从「选中的证据/记忆」中减去——让人区分「态度塑造了表达」与「事实支持了结论」。
+- 审查加固：canon 依赖按 id 单独解析（`store.get_event`，不受 display window 限制）；truncation 加「历史被截断」标注；审批令牌对照 `tool.approval_granted` 核实（匹配显示「人工审批（由 X 批准）」，伪造标「未在账本中核实」）；recipe 角色改称「模型配方」不过度声称；非字符串 task 不崩。
+- 端到端验证：`model.answer` 标 [taste] 影响了排序/表达，`workspace.snapshot` / `project.constraint` 标 [event] 选中的证据/记忆，`code-change-balanced` 标 [recipe] 模型配方——三种角色清晰区分。
+
+### Design Rationale
+
+- **为什么品味引用的事件在因果图中必须标为软影响而非证据**：store 为溯源完整会把品味来源并入包 provenance，但因果图若把它们标为「选中的证据」，就把「这个回答让我眼前一亮」误读成「这个事实支持了结论」。区分「影响了排序/表达」与「选中的证据/记忆」，才能让人真正识别错误来自证据、记忆、路由、模型还是工具。
+- **为什么审批令牌必须对照账本核实**：一个 `tool.completed` 事件可以携带任意 token id——伪造事件也能。账本的意义就是门不能自证；只有匹配的 `tool.approval_granted` 存在才显示「人工审批（由 X 批准）」，否则标「未在账本中核实」。
+
+### Notes & Caveats
+
+- Causal Map 目前是单方向「结果→依赖」，尚无反向查询「这个证据被哪些结果依赖」。
+- truncation（display window 截断）已在图中标注「历史被截断」，非静默省略。
+- 新增 13 个测试，总数到 394。
+
 ## [0.25.0] - 2026-10-07
 
 ### Features
