@@ -1203,6 +1203,66 @@ class HarnessStore:
             for similarity, row in scored[:limit]
         ]
 
+    def search_events_ranked(
+        self,
+        query: str,
+        embedding_fn: Any,
+        *,
+        session_id: str | None = None,
+        limit: int = 20,
+        min_similarity: float = 0.0,
+        rerank_fn: Any = None,
+    ) -> list[dict[str, Any]]:
+        """Three-stage retrieval: recall + rerank + construct (docs/memory-model §6).
+
+        Stage 1 (recall) runs :meth:`search_events_semantic`.  Stage 2 (rerank)
+        re-orders the candidates by task relevance, source quality, review
+        status and freshness via an injectable ``RerankFn`` (default
+        :func:`noname_harness.rerank.default_rerank`).  Stage 3 (construct)
+        returns each result with its short ref id and the ``rerank_reasons``
+        behind its placement, so the ordering is explainable.
+
+        Reranking is a projection: it re-orders and annotates, never alters the
+        underlying events/evidence.
+        """
+
+        from .rerank import default_rerank
+
+        if rerank_fn is None:
+            rerank_fn = default_rerank
+        # Recall (reuses the semantic recall with its guards).
+        recalled = self.search_events_semantic(
+            query,
+            embedding_fn,
+            session_id=session_id,
+            limit=limit,
+            min_similarity=min_similarity,
+        )
+        # Promoted event ids (canon/task state) feed the review-status signal.
+        promoted = frozenset(
+            event_id
+            for item in self.active_state("high") + self.active_state("mid")
+            for event_id in item["source_event_ids"]
+        )
+        # Attach evidence counts for the source-quality signal.
+        for hit in recalled:
+            hit["evidence"] = self.evidence_for_event(hit["event"].id)
+        if rerank_fn is default_rerank:
+            import functools
+
+            rerank_fn = functools.partial(default_rerank, promoted_event_ids=promoted)
+        ranked = rerank_fn(query, recalled)
+        return [
+            {
+                "event": item.event,
+                "similarity": item.similarity,
+                "ref_id": item.ref_id,
+                "score": item.score,
+                "rerank_reasons": list(item.rerank_reasons),
+            }
+            for item in ranked[:limit]
+        ]
+
     def check_event_ids(self, source_event_ids: Sequence[str]) -> None:
         """Public contract: assert every cited source event exists.
 

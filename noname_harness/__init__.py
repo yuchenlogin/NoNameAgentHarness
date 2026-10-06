@@ -14,6 +14,7 @@ from .card_images import GeneratedImage, local_typographic_image, card_image_for
 from .extractor import ExtractionCandidate, MemoryExtractor, rule_based_extractor
 from .llm_extractor import LLMExtractor
 from .embedding_service import OpenAIEmbedding, load_openai_embedding
+from .rerank import RankedCandidate, default_rerank
 from .adapters import (
     AdapterDriver,
     LocalEchoAdapter,
@@ -69,6 +70,8 @@ __all__ = [
     "LLMExtractor",
     "OpenAIEmbedding",
     "load_openai_embedding",
+    "RankedCandidate",
+    "default_rerank",
     "load_openai_adapter",
     "LocalEchoAdapter",
     "ModelAdapterError",

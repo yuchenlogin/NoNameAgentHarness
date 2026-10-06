@@ -111,6 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--session")
     search.add_argument("--limit", type=int, default=20)
     search.add_argument("--semantic", action="store_true", help="use vector/semantic recall (requires an embedding index)")
+    search.add_argument("--ranked", action="store_true", help="rerank semantic results by relevance/source/review/freshness (implies --semantic)")
 
     embed = sub.add_parser("embed", parents=[_db_parent()], help="(re)build the vector recall projection")
     embed.add_argument("--session")
@@ -297,7 +298,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 destination.write_text(html_text, encoding="utf-8")
                 _print({"path": str(destination), "events": model["counts"]["events"]})
             elif args.command == "search":
-                if args.semantic:
+                if args.ranked:
+                    from .embeddings import local_hash_embedding
+
+                    _print(
+                        [
+                            {
+                                **_event_dict(hit["event"]),
+                                "similarity": hit["similarity"],
+                                "ref_id": hit["ref_id"],
+                                "score": hit["score"],
+                                "rerank_reasons": hit["rerank_reasons"],
+                            }
+                            for hit in store.search_events_ranked(
+                                args.query,
+                                local_hash_embedding,
+                                session_id=args.session,
+                                limit=args.limit,
+                            )
+                        ]
+                    )
+                elif args.semantic:
                     from .embeddings import local_hash_embedding
 
                     _print(
