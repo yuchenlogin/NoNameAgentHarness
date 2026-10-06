@@ -56,6 +56,7 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 - **FTS5**（默认文字检索，可重建索引）。
 - **向量投影**（可重建，`event_embeddings`，schema v7）：词面级 `local_hash_embedding`（默认，无网络可验证）。
 - **真语义 embedding 服务**：`OpenAIEmbedding`（复用 `vendor_http` 凭证安全基类），真语义召回（如英文查询召回中文相关事件）。
+- **重排已落地**：`rerank.py`（`RerankFn` 协议 + `default_rerank` 确定性多维评分），三阶段（召回 / 重排 / 构造）闭环，每条结果带可解释 `rerank_reasons`。
 
 ## 真实模型接入 · 协议经多供应商验证
 
@@ -74,7 +75,6 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 
 这些都是已明确记录的增强项或更深的系统层，**不是核心缺口**：
 
-- **语义重排（rerank）**：检索三阶段中"重排"目前只有相似度+新鲜度，无独立 reranker 模型。
 - **真实图像模型插件**：品味卡片默认抽象排版渲染器已落地，真实 imagegen 插件待注入。
 - **Causal Map 独立交互图**：账本目前以时间线节点带来源标注，独立的因果交互图属下一步。
 - **真流式 SSE**：`stream()` 目前是 complete 重放的诚实占位，非真实供应商流式。

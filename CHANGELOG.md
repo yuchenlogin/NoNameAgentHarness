@@ -2,6 +2,27 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.24.0] - 2026-10-07
+
+### Features
+
+- 语义重排（rerank）落地，检索三阶段闭环（memory-model §6，经一轮对抗性审查——CONTESTED 后修复——schema 不变，仍为 v7）：新增 `noname_harness/rerank.py`。`RerankFn` 协议（query, candidates → 重排候选，可注入）+ 确定性多维评分器 `default_rerank`（按 §6 契约维度：任务相关性=向量相似度、来源质量=证据数+高信号事件类型、审核状态=是否已提升为法典/任务态、新鲜度=真半衰期时间衰减）。真实 reranker 模型按同一协议注入。
+- `store.search_events_ranked`：召回（复用 `search_events_semantic` 及其守卫）→ 重排 → 构造（带 `score` / `ref_id` / `rerank_reasons`）。
+- 重排是投影不引入新事实：只改变呈现顺序与理由标注，绝不改变事件/证据；每条结果带 `rerank_reasons` 可解释。
+- 审查加固：review-status 标记在候选自身（`hit["promoted"]`），包装/自定义 reranker 都可见不丢信号；真半衰期 `2**(-age/half_life)`；坏时间戳不崩；N+1 evidence 改一条 GROUP BY 聚合；审核状态按查询 session 过滤；CLI 空索引提示；权重可配置 keyword 参数；删 `RerankProtocol` 冗余。
+- CLI：`search --ranked`（隐含 `--semantic`，带 score 与 rerank_reasons）。
+
+### Design Rationale
+
+- **为什么重排是投影不引入新事实**：重排只改变候选的呈现顺序与理由标注，绝不改变事件/证据；原始召回顺序永远可恢复，每条结果带 `rerank_reasons` 让人看见「为什么排在这」而非只看见「排在这」。
+- **为什么 review-status 要标记在候选自身而非 kwarg**：`functools.partial`/装饰器包装默认 reranker 时身份检查会静默丢信号；标记在候选上让任何 reranker（默认/包装/自定义）都看见，注入永不分叉。
+
+### Notes & Caveats
+
+- `default_rerank` 是确定性替身（多维启发式评分），真实 reranker 模型待注入。
+- 各维度权重可通过 keyword 参数配置。
+- 新增 12 个测试，总数到 367。
+
 ## [0.23.0] - 2026-10-07
 
 ### Features
