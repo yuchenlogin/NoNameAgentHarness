@@ -119,3 +119,84 @@ def test_rerank_fn_is_injectable(tmp_path):
         assert called["n"] >= 1
     finally:
         store.close()
+
+
+# --- 对抗性审查发现的回归 ---
+
+def test_true_half_life_decay():
+    from noname_harness.rerank import _freshness_score
+    reference = "2026-10-31T00:00:00Z"
+    # At exactly 30 days the score is 0.5 (a true half-life, not 1/e).
+    score_30 = _freshness_score("2026-10-01T00:00:00Z", reference)
+    assert score_30 == pytest.approx(0.5, abs=0.01)
+
+
+def test_freshness_handles_bad_timestamps_without_crashing():
+    from noname_harness.rerank import _freshness_score
+    assert _freshness_score(None, "2026-10-02T00:00:00Z") == 0.5
+    assert _freshness_score(123, "2026-10-02T00:00:00Z") == 0.5
+    assert _freshness_score("not a date", "2026-10-02T00:00:00Z") == 0.5
+    assert _freshness_score("2026-10-01T00:00:00", "2026-10-02T00:00:00Z") == 0.5  # naive
+
+
+def test_wrapped_default_rerank_keeps_review_signal(tmp_path):
+    """A partial-wrapped default reranker must still see the review-status boost."""
+    store, _ = make_store(tmp_path)
+    try:
+        event = store.append_event("s", "decision.accepted", {"key": "db", "content": {"text": "用连接池"}})
+        proposal = store.create_proposal("high", "db", {"text": "用连接池"}, [event.id])
+        store.review_proposal(proposal["id"], "accept", "user")
+        store.append_event("s", "note", {"text": "数据库"})
+        store.build_embedding_index(local_hash_embedding)
+        import functools
+        # Wrap default_rerank in partial (the case that used to lose the signal).
+        wrapped = functools.partial(default_rerank, reference_time="2026-12-01T00:00:00Z")
+        ranked = store.search_events_ranked("数据库", local_hash_embedding, rerank_fn=wrapped)
+        decision_hit = next(h for h in ranked if h["event"].event_type == "decision.accepted")
+        assert any("已提升为法典" in r for r in decision_hit["rerank_reasons"])
+    finally:
+        store.close()
+
+
+def test_review_signal_is_session_scoped(tmp_path):
+    """A promotion in session B must not boost candidates from session A."""
+    store, _ = make_store(tmp_path)
+    try:
+        # Promote a decision in session B.
+        eb = store.append_event("b", "decision.accepted", {"key": "db", "content": {"text": "x"}})
+        pb = store.create_proposal("high", "db", {"text": "x"}, [eb.id])
+        store.review_proposal(pb["id"], "accept", "user")
+        # A same-type event in session A (not promoted).
+        store.append_event("a", "decision.accepted", {"key": "other", "content": {"text": "y"}})
+        store.build_embedding_index(local_hash_embedding)
+        ranked = store.search_events_ranked("x", local_hash_embedding, session_id="a")
+        a_hit = next(h for h in ranked if h["event"].session_id == "a")
+        # The session-A event does NOT get the review boost from session B's promotion.
+        assert not any("已提升为法典" in r for r in a_hit["rerank_reasons"])
+    finally:
+        store.close()
+
+
+def test_weights_are_configurable():
+    candidates = [
+        {"event": _event("a", "test.failed"), "similarity": 0.5, "ref_id": "a", "evidence": [{"id": "e"}]},
+        {"event": _event("b", "note"), "similarity": 0.6, "ref_id": "b", "evidence": []},
+    ]
+    # Zero out the source weight: the bare high-similarity note now wins.
+    ranked = default_rerank(
+        "q", candidates, reference_time="2026-10-02T00:00:00Z",
+        weights={"source": 0.0, "review": 0.0, "fresh": 0.0},
+    )
+    assert ranked[0].event.id == "b"
+
+
+def test_empty_index_hint_on_cli(tmp_path, capsys):
+    from noname_harness.cli import main
+    root = tmp_path / "project"
+    root.mkdir()
+    db = root / ".noname" / "harness.db"
+    assert main(["init", "--db", str(db), "--root", str(root)]) == 0
+    capsys.readouterr()
+    assert main(["search", "hello", "--db", str(db), "--ranked"]) == 0
+    err = capsys.readouterr().err
+    assert "embed" in err

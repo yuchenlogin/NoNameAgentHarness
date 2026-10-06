@@ -19,8 +19,10 @@ separate and never reranked here.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from datetime import datetime
+from typing import Any, Callable
 
 # A rerank function maps (query, candidates) to re-scored, re-ordered candidates.
 RerankFn = Callable[[str, list[dict[str, Any]]], list["RankedCandidate"]]
@@ -37,11 +39,6 @@ class RankedCandidate:
     rerank_reasons: tuple[str, ...]
 
 
-class RerankProtocol(Protocol):
-    def __call__(self, query: str, candidates: list[dict[str, Any]]) -> list[RankedCandidate]:
-        ...
-
-
 # Signal weights for the default scorer.  These are coarse, documented
 # heuristics -- a real reranker model replaces them behind the same protocol.
 _W_RELEVANCE = 1.0      # task relevance (vector similarity)
@@ -56,19 +53,18 @@ _HIGH_SIGNAL_TYPES = {"test.failed", "artifact.changed", "decision.accepted", "t
 def _freshness_score(occurred_at: str, reference: str) -> float:
     """A simple recency score in [0, 1]: newer is higher, ~30-day half-life."""
 
+    def parse(text: str) -> datetime:
+        if not isinstance(text, str):
+            raise TypeError("timestamp must be a string")
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
     try:
-        from datetime import datetime
-
-        def parse(text: str) -> datetime:
-            return datetime.fromisoformat(text.replace("Z", "+00:00"))
-
         age_seconds = max(0.0, (parse(reference) - parse(occurred_at)).total_seconds())
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
         return 0.5
     half_life = 30 * 24 * 3600
-    import math
-
-    return math.exp(-age_seconds / half_life)
+    # A true half-life decay: the score is 0.5 at exactly one half-life.
+    return 2.0 ** (-age_seconds / half_life)
 
 
 def default_rerank(
@@ -78,6 +74,7 @@ def default_rerank(
     promoted_event_ids: frozenset[str] = frozenset(),
     reference_time: str | None = None,
     now_fn: Callable[[], str] | None = None,
+    weights: dict[str, float] | None = None,
 ) -> list[RankedCandidate]:
     """A deterministic multi-dimensional reranker (the contract's dimensions).
 
@@ -89,10 +86,18 @@ def default_rerank(
     """
 
     if now_fn is None:
-        from datetime import datetime, timezone
+        from datetime import timezone
 
         now_fn = lambda: datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     reference = reference_time or now_fn()
+    w = {
+        "relevance": _W_RELEVANCE,
+        "source": _W_SOURCE,
+        "review": _W_REVIEW,
+        "fresh": _W_FRESH,
+    }
+    if weights:
+        w.update(weights)
 
     ranked: list[RankedCandidate] = []
     for candidate in candidates:
@@ -101,7 +106,7 @@ def default_rerank(
         reasons: list[str] = []
 
         # Task relevance (dominant signal).
-        relevance = _W_RELEVANCE * similarity
+        relevance = w["relevance"] * similarity
         reasons.append(f"相关性 {similarity:.2f}")
 
         # Source quality: evidence count + high-signal event type.
@@ -114,9 +119,11 @@ def default_rerank(
             source_score += 0.5
             reasons.append(f"高信号类型 {event.event_type}")
 
-        # Review status: promoted to durable canon/task state.
+        # Review status: promoted to durable canon/task state.  Read from the
+        # candidate's own ``promoted`` flag (set by the store) so the signal is
+        # available no matter how this reranker was invoked or wrapped.
         review_score = 0.0
-        if event.id in promoted_event_ids:
+        if candidate.get("promoted") or event.id in promoted_event_ids:
             review_score = 1.0
             reasons.append("已提升为法典/任务态")
 
@@ -126,9 +133,9 @@ def default_rerank(
 
         score = (
             relevance
-            + _W_SOURCE * source_score
-            + _W_REVIEW * review_score
-            + _W_FRESH * fresh
+            + w["source"] * source_score
+            + w["review"] * review_score
+            + w["fresh"] * fresh
         )
         ranked.append(
             RankedCandidate(

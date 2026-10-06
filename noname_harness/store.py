@@ -1228,8 +1228,6 @@ class HarnessStore:
 
         from .rerank import default_rerank
 
-        if rerank_fn is None:
-            rerank_fn = default_rerank
         # Recall (reuses the semantic recall with its guards).
         recalled = self.search_events_semantic(
             query,
@@ -1239,18 +1237,26 @@ class HarnessStore:
             min_similarity=min_similarity,
         )
         # Promoted event ids (canon/task state) feed the review-status signal.
+        # Scoped to the queried session when one is given, so an unrelated
+        # session's promotion cannot boost these candidates.
         promoted = frozenset(
             event_id
             for item in self.active_state("high") + self.active_state("mid")
             for event_id in item["source_event_ids"]
+            if session_id is None or self._event_session(event_id) == session_id
         )
-        # Attach evidence counts for the source-quality signal.
+        # Evidence counts for the source-quality signal, in ONE aggregate query
+        # (not N+1 full-row fetches).
+        event_ids = [hit["event"].id for hit in recalled]
+        evidence_counts = self._evidence_counts(event_ids)
         for hit in recalled:
-            hit["evidence"] = self.evidence_for_event(hit["event"].id)
-        if rerank_fn is default_rerank:
-            import functools
-
-            rerank_fn = functools.partial(default_rerank, promoted_event_ids=promoted)
+            hit["evidence"] = [None] * evidence_counts.get(hit["event"].id, 0)
+            # Review-status is marked on the candidate itself, so ANY reranker
+            # (default, partial-wrapped, or custom) sees it without needing a
+            # special kwarg -- injectability never forks the signal.
+            hit["promoted"] = hit["event"].id in promoted
+        if rerank_fn is None:
+            rerank_fn = default_rerank
         ranked = rerank_fn(query, recalled)
         return [
             {
@@ -1262,6 +1268,25 @@ class HarnessStore:
             }
             for item in ranked[:limit]
         ]
+
+    def _evidence_counts(self, event_ids: list[str]) -> dict[str, int]:
+        """Evidence span counts per event id, in a single aggregate query."""
+
+        if not event_ids:
+            return {}
+        placeholders = ",".join("?" for _ in event_ids)
+        rows = self._connection.execute(
+            f"SELECT event_id, COUNT(*) AS n FROM evidence_spans "
+            f"WHERE event_id IN ({placeholders}) GROUP BY event_id",
+            tuple(event_ids),
+        ).fetchall()
+        return {row["event_id"]: row["n"] for row in rows}
+
+    def _event_session(self, event_id: str) -> str | None:
+        row = self._connection.execute(
+            "SELECT session_id FROM session_events WHERE id = ?", (event_id,)
+        ).fetchone()
+        return row["session_id"] if row else None
 
     def check_event_ids(self, source_event_ids: Sequence[str]) -> None:
         """Public contract: assert every cited source event exists.

@@ -301,6 +301,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.ranked:
                     from .embeddings import local_hash_embedding
 
+                    if not store.query("SELECT 1 FROM event_embeddings LIMIT 1"):
+                        print(
+                            "hint: embedding index is empty; run `embed` first for semantic/ranked search",
+                            file=sys.stderr,
+                        )
                     _print(
                         [
                             {
