@@ -60,9 +60,14 @@ CREATE TRIGGER IF NOT EXISTS state_revisions_supersede_guard
 BEFORE INSERT ON state_revisions
 WHEN NEW.supersedes_id IS NOT NULL
 BEGIN
-    SELECT RAISE(ABORT, 'supersede target must be an existing, different state revision')
+    SELECT RAISE(ABORT, 'supersede target must be an existing, different state revision in the same layer and key')
     WHERE NEW.supersedes_id = NEW.id
-       OR NOT EXISTS (SELECT 1 FROM state_revisions WHERE id = NEW.supersedes_id);
+       OR NOT EXISTS (
+           SELECT 1 FROM state_revisions
+           WHERE id = NEW.supersedes_id
+             AND layer = NEW.layer
+             AND logical_key = NEW.logical_key
+       );
 END;
 """
 
@@ -1281,11 +1286,39 @@ class HarnessStore:
         if layer not in VALID_LAYERS:
             raise ValueError(f"invalid layer: {layer}")
         rows = self._connection.execute(
-            "SELECT * FROM state_revisions WHERE layer = ? AND logical_key = ? "
-            "ORDER BY created_at, rowid",
+            "SELECT * FROM state_revisions WHERE layer = ? AND logical_key = ?",
             (layer, logical_key),
         ).fetchall()
-        return [
+        by_id = {row["id"]: row for row in rows}
+        if not rows:
+            return []
+        # Walk the supersedes chain from the true head (the revision nothing in
+        # this key supersedes), NOT by wall-clock created_at -- a clock that
+        # moves backwards between reviews would otherwise invert the chain and
+        # show the superseded parent as the head.  Append-only triggers plus the
+        # one-child-per-parent index make exactly one head per key.
+        superseded = {row["supersedes_id"] for row in rows if row["supersedes_id"]}
+        heads = [row for row in rows if row["id"] not in superseded]
+        head = heads[0] if heads else rows[-1]  # pragma: no cover - defensive
+        chain: list[Any] = []
+        current = head
+        seen = {head["id"]}
+        broken = False
+        while True:
+            chain.append(current)
+            parent_id = current["supersedes_id"]
+            if parent_id is None:
+                break
+            parent = by_id.get(parent_id)
+            if parent is None or parent["id"] in seen:
+                # A missing or cycling parent: mark the lineage broken rather
+                # than silently truncating the audit trail.
+                broken = True
+                break
+            seen.add(parent["id"])
+            current = parent
+        chain.reverse()
+        result = [
             {
                 "id": row["id"],
                 "layer": row["layer"],
@@ -1300,9 +1333,11 @@ class HarnessStore:
                 "valid_from": row["valid_from"],
                 "valid_to": row["valid_to"],
                 "created_at": row["created_at"],
+                "broken_lineage": broken,
             }
-            for row in rows
+            for row in chain
         ]
+        return result
 
     def _evidence_counts(self, event_ids: list[str]) -> dict[str, int]:
         """Evidence span counts per event id, in a single aggregate query."""

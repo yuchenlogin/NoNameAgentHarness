@@ -70,11 +70,16 @@ def build_state_diff_model(store: HarnessStore) -> dict[str, Any]:
             }
         )
 
-    # Taste-card evolution chains.
+    # Taste-card evolution chains.  Heads are found in ONE query (the same
+    # supersedes-set filter _head_rows uses), not four full-table scans; each
+    # chain is then walked with single-row lookups (no redundant projections).
     cards_service = TasteCardService(store)
+    all_card_rows = store.query("SELECT * FROM taste_cards")
+    superseded_ids = {row["supersedes_id"] for row in all_card_rows if row["supersedes_id"]}
+    heads = [row for row in all_card_rows if row["id"] not in superseded_ids]
     card_chains = []
-    for card in cards_service.by_status("active") + cards_service.by_status("retired") + cards_service.by_status("paused") + cards_service.by_status("candidate"):
-        chain = _card_chain(cards_service, card)
+    for head_row in heads:
+        chain = _card_chain(cards_service, cards_service.get(head_row["id"]))
         if chain:
             card_chains.append(chain)
 
@@ -89,6 +94,11 @@ def _describe_delta(previous: dict[str, Any], current: dict[str, Any]) -> str:
     """A short human description of what changed between two revisions."""
 
     if current["status"] == "retired":
+        # A retire built from a *different* proposal content than the current
+        # head is a silent content mutation on the way out -- surface it, do
+        # not hide it behind the bare "retired" label.
+        if previous["content"] != current["content"]:
+            return "失效（内容同时变更，保留历史）"
         return "失效（retired，保留历史）"
     if previous["content"] != current["content"]:
         return "内容被新版本取代"
@@ -101,13 +111,16 @@ def _card_chain(cards_service: TasteCardService, head: dict[str, Any]) -> dict[s
     lineage = [head]
     current = head
     seen = {head["id"]}
+    broken = False
     while current.get("supersedes_id"):
         parent_id = current["supersedes_id"]
         if parent_id in seen:
+            broken = True
             break
         try:
             parent = cards_service.get(parent_id)
         except KeyError:
+            broken = True
             break
         seen.add(parent_id)
         lineage.append(parent)
@@ -115,8 +128,13 @@ def _card_chain(cards_service: TasteCardService, head: dict[str, Any]) -> dict[s
     lineage.reverse()
     if not lineage:
         return None
+    root_title = lineage[0]["title"] if lineage else head["title"]
+    display_title = (
+        root_title if root_title == head["title"] else f"{root_title} → {head['title']}"
+    )
     return {
-        "title": head["title"],
+        "title": display_title,
+        "broken_lineage": broken,
         "head_status": head["status"],
         "versions": [
             {
@@ -144,11 +162,17 @@ def render_state_diff_html(model: dict[str, Any]) -> str:
         for version in diff["versions"]:
             head_mark = ' <span class="badge">当前</span>' if version["is_head"] else ""
             status_class = "retired" if version["status"] == "retired" else "active"
-            delta = (
-                f'<span class="delta">← {html.escape(version["delta_from_previous"])}</span>'
-                if version["delta_from_previous"]
-                else '<span class="delta added">← 新增</span>'
-            )
+            if version.get("broken_lineage"):
+                delta = '<span class="delta broken">← 链断裂（provenance 不完整）</span>'
+            elif version["delta_from_previous"]:
+                delta = f'<span class="delta">← {html.escape(version["delta_from_previous"])}</span>'
+            elif version["status"] == "retired":
+                # A first version that is already retired must not be labelled
+                # "added" -- it was dead on arrival.
+                delta = '<span class="delta">← 新增即失效</span>'
+            else:
+                delta = '<span class="delta added">← 新增</span>'
+            
             validity = ""
             if version["valid_from"] or version["valid_to"]:
                 validity = (
