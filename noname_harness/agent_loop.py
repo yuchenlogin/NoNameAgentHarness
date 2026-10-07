@@ -70,7 +70,12 @@ _TRANSITIONS: dict[str, set[str]] = {
     "CHECKING_STOP": {"CALLING_MODEL", "COMPLETED", "FAILED", "CANCELLED"},
     "COMPLETED": set(),
     "FAILED": set(),
-    "CANCELLED": set(),
+    # CANCELLED -> ASSEMBLING_CONTEXT is reachable ONLY via resume(): a run
+    # that stopped on waiting_approval re-enters the machine at the assembly
+    # stage once approval is granted.  It is declared here explicitly so the
+    # legal-transition table stays the single source of truth; a plain
+    # transition into CANCELLED still cannot be followed by anything else.
+    "CANCELLED": {"ASSEMBLING_CONTEXT"},
 }
 
 
@@ -124,6 +129,9 @@ class AgentLoop:
     tool_registry: Any = None
     _state: str = field(default="IDLE", init=False)
     _rounds: int = field(default=0, init=False)
+    # Resume scratch state: set by resume() before re-entering the machine,
+    # consumed by _drive() at the assembly stage.
+    _resume_context: dict[str, Any] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if not self.session_id.strip():
@@ -201,6 +209,38 @@ class AgentLoop:
                 "budget_rounds": self.budget_rounds,
             },
         )
+        return self._drive(task, task_type=task_type)
+
+    def _drive(
+        self,
+        task: str,
+        *,
+        task_type: str | None = None,
+    ) -> dict[str, Any]:
+        """Assemble context and drive the machine to a terminal state.
+
+        Shared by run() (fresh run) and resume() (continuation of a
+        waiting_approval run): the driver loop below is identical for both.
+        A resume scratch (``_resume_context``) is consumed at the assembly
+        stage, so a continuation round is recorded and driven exactly like a
+        normal one.
+
+        Defence in depth (NOT a security boundary): the private entry accepts
+        only a fresh loop (IDLE, entered by run()) or a resume loop that was
+        explicitly parked at CANCELLED with its scratch context set by
+        resume().  This catches in-process callers that try to re-drive a
+        finished/cancelled loop around the public gates; Python's privacy is
+        by convention, so the real gate stays in resume().
+        """
+
+        if self._state != "IDLE" and not (
+            self._state == "CANCELLED" and self._resume_context is not None
+        ):
+            raise AgentLoopError(
+                f"_drive() requires a fresh (IDLE) loop or a resume()-prepared "
+                f"(CANCELLED + resume context) loop, not state {self._state!r}"
+            )
+
         context: dict[str, Any] = {}
         last_tool_result: Any = None
         try:
@@ -208,6 +248,15 @@ class AgentLoop:
             context = self.store.assemble_context_package(
                 task, session_id=self.session_id, task_type=task_type
             )
+            if self._resume_context is not None:
+                # A resumed run carries the approval evidence of the paused
+                # turn into the assembled package: the driver sees WHICH gated
+                # call was waiting and its one-time token id, and decides how
+                # to continue (typically: re-issue that exact call carrying
+                # the token).  The token itself is never serialised -- only
+                # its id, which is useless without the registry's live grants.
+                context["resume"] = self._resume_context
+                self._resume_context = None
             # Inject the model-visible tool contracts so the driver can tell
             # the model which tools exist (contracts only, never
             # implementations).  Without this the model could only hallucinate
@@ -249,18 +298,28 @@ class AgentLoop:
                                 "reason": "pre-flight: gated tool call lacks a valid approval token",
                             },
                         )
-                        self._transition(
-                            "CANCELLED",
-                            {
-                                "reason": "waiting_approval",
-                                "pending_tool": pending.get("name"),
-                                "pending_index": calls.index(pending),
-                            },
-                        )
+                        # The pending call is identified by name + index +
+                        # arguments *hash* (never the raw model-controlled
+                        # arguments) so resume() can verify a presented token
+                        # is bound to THIS exact call before re-entering.
+                        from .tools import _safe_arguments_hash
+
+                        pending_hash = _safe_arguments_hash(pending.get("arguments", {}))
+                        pending_detail = {
+                            "reason": "waiting_approval",
+                            "pending_tool": pending.get("name"),
+                            "pending_index": calls.index(pending),
+                            "pending_arguments_hash": pending_hash,
+                        }
+                        self._transition("CANCELLED", pending_detail)
                         return self._summary(
                             "waiting_approval",
                             context,
-                            output={"pending_tool": pending.get("name"), "pending_index": calls.index(pending)},
+                            output={
+                                "pending_tool": pending.get("name"),
+                                "pending_index": calls.index(pending),
+                                "pending_arguments_hash": pending_hash,
+                            },
                         )
                     self._transition("WAITING_TOOL", {"tools": [c.get("name") for c in calls]})
                     results = []
@@ -328,6 +387,218 @@ class AgentLoop:
             summary = self._summary("unrecoverable_error", context, error=error_text)
             summary.update(error_detail)
             return summary
+
+    # ------------------------------------------------------------------
+    # resume: continue a run that paused on waiting_approval
+    # ------------------------------------------------------------------
+    @classmethod
+    def resume(
+        cls,
+        store: HarnessStore,
+        session_id: str,
+        driver: SessionDriver,
+        *,
+        approval_token: Any,
+        tool_registry: Any = None,
+        actor_id: str = "system",
+    ) -> dict[str, Any]:
+        """Resume a run whose last terminal state is waiting_approval.
+
+        Recovery is a READ-ONLY rebuild of the paused run's truth from the
+        event stream (task, limits, round count, pending tool call), followed
+        by re-entering the state machine with rounds inherited.  It is not a
+        new run: no new ``loop.started`` is written, the round counter
+        continues where the current run's stream left off, and ``max_rounds``
+        keeps binding across the pause -- resume can never be a backdoor
+        around the budget.
+
+        Gate rules (all violations raise :class:`AgentLoopError` loudly, no
+        events written):
+
+        - only a run whose most recent ``loop.finished`` has
+          ``stop_reason == "waiting_approval"`` may resume;
+        - one resume PER PAUSE (seq-scoped): a ``loop.resumed`` event vetoes
+          resuming the pause it belongs to (i.e. the pause whose
+          ``loop.finished`` precedes it); a LATER pause (a newer
+          waiting_approval finish) gets its own fresh resume;
+        - the presented approval token must be a LIVE token bound to the
+          pending call (tool name + exact-arguments hash, when the stream
+          recorded it) -- checked against the registry without consuming it,
+          so a wrong or consumed token fails before any transition is
+          recorded.
+
+        Gates 1 and 2 plus the ``loop.resumed`` ledger write run inside a
+        single ``BEGIN IMMEDIATE`` transaction (the store's standard write
+        primitive), so two concurrent actors cannot both pass the check:
+        the second blocks on the write lock, then re-reads the ledger and
+        sees the first actor's ``loop.resumed``.  Gate 3 (token lookup) is
+        intentionally OUTSIDE that transaction: the registry's live grants
+        are process-local, and the token's one-time consumption is arbitrated
+        by the registry at execution time.
+
+        Round inheritance is scoped to the CURRENT run: only transitions
+        recorded after the most recent ``loop.started`` count.  Earlier runs
+        in the same session never spend this run's budget.
+
+        Trust boundary: the event stream has no author concept, so resume()
+        trusts the recorded ``loop.finished`` / ``loop.started`` contents.
+        An actor able to write this session's event stream is already
+        trusted; a forged finish can unlock the resume gate but CANNOT mint
+        an approval token or defeat the registry's execution-time
+        name/arguments/session binding -- the physical approval gate is gate
+        3 plus execution-time verification, not the event predicates.
+
+        Token semantics are unchanged: the token is still one-time,
+        argument-bound and session-bound, and is consumed only when the
+        resumed run actually executes the gated call through the registry.
+        """
+
+        if not actor_id.strip():
+            raise ValueError("actor_id cannot be empty")
+
+        import json as _json
+
+        # Gates 1+2 and the resume bookkeeping share ONE BEGIN IMMEDIATE
+        # transaction: the check (SELECT) and the claim (INSERT loop.resumed)
+        # are atomic, closing the check-then-act window that allowed two
+        # racing actors to both resume the same pause.  The write lock is
+        # held for microseconds -- the actual driving happens after COMMIT.
+        with store.transaction() as connection:
+            def read_one(sql, args):
+                # Identical read queries as store.query_one, but on the
+                # transaction's connection so they see (and serialise with)
+                # the claim write below.
+                return connection.execute(sql, tuple(args)).fetchone()
+
+            # --- gate 1: the most recent finish must be a waiting_approval pause.
+            finished = read_one(
+                "SELECT payload_json, seq FROM session_events "
+                "WHERE session_id = ? AND event_type = 'loop.finished' "
+                "ORDER BY seq DESC LIMIT 1",
+                (session_id,),
+            )
+            if finished is None:
+                raise AgentLoopError(
+                    f"cannot resume session '{session_id}': no finished run in the event stream"
+                )
+
+            finished_payload = _json.loads(finished["payload_json"])
+            stop_reason = finished_payload.get("stop_reason")
+            if stop_reason != "waiting_approval":
+                raise AgentLoopError(
+                    f"cannot resume session '{session_id}': last run ended with "
+                    f"stop_reason={stop_reason!r}; only a waiting_approval run may resume"
+                )
+
+            # --- gate 2: one resume per pause (seq-scoped, like
+            # _cancellation_requested): a loop.resumed vetoes only the pause
+            # it answered.  A pause whose finish seq is NEWER than every
+            # loop.resumed has never been resumed and may resume once.
+            resumed = read_one(
+                "SELECT seq FROM session_events "
+                "WHERE session_id = ? AND event_type = 'loop.resumed' "
+                "AND seq > ? ORDER BY seq DESC LIMIT 1",
+                (session_id, finished["seq"]),
+            )
+            if resumed is not None:
+                raise AgentLoopError(
+                    f"cannot resume session '{session_id}': this pause was already resumed "
+                    "(loop.resumed is in the ledger); refusing to double-run it"
+                )
+
+            # --- read-only rebuild of the run's truth from the stream.
+            started = read_one(
+                "SELECT payload_json, seq FROM session_events "
+                "WHERE session_id = ? AND event_type = 'loop.started' "
+                "ORDER BY seq DESC LIMIT 1",
+                (session_id,),
+            )
+            if started is None:
+                raise AgentLoopError(
+                    f"cannot resume session '{session_id}': loop.started is missing from the stream"
+                )
+            started_payload = _json.loads(started["payload_json"])
+            task = started_payload.get("task")
+            task_type = started_payload.get("task_type")
+            max_rounds = started_payload.get("max_rounds", 10)
+            budget_rounds = started_payload.get("budget_rounds")
+            # Rounds are derived from the recorded transitions of THIS run
+            # (seq > latest loop.started) -- never from process memory, and
+            # never charged against earlier runs in the same session.
+            rounds_row = read_one(
+                "SELECT MAX(CAST(json_extract(payload_json, '$.round') AS INTEGER)) AS rounds "
+                "FROM session_events WHERE session_id = ? AND event_type = 'loop.transition' "
+                "AND seq > ?",
+                (session_id, started["seq"]),
+            )
+            inherited_rounds = int(rounds_row["rounds"]) if rounds_row and rounds_row["rounds"] is not None else 0
+
+            # The pending tool call is identified by the recorded finish summary.
+            output = finished_payload.get("output") or {}
+            pending_tool = output.get("pending_tool")
+            pending_index = output.get("pending_index", 0)
+            pending_arguments_hash = output.get("pending_arguments_hash")
+
+            # --- gate 3: the token must be live and bound to the pending tool.
+            # Checked WITHOUT consuming it: consumption happens only when the
+            # resumed run re-issues the call through the registry.
+            token_id = getattr(approval_token, "id", approval_token)
+            if tool_registry is None:
+                raise AgentLoopError(
+                    "cannot resume: a tool_registry is required to verify the approval token"
+                )
+            live = tool_registry.get_live_token(token_id) if isinstance(token_id, str) else None
+            if (
+                live is None
+                or live.tool_name != pending_tool
+                # A grant is bound to exact arguments: when the stream recorded the
+                # pending call's hash, the token must match it -- a token minted
+                # for a different call of the same tool is not a grant for this
+                # pause.  (Older streams without the hash fall back to the
+                # name-only check; execution-time verification still applies.)
+                or (pending_arguments_hash is not None
+                    and live.arguments_hash != pending_arguments_hash)
+            ):
+                raise AgentLoopError(
+                    f"cannot resume session '{session_id}': approval token is not a live "
+                    f"grant bound to the pending call {pending_tool!r}"
+                )
+
+            # The resume itself is an append-only, replayable ledger fact: who
+            # resumed, which grant authorised it, from which pause, at which
+            # round.  Recorded INSIDE the gate transaction so the claim is
+            # committed before any transition: a crash mid-resume leaves an
+            # honest trail (and vetoes a retry of the same pause via gate 2).
+            store.record_event(
+                connection,
+                session_id,
+                "loop.resumed",
+                {
+                    "actor_id": actor_id,
+                    "resumed_from": "waiting_approval",
+                    "pending_tool": pending_tool,
+                    "pending_index": pending_index,
+                    "approval_token_id": token_id,
+                    "inherited_rounds": inherited_rounds,
+                },
+            )
+
+        loop = cls(
+            store=store,
+            session_id=session_id,
+            driver=driver,
+            max_rounds=max_rounds,
+            budget_rounds=budget_rounds,
+            tool_registry=tool_registry,
+        )
+        loop._state = "CANCELLED"  # re-entering the machine from the pause
+        loop._rounds = inherited_rounds
+        loop._resume_context = {
+            "pending_tool": pending_tool,
+            "pending_index": pending_index,
+            "approval_token_id": token_id,
+        }
+        return loop._drive(task, task_type=task_type)
 
     def cancel(self, reason: str = "user_cancelled") -> None:
         """Request cancellation of this loop, as an append-only ledger event.
