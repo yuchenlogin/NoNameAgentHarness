@@ -12,6 +12,7 @@ from .openai_adapter import OpenAIAdapter, load_openai_adapter
 from .anthropic_adapter import AnthropicAdapter, load_anthropic_adapter
 from .embeddings import local_hash_embedding, cosine_similarity
 from .card_images import GeneratedImage, local_typographic_image, card_image_for
+from .image_gen_adapter import OpenAIImageGenAdapter, load_image_gen_plugin
 from .extractor import ExtractionCandidate, MemoryExtractor, rule_based_extractor
 from .llm_extractor import LLMExtractor
 from .embedding_service import OpenAIEmbedding, load_openai_embedding
@@ -65,6 +66,8 @@ __all__ = [
     "GeneratedImage",
     "local_typographic_image",
     "card_image_for",
+    "OpenAIImageGenAdapter",
+    "load_image_gen_plugin",
     "ExtractionCandidate",
     "MemoryExtractor",
     "rule_based_extractor",
