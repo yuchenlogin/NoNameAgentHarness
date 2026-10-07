@@ -139,6 +139,8 @@ class TasteService:
 
         if action not in VALID_TASTE_ACTIONS:
             raise ValueError(f"invalid taste action: {action}")
+        if not isinstance(reviewer_id, str):
+            raise TypeError(f"reviewer_id must be str, got {type(reviewer_id).__name__}")
         if not reviewer_id.strip():
             raise ValueError("reviewer_id cannot be empty")
         row = self._get_row(taste_id)
@@ -349,6 +351,13 @@ class TasteService:
         actor_id: str,
         reason: str | None,
     ) -> dict[str, Any]:
+        # Same str-key guard as the store's append_event: bytes-like actor
+        # ids would land in the table as BLOBs and silently split the ledger
+        # (str reads never match a BLOB key).  Validate at the single INSERT
+        # seam so every caller (authored / adopted / review-edit) is covered.
+        for field_name, value in (("actor_id", actor_id), ("scope", scope), ("track", track)):
+            if not isinstance(value, str):
+                raise TypeError(f"{field_name} must be str, got {type(value).__name__}")
         taste_id = _id("tst")
         recorded_at = _now()
         with self.store.transaction() as connection:

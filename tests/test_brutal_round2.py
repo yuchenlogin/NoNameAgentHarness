@@ -2109,3 +2109,101 @@ class TestRouterAndCards:
             assert store.verify_integrity()["ok"] is True
         finally:
             store.close()
+
+
+# ---------------------------------------------------------------------------
+# Follow-up: residual holes confirmed by the fix-verification review
+# (/tmp/attack_fixes/REPORT).  These pin the closed seams so the same bug
+# class cannot re-open at a higher layer.
+# ---------------------------------------------------------------------------
+
+class TestResidualStrKeyGuards:
+    """taste/card services reach the same INSERT seam the store guards; the
+    str-key invariant must hold there too (bytes would land as BLOBs and
+    split the ledger silently)."""
+
+    def test_taste_record_authored_rejects_bytes_actor(self, tmp_path):
+        store = HarnessStore(tmp_path / "h.db")
+        store.initialize_project(tmp_path, "p")
+        svc = TasteService(store)
+        with pytest.raises(TypeError, match="actor_id must be str"):
+            svc.record_authored({"attitude": "x"}, actor_id=b"bytes")
+        # bytearray / memoryview are the same bug class
+        with pytest.raises(TypeError):
+            svc.record_authored({"attitude": "x"}, actor_id=bytearray(b"x"))
+
+    def test_taste_review_rejects_bytes_reviewer(self, tmp_path):
+        store = HarnessStore(tmp_path / "h.db")
+        store.initialize_project(tmp_path, "p")
+        svc = TasteService(store)
+        rec = svc.record_authored({"attitude": "x"})
+        with pytest.raises(TypeError, match="reviewer_id must be str"):
+            svc.review(rec["id"], "edit", b"bytes", edited_content={"attitude": "y"})
+
+    def test_card_create_rejects_bytes_actor(self, tmp_path):
+        store = HarnessStore(tmp_path / "h.db")
+        store.initialize_project(tmp_path, "p")
+        svc = TasteService(store)
+        rec = svc.record_authored({"attitude": "x"})
+        cards = TasteCardService(store)
+        with pytest.raises(TypeError, match="actor_id must be str"):
+            cards.create_card(
+                title="t", attitude="a", track="authored", scope="user",
+                taste_ids=[rec["id"]], actor_id=b"bytes",
+            )
+
+    def test_card_review_rejects_bytes_reviewer(self, tmp_path):
+        store = HarnessStore(tmp_path / "h.db")
+        store.initialize_project(tmp_path, "p")
+        svc = TasteService(store)
+        rec = svc.record_authored({"attitude": "x"})
+        cards = TasteCardService(store)
+        card = cards.create_card(
+            title="t", attitude="a", track="authored", scope="user",
+            taste_ids=[rec["id"]],
+        )
+        with pytest.raises(TypeError, match="reviewer_id must be str"):
+            cards.review(card["id"], "accept", b"bytes")
+
+    def test_actor_ids_persist_as_text_not_blob(self, tmp_path):
+        """The guard's purpose: a legitimate str actor_id must land as TEXT."""
+        store = HarnessStore(tmp_path / "h.db")
+        store.initialize_project(tmp_path, "p")
+        svc = TasteService(store)
+        svc.record_authored({"attitude": "x"}, actor_id="human")
+        row = store.query_one(
+            "SELECT typeof(actor_id) AS t FROM taste_records LIMIT 1"
+        )
+        assert row["t"] == "text"
+
+
+class TestStoreInitResourceHygiene:
+    """A store that fails schema setup must not leak its connection."""
+
+    def test_failed_init_closes_connection(self, tmp_path, monkeypatch):
+        db = tmp_path / "h.db"
+        # Force _ensure_schema to fail after connect (read-only scenario
+        # simulated deterministically) and assert the handle is closed.
+        import sqlite3 as _sql
+        closed = []
+        real_connect = _sql.connect
+
+        class SpyConnection:
+            def __init__(self, *a, **k):
+                self._inner = real_connect(*a, **k)
+                self.row_factory = None
+            def execute(self, *a, **k):
+                return self._inner.execute(*a, **k)
+            def close(self):
+                closed.append(True)
+                return self._inner.close()
+
+        monkeypatch.setattr(_sql, "connect", SpyConnection)
+        from noname_harness import store as store_mod
+        monkeypatch.setattr(
+            store_mod.HarnessStore, "_ensure_schema",
+            lambda self: (_ for _ in ()).throw(OSError("read-only file system")),
+        )
+        with pytest.raises(OSError, match="read-only"):
+            HarnessStore(db)
+        assert closed == [True]

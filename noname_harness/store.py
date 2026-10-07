@@ -187,7 +187,15 @@ class HarnessStore:
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA journal_mode = WAL")
-        self._ensure_schema()
+        try:
+            self._ensure_schema()
+        except Exception:
+            # A half-initialised store must not leak its connection: if schema
+            # setup fails (read-only fs, corrupt file), close before the
+            # exception propagates so the caller is not left holding an open
+            # handle on an object that never finished construction.
+            self._connection.close()
+            raise
 
     def close(self) -> None:
         self._connection.close()

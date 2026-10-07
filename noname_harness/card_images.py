@@ -53,7 +53,8 @@ def _sanitize_text(value: Any) -> str:
     A corrupted/hostile card can carry lone surrogates (e.g. 'surrog\\ud800ate')
     that no UTF-8 encoder can represent.  Every render seam (seed hashing,
     SVG text) must sanitise rather than crash: encode+replace rewrites each
-    lone surrogate to U+FFFD, keeping the output deterministic and valid XML.
+    undecodable sequence (lone surrogate, control char) to ASCII ``?``,
+    keeping the output deterministic and valid XML.
     """
 
     return str(value).encode("utf-8", errors="replace").decode("utf-8")

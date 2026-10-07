@@ -184,6 +184,17 @@ class TasteCardService:
     ) -> None:
         """Insert a card row and its ledger event inside a transaction."""
 
+        # Same str-key guard as the store's append_event (see
+        # TasteService._insert_taste): bytes-like ids become BLOBs and split
+        # the ledger silently.  One seam covers create / review / split.
+        for field_name, value in (
+            ("actor_id", actor_id),
+            ("scope", scope),
+            ("track", track),
+            ("card_id", card_id),
+        ):
+            if not isinstance(value, str):
+                raise TypeError(f"{field_name} must be str, got {type(value).__name__}")
         connection.execute(
             "INSERT INTO taste_cards "
             "(id, title, attitude, track, scope, taste_ids_json, "
@@ -245,6 +256,8 @@ class TasteCardService:
 
         if action not in VALID_CARD_ACTIONS:
             raise ValueError(f"invalid card action: {action}")
+        if not isinstance(reviewer_id, str):
+            raise TypeError(f"reviewer_id must be str, got {type(reviewer_id).__name__}")
         if not reviewer_id.strip():
             raise ValueError("reviewer_id cannot be empty")
         row = self._get_row(card_id)

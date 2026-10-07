@@ -514,10 +514,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Database-environment failures (unopenable/read-only --db path, --db
         # pointing at a directory, malformed db file) surface from sqlite as
         # OperationalError -- a *user-facing* condition, reported like every
-        # other CLI error.  This intentionally does NOT catch the broader
-        # sqlite3.Error/DatabaseError family: programming errors such as a
-        # malformed SQL statement (sqlite3.ProgrammingError/InternalError) are
-        # bugs and must keep surfacing as tracebacks.
+        # other CLI error.  Per PEP 249 OperationalError is itself a
+        # DatabaseError subclass (database is locked / malformed file lands
+        # here too, which is acceptable -- those are environment, not code),
+        # but the *other* DatabaseError siblings stay loud: programming
+        # errors such as a malformed SQL statement
+        # (sqlite3.ProgrammingError/InternalError/IntegrityError) are bugs
+        # and must keep surfacing as tracebacks.
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except (ValueError, KeyError, RuntimeError, FileExistsError, WorkspaceBoundaryError) as exc:
