@@ -89,14 +89,23 @@ class Plugin:
     ``build`` is called at load time with no arguments and returns the plugin's
     contributions.  Keeping construction behind a factory means nothing runs --
     and no state is touched -- until the manifest has been validated.
+
+    ``unload`` is an optional hook called during :meth:`PluginRuntime.unload`,
+    after the plugin's tools have been reclaimed and before the
+    ``plugin.unloaded`` ledger event is written.  It lets a plugin bind
+    non-tool side effects (e.g. a generator's network egress) to the
+    reversible lifecycle, so a leaked handle cannot outlive the plugin.
     """
 
     manifest: PluginManifest
     build: Callable[[], list[PluginContribution]]
+    unload: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
         if not callable(self.build):
             raise PluginError("plugin build must be callable")
+        if self.unload is not None and not callable(self.unload):
+            raise PluginError("plugin unload must be callable")
 
 
 @dataclass
@@ -199,6 +208,11 @@ class PluginRuntime:
         for name in self._contributions.pop(plugin_id, []):
             if self.registry.unregister(name):
                 reclaimed.append(name)
+        # A plugin may bind non-tool side effects to the lifecycle (e.g.
+        # deactivating a generator whose only handle escaped).  The hook runs
+        # after contributions are reclaimed, as part of the unload.
+        if plugin.unload is not None:
+            plugin.unload()
         self.store.append_event(
             "system",
             "plugin.unloaded",

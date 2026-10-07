@@ -42,6 +42,7 @@ _MEDIA_SUFFIX = {
     "image/svg+xml": ".svg",
     "image/png": ".png",
     "image/jpeg": ".jpg",
+    "image/webp": ".webp",
 }
 
 # Lifecycle transitions for a card.  ``split`` produces new cards and retires

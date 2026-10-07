@@ -11,6 +11,7 @@ supply only their *differences*: request building and response parsing.
 from __future__ import annotations
 
 import json
+import math
 import socket
 import urllib.error
 import urllib.request
@@ -23,6 +24,73 @@ from .adapters import ModelAdapterError
 
 # snake_case identifier shape for a trusted error enum token.
 _ERROR_CODE_SHAPE = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
+
+# A vendor error code is attacker-controlled text.  A *shape* allowlist is not
+# enough: a credential with its known prefix stripped (e.g. the 32-char
+# lowercase body of an API key) matches the shape perfectly, so a hostile
+# endpoint could echo secrets into the ledger under the "error_code" name.
+# Only *known* enum tokens are recorded; anything else (even well-shaped) is
+# collapsed to "unlisted" so the classification signal survives without
+# carrying attacker entropy.
+_KNOWN_ERROR_CODES = frozenset(
+    {
+        # OpenAI-style codes / types.
+        "invalid_api_key",
+        "incorrect_api_key",
+        "authentication_error",
+        "rate_limit_exceeded",
+        "insufficient_quota",
+        "model_not_found",
+        "invalid_request_error",
+        "content_policy_violation",
+        "server_error",
+        "overloaded",
+        "billing_hard_limit_reached",
+        # Anthropic-style error types.
+        "api_error",
+        "invalid_request",
+        "not_found_error",
+        "overloaded_error",
+        "permission_error",
+        "request_too_large",
+        "timeout_error",
+        "billing_error",
+    }
+)
+
+_UNLISTED_ERROR_CODE = "unlisted"
+
+# Numeric fields from a vendor response (usage counters, `created`) must be
+# real, bounded ints: a malicious endpoint returning negatives, bools or
+# 2**63-scale values would poison cost accounting that aggregates them.
+MAX_VENDOR_INT = 10**12
+
+def bounded_vendor_int(value: Any) -> int | None:
+    """Coerce a vendor numeric field, refusing bools/negatives/huge values."""
+
+    if type(value) is int and 0 <= value <= MAX_VENDOR_INT:
+        return value
+    return None
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+def validate_timeout(timeout: Any) -> float:
+    """Return a finite, strictly positive timeout or fail loudly.
+
+    A zero/negative/NaN/inf timeout has undefined behaviour in urllib and
+    silently broken retry semantics everywhere else.
+    """
+
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ModelAdapterError(
+            "invalid_request", f"timeout must be a number, got {type(timeout).__name__}"
+        )
+    value = float(timeout)
+    if math.isnan(value) or math.isinf(value) or value <= 0:
+        raise ModelAdapterError(
+            "invalid_request", f"timeout must be finite and > 0, got {value!r}"
+        )
+    return value
 
 # A transport maps (url, headers, body_bytes, timeout) -> (status, response_bytes).
 Transport = Callable[[str, dict[str, str], bytes, float], tuple[int, bytes]]
@@ -88,13 +156,33 @@ def validate_base_url(base: str, *, allow_insecure: bool) -> str:
     ``allow_insecure`` is set (e.g. a local model server).
     """
 
-    scheme = urlsplit(base.strip().lower()).scheme
+    # Check BEFORE strip(): str.strip() also removes \x0b-\x0d, which would
+    # otherwise launder a control character out of the checked string.
+    if _CONTROL_CHARS.search(base):
+        raise ModelAdapterError(
+            "auth", "refusing base URL with control characters (trust boundary violation)"
+        )
+    stripped = base.strip()
+    parts = urlsplit(stripped.lower())
+    scheme = parts.scheme
     allowed = {"https"} if not allow_insecure else {"https", "http"}
     if scheme not in allowed:
         raise ModelAdapterError(
             "auth",
             f"refusing base URL scheme {scheme!r} (would send credentials over a "
             "non-HTTPS channel); pass allow_insecure=True for a local plaintext endpoint",
+        )
+    # The credential is sent to whatever this URL names: embedded userinfo or a
+    # trailing-dot host would smuggle credentials into the URL itself or bypass
+    # host comparisons.
+    if parts.username or parts.password or "@" in (parts.netloc or ""):
+        raise ModelAdapterError(
+            "auth", "refusing base URL with embedded userinfo (credential smuggling risk)"
+        )
+    hostname = parts.hostname or ""
+    if hostname.endswith("."):
+        raise ModelAdapterError(
+            "auth", "refusing base URL with a trailing-dot host (trust boundary violation)"
         )
     return base.rstrip("/")
 
@@ -116,11 +204,13 @@ def safe_error_ref(status: int, raw: bytes) -> dict[str, Any]:
             code = error.get("code") or error.get("type")
         elif isinstance(body, dict):
             code = body.get("type")
-        # An error_code is attacker-controlled text; only keep it if it looks
-        # like a known enum token (snake_case identifier), never free text that
-        # could carry a credential or attacker content into the ledger.
+        # An error_code is attacker-controlled text; only keep tokens from the
+        # known vendor enum.  A well-shaped but unknown token (e.g. a stripped
+        # credential echoed back by a hostile endpoint) is recorded as
+        # "unlisted": the "the vendor did name an error" signal survives
+        # without attacker entropy ever reaching the ledger.
         if isinstance(code, str) and _ERROR_CODE_SHAPE.match(code):
-            ref["error_code"] = code
+            ref["error_code"] = code if code in _KNOWN_ERROR_CODES else _UNLISTED_ERROR_CODE
     except (ValueError, UnicodeDecodeError):
         pass
     return ref
@@ -131,7 +221,12 @@ def safe_usage_ref(usage: Any) -> dict[str, int]:
 
     if not isinstance(usage, dict):
         return {}
-    return {key: usage[key] for key in _USAGE_FIELDS if isinstance(usage.get(key), int)}
+    result: dict[str, int] = {}
+    for key in _USAGE_FIELDS:
+        value = bounded_vendor_int(usage.get(key))
+        if value is not None:
+            result[key] = value
+    return result
 
 
 def json_schema_type(type_name: str) -> str:
