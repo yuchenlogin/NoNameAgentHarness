@@ -22,6 +22,7 @@
 
 - 6 个 xfail(strict=True) 复现测试全部转为正式断言 + 5 个新边界测试；622 passed, 0 failed, 0 xfailed。
 - 修复全部 fail-closed 且最小化；`embeddings.py` 无需改动（`local_hash_embedding` 天然有限）。
+- **修复验证复测（31 探针）确认 6 项修复全部有效无回归**，并追加收口：taste/card 服务的 `actor_id`/`scope`/`reviewer_id` 与 bytes session_id 属同一 bug 类（高一层的未防护 INSERT 接缝）——`_insert_taste`/`_insert_card`/`review` 统一 `isinstance(str)` 守卫；`HarnessStore.__init__` 在 schema 失败时不再泄漏连接；两处注释与实现对齐（PEP 249 异常层次、sanitize 实际产出）。+6 回归测试，628 passed, 0 xfailed。
 
 ## [0.32.0] - 2026-10-07
 
