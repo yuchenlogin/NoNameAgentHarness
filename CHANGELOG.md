@@ -2,6 +2,76 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.32.0] - 2026-10-07
+
+### Features
+
+- `AgentLoop.resume()` 对抗性审查（/tmp/attack_resume/REPORT.md，结论 CONTESTED）确认的 3 项发现全部修复 + 1 项纵深加固 + 1 项信任边界文档化；schema 不变（仍 v7）：
+  - **F1 [HIGH]** gate 2 的 TOCTOU 双跑窗口关闭：gate 1+2 的检查（SELECT）与 `loop.resumed` 认领（INSERT）收进同一个 `BEGIN IMMEDIATE` 事务（store 现有事务原语），check 与 claim 原子化——并发 actor 竞速时第二个在写锁上阻塞、重读账本后被 gate 2 拒绝，双跑从实测 ~10%（注入延迟后 100%）降为 0（多进程竞速回归测试 5/5 稳定）。
+  - **F3 [MEDIUM]** gate 2 从会话级永久 veto 改为按 pause 作用域（seq 规则，与 `_cancellation_requested` 同构）：`loop.resumed` 只 veto seq 早于它的那次暂停，pause→resume→pause→resume 合法循环恢复可用；同一 pause 的重复 resume 仍被拒绝（防重放本就由一次性令牌承担，会话级 veto 只有可用性损失）。
+  - **F4 [MEDIUM]** 轮次继承按 run 隔离：`MAX(round)` 只统计最近一次 `loop.started` 之后的 transition，同 session 早先 run 的轮次不再污染当前 run 的预算（原语义下 run1 的 9 轮会把 run2 错误打到 round_limit）。
+  - **F5 [LOW]** `_drive` 私有入口加纵深防御断言：仅 IDLE（run() 路径）或 resume() 显式置位的 CANCELLED+scratch 可进入，从 CANCELLED 直接调私有 `_drive` 绕过门禁被响亮拒绝（docstring 注明这是纵深防御而非安全边界）。
+  - **F2 [HIGH-ish，信任边界]**：不做代码改动，docstring 与 docs/runtime-architecture.md §6 明说 resume 的信任边界——事件流无作者概念，能写 session 事件流的 actor 已被信任；伪造 finish 只能解锁 resume 之门，不能伪造审批令牌、不能绕过执行期实名绑定（物理防线是 gate 3 + 执行期校验）。
+- 回归测试：tests/test_resume.py 13 → 18（新增 F1 多进程竞速、F3 合法循环 + 同 pause 双 resume 拒绝、F4 多 run 轮次隔离、F5 `_drive` 重入拒绝），探针 A3/C4/D3/E1 择优转为正式回归；四文件矩阵（resume/agent_loop/cancel/parallel_tools）56 全绿，全套 461 绿（test_image_gen_adapter.py 由并行任务处理，未动）。
+
+### Design Rationale
+
+- **F1 为什么用事务而非 UNIQUE 约束**：`session_events` 的 seq 由 `MAX(seq)+1` 计算，唯一约束无法表达「同一 pause 只能 resume 一次」的谓词（pause 由最新的 waiting_approval finish 界定，是动态谓词）；`BEGIN IMMEDIATE` 是 store 既有的串行化原语，写锁只持有微秒级（gate 3 的进程内令牌查找与 `_drive` 都在事务外），不改变单连接架构。
+- **F3 为什么 seq 作用域足够**：防重放的物理承担者是一次性令牌（执行期消费），gate 2 只是记账/活跃性护栏；把它收窄到 pause 作用域后，「第二次 pause 有全新 grant 却被旧 resume 事件否决」的永久拒绝服务（含探针 D2 的 resume 后首轮崩溃锁死）随之消除。
+- **F4 为什么改语义是安全的**：旧语义（全 session MAX）只会「多扣」不会「少扣」，本身不是预算后门；新语义按 run 隔离后预算上限仍然成立（回归测试保留 max_rounds/budget_rounds 跨暂停绑定的断言），只是不再把别人欠的轮次算到当前 run 头上。
+
+### Notes & Caveats
+
+- **行为变化**：同一 session 的第二次及以后 pause 现在可以合法 resume（F3 之前被永久拒绝）——tests/test_resume.py 的 `test_replay_guard_vetoes_second_resume_of_same_pause` 旧断言（第二次 pause 也被 veto）已按新语义改为「第二次 pause resume 成功」，同 pause 双 resume 的拒绝由新测试 `test_double_resume_of_same_pause_rejected` 覆盖。
+- 多 run 会话的 resume 继承轮次从「全 session MAX」变为「当前 run MAX」：依赖旧语义的调用方（若有）会看到更小的 inherited_rounds；预算上限语义不变。
+- resume() 内部的 gate 读查询改在事务连接上执行（绕过 store.query_one 的连接），语义等价但走 `store.transaction()` 公共原语；`loop.resumed` 写入改用 `store.record_event(connection, ...)`（store 既有的服务级事务写入通道）。
+
+## [0.31.0] - 2026-10-07
+
+### Features
+
+- 对抗性审查（/tmp/attack_imggen/REPORT.md，结论 CONTESTED）确认的 5 项漏洞全部修复，并顺手修复 4 项 LOW；schema 不变（仍 v7），无外部依赖：
+  - **F1 [HIGH]** `vendor_http.safe_error_ref` 的 error_code 由「形状正则」收紧为「已知枚举集合」（OpenAI + Anthropic 风格已知 code 超集）；集合外但形状合法的一律记 `"unlisted"`，形状非法的继续丢弃——恶意端点无法再把去前缀的 key 主体以 error_code 名义回显进账本。
+  - **F2 [HIGH]** 图像响应字节上限：b64 字符串先查长度（约 28MB 字符上限，对应解码后 20MB，与多模态 ImageBlock 上限对齐），超限 classified `invalid_request`（不可重试），且永不先解码放大内存。
+  - **F3 [HIGH]** vendor 控制的 `media_type` 收敛为白名单 `{image/png, image/jpeg, image/webp}`（排除 svg/html 等 active content，堵死 SVG+`<script>` 落盘的存储型 XSS 通道）；media_type 先做字符集校验（拒绝 \r\n 等）；`taste_cards._MEDIA_SUFFIX` 补 `.webp` 映射。
+  - **F4 [MEDIUM]** usage/created 数值字段改为 `type(x) is int and 0 <= x <= 10**12`（排除 bool 子类、负数、巨数），超界丢弃该字段；共享 `safe_usage_ref` 同步收紧。
+  - **F5 [MEDIUM]** 插件生命周期绑定副作用：adapter 构造 fail-closed（`_active=False`），`load_image_gen_plugin` 在 `runtime.load()` 成功后激活；plugins.py 最小扩展 `Plugin.unload` 可选钩子，unload 后 adapter 的 generate 响亮拒绝（classified `invalid_request`），泄漏的对象句柄不能继续 egress/计费。
+  - LOW：`_coerce_size` validate-then-use 脱节修复（构造时规范化存回，`"  1024X1024 "` → 发送 `1024x1024`）；构造时 timeout 校验（拒绝 0/负/NaN/inf/非数值）；base_url 校验拒绝 userinfo、尾随点 host、控制字符（检查先于 strip，防 \x0b 被 strip 洗白）；失败路径清空 `last_usage`/`last_vendor_ref`，避免陈旧 usage 被记到失败头上。
+
+### Design Rationale
+
+- **error_code 为什么用枚举而非继续收紧形状**：形状正则过滤得了格式、过滤不了熵——32 字符小写 key 主体与合法 snake_case token 形状不可区分。枚举集合是有界的，攻击者最多选择「说一个已知 token」，无法注入任意字符串；`"unlisted"` 占位保留了「vendor 确实报了 code」的信号而不携带攻击者熵。
+- **F5 为什么选 fail-closed 而非文档声明**：报告的最低要求是「至少在文档承认生命周期不绑定对象句柄」，但 plugins.py 只需加一个可选 `unload` 钩子（默认 None，对现有插件零影响）就能把绑定做实；做实的成本低于承认漏洞的成本。
+- **base_url/size/timeout 为什么提到构造时校验**：原在每次调用时校验意味着「无效配置可以存在、只是不能用」；fail-closed 姿态下无效配置根本不能存在，validate-then-use 的 then-use 脱节（size 原值进 body）也随之消失。
+
+### Notes & Caveats
+
+- 行为变化：直接 `OpenAIImageGenAdapter(...)` 构造的 adapter 默认拒绝 generate，需经 `load_image_gen_plugin` 激活（或测试中显式 `_mark_plugin_loaded()`）；`validate_base_url` 提前到构造时意味着非法 base_url 在构造即抛——openai/anthropic/embedding 适配器行为不变（它们仍在调用时校验），全套 512 测试绿。
+- `Plugin.unload` 为可选字段，现有插件无需改动；钩子在贡献回收后、`plugin.unloaded` 账本事件前执行。
+- 回归测试 +22（tests/test_image_gen_adapter.py 56 个），关键攻击探针（凭证回显 error_code、巨型 b64、SVG script、usage 投毒、unload 后 egress）已转为正式回归。
+
+## [0.30.0] - 2026-10-07
+
+### Features
+
+- 真实图像模型插件落地——DELIVERY.md「尚未做」清单中的 imagegen 插件（schema 不变，仍为 v7）：新增 `noname_harness/image_gen_adapter.py`，`OpenAIImageGenAdapter` 实现 OpenAI 兼容 `/images/generations`（gpt-image / dall-e 风格）端点的 `ImageGenerator` 协议，可直接注入 `card_image_for` / `taste_cards.generate_image`；`load_image_gen_plugin(runtime, ...)` 按 `load_openai_adapter` 的模式把图像生成能力结晶成零工具插件（capabilities=("image-generation",)，side_effects=("network-egress", "billing")，加载记 plugin.loaded 审计）。
+- 凭证安全全部复用 `vendor_http` 基类：HTTPS 强制（allow_insecure 仅本地 opt-in）、拒绝一切重定向（防 302 转发 Bearer key）、错误按因分类（auth / rate_limit / timeout / overloaded / invalid_request + retryable 标注）、api_key `repr=False`。
+- vendor_ref 全路径白名单：成功路径只保留 `{status, created, usage}`（usage 按 int 白名单强转）；错误路径复用 `safe_error_ref`（status + 形状校验过的 error_code），错误体与凭证永不落账；图像 b64 是内容不入 vendor_ref。
+- 诚实的 metadata：generator_id 随模型配置（`openai-image-<model>`）、prompt 记录实际发送内容、API 不支持 seed 时 `seed: None` + `seed_supported: False` + `rebuildable: False`（不伪造确定性），usage 入账可追溯。
+- prompt 安全构建：`build_card_prompt` 只取卡片文本摘要（title/attitude/track），逐字段截断（200/800/80 字符）+ 总长 4000 字符上限（防 prompt 炸弹）；prompt 前导固定为「抽象、非写实、无人脸、无文字」的视觉解释指令。
+
+### Design Rationale
+
+- **为什么拒绝 url 形式的图像响应**：部分 dall-e 风格端点返回 URL 而非 b64。取回它需要第二次 egress，越出「单一已审计端点」的边界；而只保存 URL 引用又不是可持久化的图像字节。宁可 classified error，不开第二条网络通道。
+- **为什么 seed 诚实标注为不支持而非伪造**：OpenAI 兼容图像 API 不接受 seed。伪造一个 seed 会暗示生成是确定性的、可重建的，这违反 metadata 契约的「可重建」语义。排版渲染器仍是默认可重建路径；真实模型图像被明确标记为 `rebuildable: False`。
+- **为什么是零工具插件**：图像生成器注入品味卡片管线（`generate_image(generator=...)`），不是模型可见的工具，所以 `build()` 返回空贡献列表；`PluginRuntime` 原生接受零工具插件（注册与卸载循环对空列表自然 no-op），无需扩展 plugins.py。side_effects 声明确保 plugin.loaded 账本事件诚实记录 network-egress / billing。
+
+### Notes & Caveats
+
+- 真实模型无法像排版渲染器那样结构性保证无人脸，abstract/no_faces 来自构造配置（默认 True，与固定 prompt 前导一致）；写实风格模型应显式置 False，服务层不会代为盖章。
+- 图像生成默认 timeout 120s（慢于 chat）；成本估算依赖响应 usage（gpt-image 风格 total/input/output tokens），无 usage 时 last_usage 为空。
+- 新增 34 个测试，总数到 477；`__init__.py` 导出 `OpenAIImageGenAdapter` / `load_image_gen_plugin`；未改动 card_images.py / plugins.py / taste_cards.py / store.py。
+
 ## [0.29.0] - 2026-10-07
 
 ### Features

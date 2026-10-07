@@ -1,6 +1,6 @@
 # NoName Agent Harness · 交付说明
 
-> 2026-10-07 · schema v7 · 355 测试全绿 · 无外部依赖（Python 标准库 + SQLite）
+> 2026-10-07 · schema v7 · 517 测试全绿 · 无外部依赖（Python 标准库 + SQLite）
 
 这份文档对照 vision 的原始预期，逐项核验 NoName 当前状态的证据。它不是营销材料，而是一份可审计的自证：每一条"已落地"都附对应的模块与测试，每一条"未做"都诚实标注。
 
@@ -10,10 +10,12 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 
 ## 验证方式（怎么证明没有 bug）
 
-- **355 个自动化测试全绿**（`pytest -q`），覆盖每个模块的 happy path 与失败路径。
-- **二十二轮对抗性审查**：每个安全关键层（审批门、沙箱、凭证安全、投影、抽取、检索、图像、账本）都经过独立 reviewer 用可执行探针攻击，发现的每个 high/medium 漏洞都已修复并配回归测试。沙箱与 OpenAI 适配器各经历两轮 REJECT 级专攻后才通过。
+- **517 个自动化测试全绿**（`pytest -q`），覆盖每个模块的 happy path 与失败路径。
+- **二十四轮对抗性审查**：每个安全关键层（审批门、沙箱、凭证安全、投影、抽取、检索、图像、账本）都经过独立 reviewer 用可执行探针攻击，发现的每个 high/medium 漏洞都已修复并配回归测试。沙箱与 OpenAI 适配器各经历两轮 REJECT 级专攻后才通过。
 - **一次系统性交付审计**：vision 原则、runtime-arch 稳定接口、文档一致性三路并行核对，发现的偏差已全部修复。
 - **系统级综合验证**：10+ 项核心能力在一个真实工作流中协同验证（见文末）。
+
+10+ 项核心能力在一个真实工作流中协同验证（见文末）。
 
 ## vision 四条原则 · 逐项核验
 
@@ -40,7 +42,7 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 | Model Adapter（契约 + 两个真实供应商） | `adapters.py`、`openai_adapter.py`、`anthropic_adapter.py`、`vendor_http.py` | ✅ |
 | Model Recipe（任务类型→角色链） | `recipes.py` | ✅ |
 | Tool Registry（审批门） | `tools.py` | ✅ |
-| Agent Loop（状态机 + 恢复） | `agent_loop.py` | ✅ |
+| Agent Loop（状态机 + 恢复 + 暂停 resume） | `agent_loop.py` | ✅ |
 | Router（显式带理由路由） | `router.py` | ✅ |
 | Plugin Runtime（能力结晶） | `plugins.py` | ✅ |
 | Execution World / Sandbox | `sandbox.py` | ✅ |
@@ -49,7 +51,7 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 
 - **双轨**：Authored（自述即激活，最高权威）/ Adopted（采纳需显式审核，不伪装成用户原话）。
 - **卡片**：确定性聚类、生命周期状态机（含原子 split）、确定性复核队列、stale 标注。
-- **图像视觉隐喻**：可注入 `ImageGenerator` 协议 + 确定性抽象排版渲染器（无人脸/摄影/敏感元素）；图像字节作为 append-only evidence span 原子持久化可溯源；多模态风险防控内建（视觉解释标注、生成器只收文本、abstract/no_faces 来自生成器）。
+- **图像视觉隐喻**：可注入 `ImageGenerator` 协议 + 确定性抽象排版渲染器（无人脸/摄影/敏感元素）+ 真实图像模型插件 `image_gen_adapter.py`（OpenAI 兼容 /images/generations，凭证安全基类复用、传输可注入、seed 语义诚实标注不支持）；图像字节作为 append-only evidence span 原子持久化可溯源；多模态风险防控内建（视觉解释标注、生成器只收文本、abstract/no_faces 来自生成器）。
 
 ## 检索 · 完整
 
@@ -63,7 +65,7 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 - **ModelAdapter 契约**：业务逻辑只按 capability 选模型，不依赖供应商字段。
 - **两个真实供应商适配器**（OpenAI + Anthropic），共享 `vendor_http` 凭证安全基类（无重定向、HTTPS 强制、vendor_ref 白名单、错误按因分类、api_key repr=False）。
 - **协议通用性实证**：同一 `AdapterDriver` + `AgentLoop`，仅替换适配器实例即可驱动两家完成完整多轮工具循环，业务逻辑零改动。
-- **真实能力以插件接入**：模型适配器、embedding 服务、（未来的图像模型）都按"能力结晶成插件"加载审计，内核不依赖任何供应商。
+- **真实能力以插件接入**：模型适配器、embedding 服务、图像模型插件都按"能力结晶成插件"加载审计，内核不依赖任何供应商。
 - **真流式 SSE 已落地**：`secure_stream_transport`（逐行读取、无重定向、HTTPS 强制、错误按因分类）+ `iter_sse_json_lines` 解析；OpenAI 按 index 累积 tool_call 片段、Anthropic 按事件类型解析并 flush orphan blocks；默认真实流式，显式 `None` 回退 complete 重放 replay。
 
 ## CLI · 29 个命令
@@ -76,13 +78,12 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 
 这些都是已明确记录的增强项或更深的系统层，**不是核心缺口**：
 
-- **真实图像模型插件**：品味卡片默认抽象排版渲染器已落地，真实 imagegen 插件待注入。
-- **并行 tool_call**：Agent Loop 单 tool_call/轮，并行响亮拒绝。
-- **暂停后 resume**：恢复为只读重建终态，waiting_approval 后需开启新 run。
 - **网络隔离与资源限额**：沙箱当前为文件边界 + 命令允许列表 + 进程组超时。
 - **多用户同步、远程数据库、加密存储**。
 
 ## 系统级综合验证（2026-10-07 实测）
+
+暂停后 resume 已落地：`AgentLoop.resume()` 从事件流重建 waiting_approval run——三重门控（仅 waiting_approval 可恢复、同一 pause 原子认领一次、live 令牌绑定 pending 调用参数哈希）、轮次按 run 隔离继承、预算跨暂停强制、跨连接接管端到端验证（tests/test_resume.py）。
 
 10+ 项核心能力在一个真实工作流中协同验证，全部通过：证据/记忆+双时序、记忆抽取（提案非 active）、审核成法典、审核收件箱、品味+卡片、跨模型投影一致、沙箱读免审、写拦截（审批门）、AgentLoop+恢复、Router、账本 UI、完整性校验。
 
@@ -90,7 +91,7 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 
 ```bash
 python3 -m noname_harness init --db .noname/harness.db --root . --name "我的项目"
-pytest -q   # 381 passed
+pytest -q   # 517 passed
 ```
 
 ## 演进
