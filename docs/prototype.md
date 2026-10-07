@@ -239,7 +239,7 @@ python3 -m noname_harness package \
 
 核心不变式是「事实对任何模型一致」：为哪个模型投影只改变低层证据窗口的宽窄（`low` 预算约收紧到 1/4、`high` 约放宽到 2 倍、窗口小于 16k 再减半、地板 3 条），已审核的法典、任务态、品味和 provenance 完全不变——换模型不换事实来源。投影目标与所用配方会记入包的 assembly 元数据和 `context.assembled` 账本事件，未来可回放审计。
 
-`--task-type` 选择配方：内置 6 个默认配方（question / research / code-change / memory-write / taste-card / high-risk），把任务类型映射到建议的角色链。配方是建议而非锁死——原型没有真实外部模型可路由，但推荐与理由会入账，让未来的路由规则可解释。查看默认配方：
+`--task-type` 选择配方：内置 6 个默认配方（question / research / code-change / memory-write / taste-card / high-risk），把任务类型映射到建议的角色链。配方是建议而非锁死——路由不直接调真实外部模型（模型由 Model Adapter 插件接入），但推荐与理由会入账，让路由规则可解释。查看默认配方：
 
 ```bash
 python3 -m noname_harness recipes --db .noname/harness.db
@@ -250,13 +250,13 @@ python3 -m noname_harness recipes --db .noname/harness.db --task-type code-chang
 
 这不是完整的 agent runtime，目前明确不包含：
 
-- 真实外部模型调用的流式输出、计费与自动模型切换（真实供应商适配器已以插件接入并经确定性 replay 端到端验证，但未经真实网络调用）；
+- 真实外部模型调用的计费与自动模型切换（真实供应商适配器与真流式 SSE 已以插件接入，经确定性 replay 端到端验证，但未经真实网络调用）；
 - 网络工具的实际执行（文件与命令执行已在沙箱内落地，网络出口未开放）；
-- 自然语言记忆抽取（LLM 提取器）、语义重排与真实 embedding 服务（当前为结构化提示 + FTS5 文字检索 + 词面级确定性嵌入的向量召回投影）；
-- 多模态图像生成（品味卡片与确定性聚类替身、复核队列已落地，但图像仍是可重建的元数据契约，默认纯排版）；
+- 检索层其余增强（自然语言记忆抽取的 LLM 提取器、真实 embedding 服务、多维语义重排均已落地；默认路径仍是结构化提示 + FTS5 文字检索 + 词面级确定性嵌入的向量召回投影）；
+- 多模态图像生成的深度能力（真实图像模型插件已以 `image_gen_adapter.py` 接入，图像字节作为 evidence span 可溯源；默认渲染器仍为确定性抽象排版）；
 - 多用户同步、远程数据库和加密存储；
 - 网络隔离与资源限额；
-- 暂停后 resume（恢复当前为只读重建终态，waiting_approval 后需开启新 run）。
+- Agent Loop 暂停后 resume 已落地（`AgentLoop.resume()` 从事件流接管 waiting_approval run 续跑，三重门控 + 轮次按 run 隔离）；恢复（`reconstruct()`）本身仍是只读重建终态。
 
 低层目前是“最近工作事件窗口”（`low_limit` 只限制这些工作事件），并在指定会话时额外附带一次当前工作区快照；它还不是最终的动态语义检索。这样做是有意的：先验证证据、审核、分层和接管契约，再逐步替换投影实现。
 

@@ -72,6 +72,8 @@ Capability Layer
 
 真流式 SSE 已落地：`secure_stream_transport` 逐行读取 + `iter_sse_json_lines` 解析；OpenAI/Anthropic 各自处理分片/orphan 场景（OpenAI 按 index 累积 tool_call arguments 片段、Anthropic 按事件类型解析并 flush orphan blocks）；默认真实流式，显式 `None` 回退 complete 重放 replay。
 
+图像生成 capability 已落地：`noname_harness/image_gen_adapter.py`（`OpenAIImageGenAdapter`，OpenAI 兼容 `/images/generations`）按「能力结晶成插件」经 `load_image_gen_plugin` 接入，复用 `vendor_http` 凭证安全基类，作为 `ImageGenerator` 注入品味卡片视觉层（seed 语义诚实标注不支持，`rebuildable: False` 不伪造确定性）。
+
 ## 4. Model Recipe
 
 一个 recipe 是角色组合，不是模型列表：
@@ -153,7 +155,7 @@ IDLE
 
 `noname_harness/agent_loop.py` 已实现本节核心（schema v5）：
 
-- 状态机已落地，含合法转移表，非法转移即 `AgentLoopError`；`STREAMING_OUTPUT` / `COMPACTING` 因原型层无驱动可达暂未实现，待真实驱动接入后恢复；
+- 状态机已落地，含合法转移表，非法转移即 `AgentLoopError`；`STREAMING_OUTPUT` / `COMPACTING` 尚未进入合法转移表——流式输出在适配器层落地（§3 真流式 SSE），loop 不在流式期间转移状态；压缩后重生属 Router 决策（`session.forked`），loop 不内建压缩状态；
 - 每次状态转移都是 `loop.transition` 事件，转移全入账；停止条件即本节所列六项；
 - 驱动异常与契约违反（矛盾 `LoopResult`、未知 `stop_reason`）统一归一为 `FAILED`，经 `_force_fail` 写真实 transition（`forced: true`）到终态；
 - `reconstruct()` 从事件流重建状态 / 轮次 / limits（从 `loop.started` 读回），不依赖进程内对象；

@@ -101,6 +101,6 @@ embedding 只用于「哪些记录可能属于一组」的召回。最终分组�
 - 卡片层已落地：`noname_harness/taste_cards.py`（`TasteCardService`）+ `taste_cards` 表（schema v6，append-only、版本化、supersedes 链、INSERT 边界防护、`one_child_per_parent` 唯一索引）。
 - 聚类为确定性替身：按 `(scope, track)` 分组已审核活跃品味，无语义/embedding；未来聚类器可替换，但不绕过同一存储与审核契约。
 - 生命周期状态机已实现：`candidate / active / paused / retired` 及合法转移表，仅 head 可审，review 在事务内写锁下重检 head；split 原子（退休原卡 + 创建互斥候选子卡在同一事务，校验前置且互不相交）。
-- 图像视觉层已落地：`noname_harness/card_images.py`（可注入 `ImageGenerator` 协议 + 确定性抽象排版渲染器 `local_typographic_image`）；图像字节作为 evidence span 原子持久化并可溯源，卡片版本化引用 `event_id + path`；多模态风险防控内建（「视觉解释」标注、默认抽象排版、生成器只接收卡片文本、`abstract / no_faces` 来自生成器自身元数据），不用图像反推品味。真实图像模型按同一协议以插件注入。
+- 图像视觉层已落地：`noname_harness/card_images.py`（可注入 `ImageGenerator` 协议 + 确定性抽象排版渲染器 `local_typographic_image`）；图像字节作为 evidence span 原子持久化并可溯源，卡片版本化引用 `event_id + path`；多模态风险防控内建（「视觉解释」标注、默认抽象排版、生成器只接收卡片文本、`abstract / no_faces` 来自生成器自身元数据），不用图像反推品味。真实图像模型插件已按同一协议落地：`noname_harness/image_gen_adapter.py`（OpenAI 兼容 `/images/generations`，经 `load_image_gen_plugin` 结晶成插件，seed 语义诚实标注不支持）。
 - 复核队列确定性：候选优先（`recorded_at` 最久优先、`id` 决胜），active 按最久未确认排序；无随机稀有度。
 - stale 仅标注：分组 taste 不再全是活跃 head 时投影标注 stale，提示复核，不阻断、不自动修改。

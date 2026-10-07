@@ -11,11 +11,9 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 ## 验证方式（怎么证明没有 bug）
 
 - **517 个自动化测试全绿**（`pytest -q`），覆盖每个模块的 happy path 与失败路径。
-- **二十四轮对抗性审查**：每个安全关键层（审批门、沙箱、凭证安全、投影、抽取、检索、图像、账本）都经过独立 reviewer 用可执行探针攻击，发现的每个 high/medium 漏洞都已修复并配回归测试。沙箱与 OpenAI 适配器各经历两轮 REJECT 级专攻后才通过。
+- **二十八轮对抗性审查**：每个安全关键层（审批门、沙箱、凭证安全、投影、抽取、检索、图像、账本）都经过独立 reviewer 用可执行探针攻击，发现的每个 high/medium 漏洞都已修复并配回归测试。沙箱与 OpenAI 适配器各经历两轮 REJECT 级专攻后才通过。
 - **一次系统性交付审计**：vision 原则、runtime-arch 稳定接口、文档一致性三路并行核对，发现的偏差已全部修复。
 - **系统级综合验证**：10+ 项核心能力在一个真实工作流中协同验证（见文末）。
-
-10+ 项核心能力在一个真实工作流中协同验证（见文末）。
 
 ## vision 四条原则 · 逐项核验
 
@@ -68,7 +66,7 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 - **真实能力以插件接入**：模型适配器、embedding 服务、图像模型插件都按"能力结晶成插件"加载审计，内核不依赖任何供应商。
 - **真流式 SSE 已落地**：`secure_stream_transport`（逐行读取、无重定向、HTTPS 强制、错误按因分类）+ `iter_sse_json_lines` 解析；OpenAI 按 index 累积 tool_call 片段、Anthropic 按事件类型解析并 flush orphan blocks；默认真实流式，显式 `None` 回退 complete 重放 replay。
 
-## CLI · 29 个命令
+## CLI · 30 个命令
 
 `init event snapshot curate extract propose review state proposals inbox ledger ledger-html search embed package recipes route taste-add taste-propose taste-review taste card-propose card-create card-review card-queue card-image card verify reindex`
 
@@ -96,7 +94,7 @@ pytest -q   # 517 passed
 
 ## 演进
 
-22 个版本（0.3.0 → 0.23.0），每个版本的 Features / Design Rationale / Notes & Caveats 见 [CHANGELOG.md](CHANGELOG.md)。设计文档见 [docs/](docs/)（vision、architecture、memory-model、runtime-architecture、ledger、taste-cards、prototype）。
+32 个版本（0.3.0 → 0.32.0），每个版本的 Features / Design Rationale / Notes & Caveats 见 [CHANGELOG.md](CHANGELOG.md)。设计文档见 [docs/](docs/)（vision、architecture、memory-model、runtime-architecture、ledger、taste-cards、prototype）。
 
 ---
 
