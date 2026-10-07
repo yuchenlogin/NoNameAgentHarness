@@ -12,7 +12,7 @@
   - **F4 [MEDIUM]** 轮次继承按 run 隔离：`MAX(round)` 只统计最近一次 `loop.started` 之后的 transition，同 session 早先 run 的轮次不再污染当前 run 的预算（原语义下 run1 的 9 轮会把 run2 错误打到 round_limit）。
   - **F5 [LOW]** `_drive` 私有入口加纵深防御断言：仅 IDLE（run() 路径）或 resume() 显式置位的 CANCELLED+scratch 可进入，从 CANCELLED 直接调私有 `_drive` 绕过门禁被响亮拒绝（docstring 注明这是纵深防御而非安全边界）。
   - **F2 [HIGH-ish，信任边界]**：不做代码改动，docstring 与 docs/runtime-architecture.md §6 明说 resume 的信任边界——事件流无作者概念，能写 session 事件流的 actor 已被信任；伪造 finish 只能解锁 resume 之门，不能伪造审批令牌、不能绕过执行期实名绑定（物理防线是 gate 3 + 执行期校验）。
-- 回归测试：tests/test_resume.py 13 → 18（新增 F1 多进程竞速、F3 合法循环 + 同 pause 双 resume 拒绝、F4 多 run 轮次隔离、F5 `_drive` 重入拒绝），探针 A3/C4/D3/E1 择优转为正式回归；四文件矩阵（resume/agent_loop/cancel/parallel_tools）56 全绿，全套 461 绿（test_image_gen_adapter.py 由并行任务处理，未动）。
+- 回归测试：tests/test_resume.py 13 → 16（新增 F1 多进程竞速、F3 合法循环 + 同 pause 双 resume 拒绝、F4 多 run 轮次隔离、F5 `_drive` 重入拒绝），探针 A3/C4/D3/E1 择优转为正式回归；全套 517 绿（含同任务并行落地的 test_image_gen_adapter.py 加固回归）。
 
 ### Design Rationale
 
@@ -49,6 +49,24 @@
 - 行为变化：直接 `OpenAIImageGenAdapter(...)` 构造的 adapter 默认拒绝 generate，需经 `load_image_gen_plugin` 激活（或测试中显式 `_mark_plugin_loaded()`）；`validate_base_url` 提前到构造时意味着非法 base_url 在构造即抛——openai/anthropic/embedding 适配器行为不变（它们仍在调用时校验），全套 512 测试绿。
 - `Plugin.unload` 为可选字段，现有插件无需改动；钩子在贡献回收后、`plugin.unloaded` 账本事件前执行。
 - 回归测试 +22（tests/test_image_gen_adapter.py 56 个），关键攻击探针（凭证回显 error_code、巨型 b64、SVG script、usage 投毒、unload 后 egress）已转为正式回归。
+
+## [0.29.1] - 2026-10-07
+
+> 追记：并行 tool_call 是版本级能力（runtime-arch §3 工具调用契约的扩展），按项目惯例应在此有条目；原两次提交（3035062 feat + 827614b fix）当时未记，0.30 条目编写时发现计数链断裂后补记。
+
+### Features
+
+- 并行 tool_call 落地——一轮多工具调用（经一轮对抗性审查后加固，schema 不变，仍为 v7）：`LoopResult.tool_calls`（复数）与 `tool_call`（单数）互斥，模型一轮可请求多个工具；每个调用**独立过审批门**（gated 调用各自需独立令牌，批次内不共享授权）；结果按调用 id 关联回传，driver 据此构建正确的 tool_result/tool 消息。
+- 审查加固：pre-flight 真正不部分执行——整批扫描任何无有效令牌的 gated 调用，发现即在执行前停止（**真正零部分执行**：无早先调用运行、无副作用入账）；并行批次包装为显式 `{"_parallel": [...]}` 标记，合法返回 list 的工具结果永不被误认作并行结果；pending 调用在 CANCELLED transition detail 与 summary output 中明示（name + index + arguments 哈希），供 resume 校验令牌绑定。
+
+### Design Rationale
+
+- **为什么 pre-flight 必须在执行前扫描整批而非边执行边停**：边执行边停会让「批次中第 N 个 gated 调用缺令牌」时前 N-1 个调用的副作用已入账——「不部分执行」沦为空话。pre-flight 把授权检查提升为批次的前置条件，任何 gated 缺令牌即整批不执行，审计语义与实际行为一致。
+
+### Notes & Caveats
+
+- 新增 9 个测试（tests/test_parallel_tools.py）。
+- 单调用路径（`tool_call`）完全向后兼容，现有 driver 零改动。
 
 ## [0.30.0] - 2026-10-07
 
