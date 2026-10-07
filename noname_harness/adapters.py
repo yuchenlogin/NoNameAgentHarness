@@ -338,11 +338,26 @@ class AdapterDriver:
             # Map every tool call (single or parallel).  Each is validated and
             # gets its own id for result correlation; the loop executes them all
             # through the approval gate (each gated call needs its own token).
+            # Assign this turn's pending ids up front (clears any stale ids
+            # from a previous approval-stop or failed turn), so correlation
+            # never leaks across turns.
+            self._pending_tool_call_ids = [call.get("id") for call in response.tool_calls]
             mapped = [self._map_tool_call(call, context) for call in response.tool_calls]
             if len(mapped) == 1:
                 return LoopResult(tool_call=mapped[0])
             return LoopResult(tool_calls=mapped)
         return LoopResult(output=response.text, task_complete=True)
+
+    @staticmethod
+    def wrap_parallel_results(results: list[Any]) -> dict[str, Any]:
+        """Wrap parallel tool results in the explicit correlation marker.
+
+        The loop passes this back as ``last_tool_result`` so the driver can
+        distinguish "several parallel results" from "one tool that returned a
+        list" when correlating results to their call ids.
+        """
+
+        return {"_parallel": list(results)}
 
     def _map_tool_call(self, call: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
         """Validate and normalise a vendor tool call for the loop's gate.
@@ -382,7 +397,6 @@ class AdapterDriver:
                 raise AgentLoopError(
                     "adapter supplied an unknown or consumed approval token id"
                 )
-        self._pending_tool_call_ids.append(call.get("id"))
         return {
             "name": name,
             "arguments": arguments,
@@ -471,21 +485,29 @@ class AdapterDriver:
             ModelMessage(role="user", content=json.dumps(brief, ensure_ascii=False))
         )
         if last_tool_result is not None:
-            # Correlate each result to the tool call that produced it.  A single
-            # result pairs with the single pending id; a list of results (from
-            # parallel calls) pairs positionally with the pending ids.
-            results = last_tool_result if isinstance(last_tool_result, list) else [last_tool_result]
+            # Correlate results to their tool calls.  Parallel results arrive as
+            # {"_parallel": [...]} (an explicit marker), so a tool that happens
+            # to RETURN a list is never mistaken for parallel results.  A single
+            # result pairs with the single pending id.
+            if isinstance(last_tool_result, dict) and "_parallel" in last_tool_result:
+                results = last_tool_result["_parallel"]
+            else:
+                results = [last_tool_result]
             for index, result in enumerate(results):
                 tool_use_id = (
                     self._pending_tool_call_ids[index]
                     if index < len(self._pending_tool_call_ids)
                     else None
                 )
+                # Positional fallback when a call has no id: a constant
+                # "last_tool_result" name would falsely claim a correlation that
+                # does not exist (and breaks Anthropic's tool_use_id lookup).
+                name = tool_use_id if tool_use_id is not None else f"tool_result_{index}"
                 messages.append(
                     ModelMessage(
                         role="tool",
                         content=json.dumps(result, ensure_ascii=False, default=str),
-                        name=tool_use_id or "last_tool_result",
+                        name=name,
                     )
                 )
             # Pending ids are consumed once the results are fed back.

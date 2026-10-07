@@ -232,14 +232,44 @@ class AgentLoop:
                         if result.tool_call is not None
                         else list(result.tool_calls)
                     )
+                    # Pre-flight: scan the whole batch for any gated call that
+                    # lacks a valid token BEFORE executing anything.  A gated
+                    # call stops the turn here -- true "no partial execution":
+                    # no earlier call runs and no side effect is recorded.
+                    pending = self._first_gated_call(calls)
+                    if pending is not None:
+                        # Record the approval requirement so the ledger shows
+                        # WHICH gated call is waiting (the same event type an
+                        # in-execution gate would produce, for a coherent audit).
+                        self.store.append_event(
+                            self.session_id,
+                            "tool.approval_required",
+                            {
+                                "name": pending.get("name"),
+                                "reason": "pre-flight: gated tool call lacks a valid approval token",
+                            },
+                        )
+                        self._transition(
+                            "CANCELLED",
+                            {
+                                "reason": "waiting_approval",
+                                "pending_tool": pending.get("name"),
+                                "pending_index": calls.index(pending),
+                            },
+                        )
+                        return self._summary(
+                            "waiting_approval",
+                            context,
+                            output={"pending_tool": pending.get("name"), "pending_index": calls.index(pending)},
+                        )
                     self._transition("WAITING_TOOL", {"tools": [c.get("name") for c in calls]})
                     results = []
                     approval_needed = False
                     for call in calls:
                         tool_result = self._execute_tool_call(call)
                         if tool_result is _WAITING_APPROVAL:
-                            # Conservative: any gated call needing approval stops
-                            # the whole turn -- no partial execution.
+                            # A token became invalid mid-batch (e.g. consumed by
+                            # an earlier parallel call): stop conservatively.
                             approval_needed = True
                             break
                         results.append(tool_result)
@@ -247,10 +277,14 @@ class AgentLoop:
                         self._transition("CANCELLED", {"reason": "waiting_approval"})
                         return self._summary("waiting_approval", context)
                     # Each result is correlated back to its call by id, so the
-                    # driver can build the right tool_result/tool message.
-                    last_tool_result = (
-                        results[0] if result.tool_call is not None else results
-                    )
+                    # driver can build the right tool_result/tool message.  A
+                    # parallel batch is wrapped in an explicit marker so a tool
+                    # that legitimately RETURNS a list is never mistaken for
+                    # parallel results.
+                    if result.tool_call is not None:
+                        last_tool_result = results[0]
+                    else:
+                        last_tool_result = {"_parallel": results}
                     self._transition("APPLYING_RESULT")
                 else:
                     self._transition("APPLYING_RESULT")
@@ -375,6 +409,22 @@ class AgentLoop:
             return ("FAILED", "round_limit")
         if self.budget_rounds is not None and self._rounds >= self.budget_rounds:
             return ("FAILED", "budget_limit")
+        return None
+
+    def _first_gated_call(self, calls: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Return the first gated call lacking a valid token, without executing.
+
+        Used by the pre-flight scan so a gated call stops the turn before any
+        tool runs.  Returns None when there is no registry (no gate) or when
+        every gated call has a valid token.
+        """
+
+        if self.tool_registry is None:
+            return None
+        for call in calls:
+            token = call.get("approval_token")
+            if self.tool_registry.requires_approval_for(call.get("name"), token):
+                return call
         return None
 
     def _execute_tool_call(self, tool_call: dict[str, Any]) -> Any:

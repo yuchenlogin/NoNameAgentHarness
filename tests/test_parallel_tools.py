@@ -166,3 +166,132 @@ def test_empty_tool_calls_list_rejected(tmp_path):
         assert "empty list" in summary["error"]
     finally:
         store.close()
+
+
+# --- 对抗性审查发现的回归 ---
+
+def test_preflight_gated_call_executes_nothing(tmp_path):
+    """[safe, gated, safe2]: pre-flight stops BEFORE safe runs (true no partial execution)."""
+    store, _ = make_store(tmp_path)
+    try:
+        registry = ToolRegistry(store)
+        executed = []
+        registry.register(Tool(
+            ToolSchema(name="safe", description="d", input_schema={}),
+            execute=lambda a: executed.append("safe") or "ok", permission="read", approval="never",
+        ))
+        registry.register(Tool(
+            ToolSchema(name="danger", description="d", input_schema={}),
+            execute=lambda a: executed.append("danger") or "ok", permission="destructive", approval="always",
+        ))
+        adapter = _multi_adapter([
+            {"tool_calls": [
+                {"name": "safe", "arguments": {}, "id": "c1"},
+                {"name": "danger", "arguments": {}, "id": "c2"},
+                {"name": "safe", "arguments": {}, "id": "c3"},
+            ]},
+        ])
+        driver = AdapterDriver(adapter, tool_registry=registry)
+        loop = AgentLoop(store=store, session_id="s", driver=driver, tool_registry=registry)
+        summary = loop.run("t")
+        assert summary["final_state"] == "CANCELLED"
+        assert summary["stop_reason"] == "waiting_approval"
+        # TRUE no partial execution: safe never ran, no side effect recorded.
+        assert executed == []
+        # The ledger names WHICH gated call is waiting.
+        assert summary["output"]["pending_tool"] == "danger"
+        assert summary["output"]["pending_index"] == 1
+        # An approval_required event names the gated call.
+        event = next(e for e in store.list_events("s", limit=50) if e.event_type == "tool.approval_required")
+        assert event.payload["name"] == "danger"
+    finally:
+        store.close()
+
+
+def test_list_returning_tool_is_not_split_into_parallel_results(tmp_path):
+    """A single tool that RETURNS a list must not be split into N tool messages."""
+    store, _ = make_store(tmp_path)
+    try:
+        registry = ToolRegistry(store)
+        registry.register(Tool(
+            ToolSchema(name="ls", description="d", input_schema={}),
+            execute=lambda a: ["file1", "file2", "file3"], permission="read", approval="never",
+        ))
+        captured = []
+        adapter = _multi_adapter([
+            {"tool_calls": [{"name": "ls", "arguments": {}, "id": "call_ls"}]},
+        ])
+        original_build = AdapterDriver._build_request
+        def spy(self, context, last_tool_result=None):
+            req = original_build(self, context, last_tool_result)
+            captured.append(req)
+            return req
+        AdapterDriver._build_request = spy
+        driver = AdapterDriver(adapter, tool_registry=registry)
+        loop = AgentLoop(store=store, session_id="s", driver=driver, tool_registry=registry)
+        summary = loop.run("t")
+        # The list-returning single call produces exactly ONE tool message.
+        tool_msgs = [m for m in captured[-1].messages if m.role == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0].name == "call_ls"
+    finally:
+        AdapterDriver._build_request = original_build
+        store.close()
+
+
+def test_pending_ids_do_not_leak_across_runs(tmp_path):
+    """Pending ids from a stopped/failed turn must not corrupt the next turn's correlation."""
+    store, _ = make_store(tmp_path)
+    try:
+        registry = ToolRegistry(store)
+        registry.register(Tool(
+            ToolSchema(name="w", description="d", input_schema={"x": "string"}),
+            execute=lambda a: "ok", permission="write", approval="always",
+        ))
+        # Turn 1: model requests a gated call, loop stops for approval.
+        adapter1 = _multi_adapter([
+            {"tool_calls": [{"name": "w", "arguments": {"x": "1"}, "id": "c1"}]},
+        ])
+        driver = AdapterDriver(adapter1, tool_registry=registry)
+        loop1 = AgentLoop(store=store, session_id="s", driver=driver, tool_registry=registry)
+        summary1 = loop1.run("t1")
+        assert summary1["final_state"] == "CANCELLED"
+        # The driver's pending ids were reset for turn 1, then cleared by the stop.
+        # A new turn must start clean (no stale c1).
+        token = registry.grant_approval("w", {"x": "1"}, approver_id="user", session_id="s")
+        adapter2 = _multi_adapter([
+            {"tool_calls": [{"name": "w", "arguments": {"x": "1"}, "id": "n1", "approval_token": token.id}]},
+            "done",
+        ])
+        driver2 = AdapterDriver(adapter2, tool_registry=registry)
+        loop2 = AgentLoop(store=store, session_id="s", driver=driver2, tool_registry=registry)
+        summary2 = loop2.run("t2")
+        assert summary2["final_state"] == "COMPLETED"
+    finally:
+        store.close()
+
+
+def test_waiting_approval_names_pending_call(tmp_path):
+    store, _ = make_store(tmp_path)
+    try:
+        registry = ToolRegistry(store)
+        registry.register(Tool(
+            ToolSchema(name="deploy", description="d", input_schema={"env": "string"}),
+            execute=lambda a: "ok", permission="destructive", approval="always",
+        ))
+        adapter = _multi_adapter([
+            {"tool_calls": [{"name": "deploy", "arguments": {"env": "prod"}, "id": "c1"}]},
+        ])
+        driver = AdapterDriver(adapter, tool_registry=registry)
+        loop = AgentLoop(store=store, session_id="s", driver=driver, tool_registry=registry)
+        summary = loop.run("t")
+        assert summary["final_state"] == "CANCELLED"
+        # The operator is told WHICH call needs approval.
+        assert summary["output"]["pending_tool"] == "deploy"
+        transition = next(
+            e for e in store.list_events("s", limit=50)
+            if e.event_type == "loop.transition" and e.payload.get("to") == "CANCELLED"
+        )
+        assert transition.payload["pending_tool"] == "deploy"
+    finally:
+        store.close()

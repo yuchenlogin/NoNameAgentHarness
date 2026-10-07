@@ -579,6 +579,26 @@ class ToolRegistry:
         )
         return result
 
+    def requires_approval_for(self, name: str, approval_token: ApprovalToken | None) -> bool:
+        """Return whether a call would need approval WITHOUT executing it.
+
+        This is a non-mutating pre-flight check used by the agent loop to scan
+        a batch of tool calls before executing any of them, so a gated call
+        stops the whole turn *before* any side effect happens (true "no partial
+        execution").  A call needs approval iff the tool is gated and no valid
+        token bound to this call is presented.
+        """
+
+        tool = self._tools.get(name)
+        if tool is None:
+            return False  # unknown tools fail at request time, not here
+        if not tool.requires_approval:
+            return False
+        if approval_token is None:
+            return True
+        live = self._grants.get(approval_token.id)
+        return live is None or live.tool_name != name
+
     def get_live_token(self, token_id: str) -> ApprovalToken | None:
         """Return a live (unconsumed) approval token by id, or None.
 
