@@ -558,10 +558,17 @@ class AgentLoop:
                 # name-only check; execution-time verification still applies.)
                 or (pending_arguments_hash is not None
                     and live.arguments_hash != pending_arguments_hash)
+                # A grant is also SESSION-bound: a live token minted for
+                # session s1 must not unlock the resume gate of s2's pause
+                # (same tool + identical arguments hash would otherwise match).
+                # The registry already enforces this at execution time, but the
+                # gate must not burn s2's one-resume-per-pause on a grant that
+                # was never issued for s2.
+                or getattr(live, "session_id", None) != session_id
             ):
                 raise AgentLoopError(
                     f"cannot resume session '{session_id}': approval token is not a live "
-                    f"grant bound to the pending call {pending_tool!r}"
+                    f"grant bound to this session's pending call {pending_tool!r}"
                 )
 
             # The resume itself is an append-only, replayable ledger fact: who

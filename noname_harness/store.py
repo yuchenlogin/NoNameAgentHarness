@@ -119,6 +119,35 @@ def _parse_instant(value: str, field: str) -> str:
 
 
 
+def _check_finite_vector(vector: Any, *, context: str) -> None:
+    """Refuse non-finite embedding vectors before they can poison a projection.
+
+    A NaN/inf component makes every cosine similarity computed against the
+    vector NaN, silently corrupting recall/ranking order.  The vendor adapter
+    checks at the network seam; this is the defence-in-depth check at the
+    store seam so no embedding implementation can bypass it.
+    """
+
+    try:
+        components = list(vector)
+    except TypeError:
+        raise TypeError(
+            f"{context}: embedding function must return a sequence of floats, "
+            f"got {type(vector).__name__}"
+        ) from None
+    for component in components:
+        if not isinstance(component, (int, float)) or isinstance(component, bool):
+            raise TypeError(
+                f"{context}: embedding vector components must be numbers, "
+                f"got {type(component).__name__}"
+            )
+        if not math.isfinite(component):
+            raise ValueError(
+                f"{context}: embedding vector contains a non-finite component "
+                "({!r}); refusing to poison the recall projection".format(component)
+            )
+
+
 def _is_read_only_sql(sql: str) -> bool:
     """Return whether a statement is a plain read (SELECT / WITH / read PRAGMA).
 
@@ -688,6 +717,18 @@ class HarnessStore:
         # Events without a project/workspace cannot be safely handed off or
         # checked against the configured boundary.
         self.project()
+        # The ledger is str-keyed: anything else (notably bytes, which have a
+        # .strip() that would pass a blank check) would be stored as a SQLite
+        # BLOB and become an invisible split-brain ledger -- written under one
+        # key type, unreachable via the str form.  Fail loudly at the seam.
+        if not isinstance(session_id, str):
+            raise TypeError(
+                f"session_id must be a str, got {type(session_id).__name__}"
+            )
+        if not isinstance(event_type, str):
+            raise TypeError(
+                f"event_type must be a str, got {type(event_type).__name__}"
+            )
         if not session_id.strip():
             raise ValueError("session_id cannot be empty")
         if not event_type.strip():
@@ -1105,6 +1146,7 @@ class HarnessStore:
                         _decode(row["payload_json"]), row["occurred_at"], row["content_hash"],
                     )
                     vector = embed(self._searchable_text(event))
+                    _check_finite_vector(vector, context="embedding index build")
                     dimensions = len(vector)
                     connection.execute(
                         "INSERT INTO event_embeddings(event_id, dimensions, vector_json, model_id, embedded_at) "
@@ -1172,6 +1214,7 @@ class HarnessStore:
                 "same embedding function"
             )
         query_vector = embed(query)
+        _check_finite_vector(query_vector, context="semantic query")
 
         clauses = []
         args: list[Any] = []
@@ -1499,6 +1542,10 @@ class HarnessStore:
     ) -> dict[str, Any]:
         if layer not in VALID_LAYERS:
             raise ValueError("durable proposals may only use high or mid layer")
+        if not isinstance(logical_key, str):
+            raise TypeError(
+                f"logical_key must be a str, got {type(logical_key).__name__}"
+            )
         if not logical_key.strip():
             raise ValueError("logical_key cannot be empty")
         if confidence is not None:
@@ -1706,6 +1753,10 @@ class HarnessStore:
     ) -> dict[str, Any]:
         if action not in VALID_REVIEW_ACTIONS:
             raise ValueError(f"invalid review action: {action}")
+        if not isinstance(reviewer_id, str):
+            raise TypeError(
+                f"reviewer_id must be a str, got {type(reviewer_id).__name__}"
+            )
         if not reviewer_id.strip():
             raise ValueError("reviewer_id cannot be empty")
         proposal = self.get_proposal(proposal_id)

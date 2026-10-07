@@ -47,10 +47,28 @@ def image_metadata_contract(generator_id: str, prompt: str, seed: int, version: 
     }
 
 
-def _seed_for(summary: dict[str, Any]) -> int:
-    """A deterministic seed from the card content (reproducible)."""
+def _sanitize_text(value: Any) -> str:
+    """Coerce to str and drop lone surrogates (invalid Unicode).
 
-    key = f"{summary.get('title','')}|{summary.get('attitude','')}|{summary.get('track','')}"
+    A corrupted/hostile card can carry lone surrogates (e.g. 'surrog\\ud800ate')
+    that no UTF-8 encoder can represent.  Every render seam (seed hashing,
+    SVG text) must sanitise rather than crash: encode+replace rewrites each
+    lone surrogate to U+FFFD, keeping the output deterministic and valid XML.
+    """
+
+    return str(value).encode("utf-8", errors="replace").decode("utf-8")
+
+def _seed_for(summary: dict[str, Any]) -> int:
+    """A deterministic seed from the card content (reproducible).
+
+    The seed only needs determinism, not losslessness, so surrogates are
+    sanitised before hashing.
+    """
+
+    key = "|".join(
+        _sanitize_text(summary.get(field, ""))
+        for field in ("title", "attitude", "track")
+    )
     return int.from_bytes(hashlib.sha256(key.encode("utf-8")).digest()[:4], "big") % (2**31)
 
 
@@ -65,9 +83,11 @@ def local_typographic_image(
     rebuildable from its metadata.
     """
 
-    title = str(summary.get("title", ""))[:40]
-    attitude = str(summary.get("attitude", ""))[:120]
-    track = str(summary.get("track", ""))
+    # Sanitise BEFORE truncating/escaping: a lone surrogate is not encodable
+    # UTF-8 and is never legal in XML 1.0 output, no matter where it lands.
+    title = _sanitize_text(summary.get("title", ""))[:40]
+    attitude = _sanitize_text(summary.get("attitude", ""))[:120]
+    track = _sanitize_text(summary.get("track", ""))
     seed = _seed_for(summary)
     # A deterministic accent rotation from the seed (subtle, not loud).
     hue = 10 + (seed % 30)  # warm accent range
@@ -101,7 +121,8 @@ def _xml_safe(text: str) -> str:
     return "".join(
         ch
         for ch in escaped
-        if ch in ("\t", "\n", "\r") or ord(ch) >= 0x20
+        if ch in ("\t", "\n", "\r")
+        or (0x20 <= ord(ch) and not 0xD800 <= ord(ch) <= 0xDFFF)
     )
 
 

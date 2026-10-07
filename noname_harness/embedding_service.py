@@ -20,6 +20,7 @@ network and no API key.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -136,6 +137,15 @@ class OpenAIEmbedding:
         if not isinstance(vector, list) or not all(type(v) in (int, float) for v in vector):
             raise ModelAdapterError(
                 "unknown", "embedding vector is malformed", vendor_ref={"id": data.get("id")}
+            )
+        # A numeric component can still be non-finite: NaN/inf pass the type
+        # check but poison every cosine similarity computed against the index.
+        # Fail closed at the vendor seam (classified non-retryable).
+        if any(not math.isfinite(v) for v in vector):
+            raise ModelAdapterError(
+                "invalid_request",
+                "embedding vector contains non-finite components (NaN/inf)",
+                vendor_ref={"id": data.get("id")},
             )
         # Pin the dimension on the first successful call and refuse any later
         # drift: a vendor that changes dimension mid-index corrupts the whole

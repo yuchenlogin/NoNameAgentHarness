@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -509,6 +510,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:  # pragma: no cover - argparse guarantees a known command
                 raise AssertionError(args.command)
         return 0
+    except sqlite3.OperationalError as exc:
+        # Database-environment failures (unopenable/read-only --db path, --db
+        # pointing at a directory, malformed db file) surface from sqlite as
+        # OperationalError -- a *user-facing* condition, reported like every
+        # other CLI error.  This intentionally does NOT catch the broader
+        # sqlite3.Error/DatabaseError family: programming errors such as a
+        # malformed SQL statement (sqlite3.ProgrammingError/InternalError) are
+        # bugs and must keep surfacing as tracebacks.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     except (ValueError, KeyError, RuntimeError, FileExistsError, WorkspaceBoundaryError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
