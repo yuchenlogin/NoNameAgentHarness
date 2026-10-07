@@ -159,6 +159,9 @@ IDLE
 - `reconstruct()` 从事件流重建状态 / 轮次 / limits（从 `loop.started` 读回），不依赖进程内对象；
 - driver 为注入的 `SessionDriver` 协议：原型用确定性 stub，生产接 Model Adapter；loop 不路由模型、不写记忆、不判权限，复用 `assemble_context_package` / `resolve_recipe` / `ToolRegistry`。
 - 取消机制已落地：`AgentLoop.cancel` 事件驱动（`loop.cancel_requested` append-only 事件，任何 actor 可从 loop 线程/进程外发起）、轮次边界协作式检测（`_check_stop` 转为 `CANCELLED`，不中断阻塞中的 `driver.act` 但不再开始下一轮）、规则 `cancel.seq > MAX(loop.finished.seq)`（新 cancel 正确归属下一个 run）、CLI `cancel --session [--reason]`，跨连接（外部 actor 独立 store）端到端验证。
+- 恢复机制已落地：`AgentLoop.resume()` 续跑 waiting_approval 暂停的 run——三道门（gate 1：最近一次 `loop.finished` 须为 waiting_approval；gate 2：**每次暂停只能 resume 一次**，`loop.resumed` 只 veto 它对应的那次暂停，seq 作用域与 `_cancellation_requested` 同构，pause→resume→pause→resume 合法循环可行；gate 3：令牌须为绑定 pending 调用的 live 一次性令牌，校验不消费）。轮次继承按 run 隔离：只统计最近一次 `loop.started` 之后的 transition 轮次，同 session 早先 run 不消耗本 run 预算；`max_rounds`/`budget_rounds` 跨暂停持续绑定，resume 不是预算后门。
+  - **并发安全**：gate 1+2 的检查与 `loop.resumed` 认领写入在同一个 `BEGIN IMMEDIATE` 事务内完成（check 与 claim 原子化），并发 actor 竞速时第二个在写锁上阻塞后重读账本被 gate 2 拒绝——不存在 check-then-act 双跑窗口；令牌的一次性消费仍由注册表执行期仲裁兜底。
+  - **信任边界（明说）**：事件流无作者概念，resume 信任账本中记录的 `loop.finished`/`loop.started` 内容——**能写 session 事件流的 actor 已被信任**。伪造 finish 事件只能解锁 resume 之门，不能伪造审批令牌（gate 3 校验的是注册表 live grant，不是事件内容），也不能绕过执行期的工具名/参数哈希/session 实名绑定；审批门的物理防线是 gate 3 + 执行期校验，而非事件谓词。`_drive` 私有入口另有纵深防御断言（仅 IDLE 或 resume 显式置位的 CANCELLED+scratch 可入），但它不是安全边界。
 
 ## 7. Router 与 Context Assembler
 
