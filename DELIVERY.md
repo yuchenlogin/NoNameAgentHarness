@@ -1,6 +1,6 @@
 # NoName Agent Harness · 交付说明
 
-> 2026-10-07 · schema v7 · 517 测试全绿 · 无外部依赖（Python 标准库 + SQLite）
+> 2026-10-08 · schema v7 · 622 测试全绿 · 无外部依赖（Python 标准库 + SQLite）
 
 这份文档对照 vision 的原始预期，逐项核验 NoName 当前状态的证据。它不是营销材料，而是一份可审计的自证：每一条"已落地"都附对应的模块与测试，每一条"未做"都诚实标注。
 
@@ -10,8 +10,8 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 
 ## 验证方式（怎么证明没有 bug）
 
-- **517 个自动化测试全绿**（`pytest -q`），覆盖每个模块的 happy path 与失败路径。
-- **二十八轮对抗性审查**：每个安全关键层（审批门、沙箱、凭证安全、投影、抽取、检索、图像、账本）都经过独立 reviewer 用可执行探针攻击，发现的每个 high/medium 漏洞都已修复并配回归测试。沙箱与 OpenAI 适配器各经历两轮 REJECT 级专攻后才通过。
+- **622 个自动化测试全绿**（`pytest -q`），覆盖每个模块的 happy path 与失败路径。
+- **二十八轮对抗性审查 + 两轮系统性暴力测试**：每个安全关键层（审批门、沙箱、凭证安全、投影、抽取、检索、图像、账本）都经过独立 reviewer 用可执行探针攻击，发现的每个 high/medium 漏洞都已修复并配回归测试。沙箱与 OpenAI 适配器各经历两轮 REJECT 级专攻后才通过。
 - **一次系统性交付审计**：vision 原则、runtime-arch 稳定接口、文档一致性三路并行核对，发现的偏差已全部修复。
 - **系统级综合验证**：10+ 项核心能力在一个真实工作流中协同验证（见文末）。
 
@@ -79,7 +79,7 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 - **网络隔离与资源限额**：沙箱当前为文件边界 + 命令允许列表 + 进程组超时。
 - **多用户同步、远程数据库、加密存储**。
 
-## 系统级综合验证（2026-10-07 实测）
+## 系统级综合验证（2026-10-07 实测，2026-10-08 复核）
 
 暂停后 resume 已落地：`AgentLoop.resume()` 从事件流重建 waiting_approval run——三重门控（仅 waiting_approval 可恢复、同一 pause 原子认领一次、live 令牌绑定 pending 调用参数哈希）、轮次按 run 隔离继承、预算跨暂停强制、跨连接接管端到端验证（tests/test_resume.py）。
 
@@ -89,12 +89,12 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 
 ```bash
 python3 -m noname_harness init --db .noname/harness.db --root . --name "我的项目"
-pytest -q   # 517 passed
+pytest -q   # 622 passed
 ```
 
 ## 演进
 
-32 个版本（0.3.0 → 0.32.0），每个版本的 Features / Design Rationale / Notes & Caveats 见 [CHANGELOG.md](CHANGELOG.md)。设计文档见 [docs/](docs/)（vision、architecture、memory-model、runtime-architecture、ledger、taste-cards、prototype）。
+33 个版本（0.3.0 → 0.33.0），每个版本的 Features / Design Rationale / Notes & Caveats 见 [CHANGELOG.md](CHANGELOG.md)。设计文档见 [docs/](docs/)（vision、architecture、memory-model、runtime-architecture、ledger、taste-cards、prototype）。
 
 ---
 

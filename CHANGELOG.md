@@ -2,6 +2,27 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.33.0] - 2026-10-08
+
+### Features
+
+- 第二轮系统性暴力/模糊测试（tests/test_brutal_round2.py，94 项 + 6 项 xfail 复现）攻击首轮 brutal 之后新增的全部公开入口：CLI 30 子命令、PluginRuntime 恶意插件、渲染管线 XSS、 sandbox 路径穿越、AgentLoop/resume 畸形输入、WAL 并发、随机工作流不变式（seed 424242，120 步，每步 verify_integrity + 投影确定性 + gated 工具零执行）。确认的 6 个真实 bug 全部修复并转正式回归（schema 不变，仍为 v7）：
+  - **[高] bytes session_id 分裂账本**：`append_event` 的空值检查被 bytes 的 `.strip()` 骗过，BLOB 入库后 str 查询永远丢失——显式 `isinstance(str)` 校验，同类入口（`create_proposal`/`review_proposal`）统一加固。
+  - **[中] resume gate 3 跨 session**：只校验 tool name + arguments hash、漏 token 的 session 绑定，s1 的 token 可解锁 s2 的 resume——校验链追加 `ApprovalToken.session_id`（执行层 session 绑定本已兜住，此修复关掉了闸门层的绕过与 pause 烧毁）。
+  - **[中×2] CLI 坏 db 路径泄 Traceback**：`--db` 指向只读文件系统/目录时 `sqlite3.OperationalError` 逃逸——`main` 精确捕获（`DatabaseError`/`ProgrammingError` 仍响亮暴露不降级），30 子命令共享入口全覆盖。
+  - **[中] 孤立 surrogate 渲染 DoS**：`card_images._seed_for` 对卡片文本直接 `.encode("utf-8")`——新增 `_sanitize_text`（replace → U+FFFD），seed/render 全走 sanitize；`_xml_safe` 补 `0xD800–0xDFFF` 排除，surrogate 永不入 XML。
+  - **[中] 非有限浮点毒化向量管线**：`_map_vector` 只查类型不查 isfinite，NaN 向量入库后 search/rerank 返回全 NaN——双缝 fail-closed：adapter 每分量 `math.isfinite`（classified invalid_request）+ `store._check_finite_vector` 入库前与查询向量两处把关。
+
+### Design Rationale
+
+- **为什么 CLI 只捕获 OperationalError 而非 sqlite3.Error 基类**：`DatabaseError` 代表 db 文件损坏、`ProgrammingError` 代表 SQL 代码 bug——这些必须以 traceback 响亮暴露给开发者，不能降级成 `error:` 友好提示而掩盖真正的问题。友好只给「环境性问题」（路径不可写/是目录），响亮保留给「代码/数据问题」。
+- **为什么 NaN 必须在入库端挡住而非只在查询端过滤**：投影被毒化的成本是不可见的——rerank 对 NaN similarity 不崩溃但排序未定义，用户会拿到「看起来正常实则随机」的召回结果。入库端 fail-closed 让毒化在发生点响亮，而非下游静默。
+
+### Notes & Caveats
+
+- 6 个 xfail(strict=True) 复现测试全部转为正式断言 + 5 个新边界测试；622 passed, 0 failed, 0 xfailed。
+- 修复全部 fail-closed 且最小化；`embeddings.py` 无需改动（`local_hash_embedding` 天然有限）。
+
 ## [0.32.0] - 2026-10-07
 
 ### Features
