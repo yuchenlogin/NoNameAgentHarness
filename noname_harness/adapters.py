@@ -328,6 +328,14 @@ class AdapterDriver:
         # can be correlated back to its call on the next turn (required by APIs
         # like Anthropic's tool_result block, and [OI] tool messages).
         self._pending_tool_call_ids: list[str | None] = []
+        # The raw tool calls from the model's last turn, kept so the next
+        # request can rebuild the assistant message that carries them.  Strict
+        # OpenAI-compatible gateways reject a tool message that does not answer
+        # an assistant message with matching ``tool_calls`` (400): the history
+        # [user, tool] is protocol-invalid without the assistant turn in
+        # between.  Only the vendor-facing shape (id / function name /
+        # serialized arguments) is retained, never the executed result.
+        self._pending_assistant_tool_calls: list[dict[str, Any]] = []
 
     def act(self, context: dict[str, Any], last_tool_result: Any = None) -> Any:
         from .agent_loop import LoopResult
@@ -342,6 +350,9 @@ class AdapterDriver:
             # from a previous approval-stop or failed turn), so correlation
             # never leaks across turns.
             self._pending_tool_call_ids = [call.get("id") for call in response.tool_calls]
+            self._pending_assistant_tool_calls = [
+                self._assistant_tool_call_payload(call) for call in response.tool_calls
+            ]
             mapped = [self._map_tool_call(call, context) for call in response.tool_calls]
             if len(mapped) == 1:
                 return LoopResult(tool_call=mapped[0])
@@ -358,6 +369,30 @@ class AdapterDriver:
         """
 
         return {"_parallel": list(results)}
+
+    @staticmethod
+    def _assistant_tool_call_payload(call: dict[str, Any]) -> dict[str, Any]:
+        """Re-serialise one tool call into the vendor-facing assistant shape.
+
+        The loop's normalised call carries ``name`` / ``arguments`` (a dict);
+        the vendor assistant message needs ``id`` + ``type: function`` +
+        ``function: {name, arguments: <json string>}``.  Arguments are
+        re-serialised (never the raw model string) so the shape is stable
+        regardless of how the vendor framed them.
+        """
+
+        import json as _json
+
+        return {
+            "id": call.get("id"),
+            "type": "function",
+            "function": {
+                "name": call.get("name"),
+                "arguments": _json.dumps(
+                    call.get("arguments", {}), ensure_ascii=False, default=str
+                ),
+            },
+        }
 
     def _map_tool_call(self, call: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
         """Validate and normalise a vendor tool call for the loop's gate.
@@ -493,6 +528,20 @@ class AdapterDriver:
                 results = last_tool_result["_parallel"]
             else:
                 results = [last_tool_result]
+            # Rebuild the assistant turn that issued these calls, immediately
+            # before their results: strict gateways require every tool message
+            # to answer an assistant message carrying the matching tool_calls.
+            if self._pending_assistant_tool_calls:
+                messages.append(
+                    ModelMessage(
+                        role="assistant",
+                        content="",
+                        name=json.dumps(
+                            {"tool_calls": self._pending_assistant_tool_calls},
+                            ensure_ascii=False,
+                        ),
+                    )
+                )
             for index, result in enumerate(results):
                 tool_use_id = (
                     self._pending_tool_call_ids[index]
@@ -512,6 +561,7 @@ class AdapterDriver:
                 )
             # Pending ids are consumed once the results are fed back.
             self._pending_tool_call_ids = []
+            self._pending_assistant_tool_calls = []
         # Surface the model-visible tool contracts (never the implementations).
         tools = tuple(
             context.get("visible_tools", ())

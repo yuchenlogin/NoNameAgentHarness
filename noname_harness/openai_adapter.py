@@ -165,8 +165,38 @@ class OpenAIAdapter:
                     )
                     parts.append({"type": "image_url", "image_url": {"url": source}})
             mapped = {"role": message.role, "content": parts}
-        if message.name is not None:
+        if message.role == "assistant" and message.name is not None:
+            # The driver threads the assistant turn's tool_calls through
+            # ``name`` as a JSON envelope (the vendor-neutral ModelMessage has
+            # no dedicated tool_calls field).  Strict gateways require the
+            # assistant message to carry them top-level so the following tool
+            # message answers a real call.  Malformed envelopes fall back to a
+            # plain name rather than corrupting the request.
+            try:
+                envelope = json.loads(message.name)
+            except (ValueError, TypeError):
+                envelope = None
+            if isinstance(envelope, dict) and "tool_calls" in envelope:
+                mapped["tool_calls"] = envelope["tool_calls"]
+                if not mapped.get("content"):
+                    # OpenAI frames a tool-calling assistant turn with null
+                    # content, not an empty string.
+                    mapped["content"] = None
+                return mapped
             mapped["name"] = message.name
+            return mapped
+        if message.name is not None:
+            if message.role == "tool":
+                # The driver threads the vendor tool-call id through
+                # ``ModelMessage.name``; the [OI] protocol requires it as a
+                # top-level ``tool_call_id`` on tool messages.  A bare ``name``
+                # is not a substitute: strict OpenAI-compatible gateways
+                # reject a tool message without tool_call_id (400), and a
+                # mis-labelled correlation is worse than none.  Anthropic maps
+                # the same field to its ``tool_use_id`` block key.
+                mapped["tool_call_id"] = message.name
+            else:
+                mapped["name"] = message.name
         return mapped
 
     def _build_body(self, request: ModelRequest) -> bytes:

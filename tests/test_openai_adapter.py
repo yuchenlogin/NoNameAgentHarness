@@ -298,3 +298,69 @@ def test_oversized_dict_arguments_rejected(monkeypatch):
     with pytest.raises(ModelAdapterError) as exc_info:
         adapter.complete(_req())
     assert "1MB" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Real-world vendor divergence: strict OpenAI-compatible gateways (verified
+# against a live NewAPI gateway, kimi-k3) reject a tool message that does not
+# answer an assistant message carrying matching tool_calls (400).  Replay
+# tests never caught this because the tolerant official API ignores the
+# missing pieces; the shapes below pin the strict-protocol framing.
+# ---------------------------------------------------------------------------
+
+def test_tool_message_maps_name_to_tool_call_id():
+    from noname_harness.adapters import ModelMessage, ModelRequest
+    adapter = OpenAIAdapter(transport=lambda *a, **k: {})
+    req = ModelRequest(messages=(
+        ModelMessage(role="user", content="x"),
+        ModelMessage(role="tool", content="result", name="call_1"),
+    ))
+    body = json.loads(adapter._build_body(req))
+    tool_msg = body["messages"][1]
+    assert tool_msg["tool_call_id"] == "call_1"
+    # A tool message must not carry a bare `name` -- it is not a substitute.
+    assert "name" not in tool_msg
+
+
+def test_assistant_tool_calls_envelope_maps_top_level():
+    """The driver threads tool_calls through ModelMessage.name as JSON; the
+    adapter must lift them to the top-level tool_calls the protocol requires."""
+    import json as _json
+    from noname_harness.adapters import ModelMessage, ModelRequest
+    adapter = OpenAIAdapter(transport=lambda *a, **k: {})
+    calls = [{"id": "call_1", "type": "function",
+              "function": {"name": "read_file", "arguments": "{\"path\":\"h.txt\"}"}}]
+    req = ModelRequest(messages=(
+        ModelMessage(role="user", content="x"),
+        ModelMessage(role="assistant", content="", name=_json.dumps({"tool_calls": calls})),
+        ModelMessage(role="tool", content="内容", name="call_1"),
+    ))
+    body = json.loads(adapter._build_body(req))
+    asst = body["messages"][1]
+    assert asst["tool_calls"] == calls
+    # A tool-calling assistant turn frames content as null, not "".
+    assert asst["content"] is None
+    assert "name" not in asst
+    # ... and the answering tool message still correlates by tool_call_id.
+    assert body["messages"][2]["tool_call_id"] == "call_1"
+
+
+def test_full_tool_loop_history_is_strict_protocol_valid():
+    """End-to-end shape: [user, assistant(tool_calls), tool(tool_call_id)] --
+    every tool message answers a real assistant call."""
+    import json as _json
+    from noname_harness.adapters import ModelMessage, ModelRequest
+    adapter = OpenAIAdapter(transport=lambda *a, **k: {})
+    calls = [{"id": "call_9", "type": "function",
+              "function": {"name": "write_file", "arguments": "{}"}}]
+    req = ModelRequest(messages=(
+        ModelMessage(role="system", content="sys"),
+        ModelMessage(role="user", content="brief"),
+        ModelMessage(role="assistant", content="", name=_json.dumps({"tool_calls": calls})),
+        ModelMessage(role="tool", content="ok", name="call_9"),
+    ))
+    body = json.loads(adapter._build_body(req))
+    roles = [m["role"] for m in body["messages"]]
+    assert roles == ["system", "user", "assistant", "tool"]
+    assert body["messages"][2]["tool_calls"][0]["id"] == "call_9"
+    assert body["messages"][3]["tool_call_id"] == "call_9"
