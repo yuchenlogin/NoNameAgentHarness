@@ -1,6 +1,6 @@
 # NoName Agent Harness · 交付说明
 
-> 2026-10-08 · schema v7 · 628 测试全绿 · 无外部依赖（Python 标准库 + SQLite）
+> 2026-10-08 · schema v8 · 654 测试全绿 · 无外部依赖（Python 标准库 + SQLite）
 
 这份文档对照 vision 的原始预期，逐项核验 NoName 当前状态的证据。它不是营销材料，而是一份可审计的自证：每一条"已落地"都附对应的模块与测试，每一条"未做"都诚实标注。
 
@@ -10,7 +10,7 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 
 ## 验证方式（怎么证明没有 bug）
 
-- **628 个自动化测试全绿**（`pytest -q`），覆盖每个模块的 happy path 与失败路径。
+- **654 个自动化测试全绿**（`pytest -q`），覆盖每个模块的 happy path 与失败路径。
 - **二十八轮对抗性审查 + 两轮系统性暴力测试**：每个安全关键层（审批门、沙箱、凭证安全、投影、抽取、检索、图像、账本）都经过独立 reviewer 用可执行探针攻击，发现的每个 high/medium 漏洞都已修复并配回归测试。沙箱与 OpenAI 适配器各经历两轮 REJECT 级专攻后才通过。
 - **一次系统性交付审计**：vision 原则、runtime-arch 稳定接口、文档一致性三路并行核对，发现的偏差已全部修复。
 - **系统级综合验证**：10+ 项核心能力在一个真实工作流中协同验证（见文末）。
@@ -89,12 +89,12 @@ NoName Agent Harness 是一个把「上下文」当作资产的 agent harness：
 
 ```bash
 python3 -m noname_harness init --db .noname/harness.db --root . --name "我的项目"
-pytest -q   # 628 passed
+pytest -q   # 654 passed
 ```
 
 ## 演进
 
-33 个版本（0.3.0 → 0.33.0），每个版本的 Features / Design Rationale / Notes & Caveats 见 [CHANGELOG.md](CHANGELOG.md)。设计文档见 [docs/](docs/)（vision、architecture、memory-model、runtime-architecture、ledger、taste-cards、prototype）。
+34 个版本（0.3.0 → 0.34.0），每个版本的 Features / Design Rationale / Notes & Caveats 见 [CHANGELOG.md](CHANGELOG.md)。设计文档见 [docs/](docs/)（vision、architecture、memory-model、runtime-architecture、ledger、taste-cards、prototype）。
 
 ---
 
