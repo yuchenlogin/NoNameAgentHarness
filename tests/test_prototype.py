@@ -9,6 +9,7 @@ from noname_harness.context import render_markdown
 from noname_harness.curator import CuratorService
 from noname_harness.handoff import infer_next_steps
 from noname_harness.models import EvidenceInput
+from noname_harness.store import SCHEMA_VERSION
 from noname_harness.store import HarnessStore, WorkspaceBoundaryError
 
 
@@ -55,10 +56,23 @@ def test_events_and_evidence_are_append_only(tmp_path):
             )
         with pytest.raises(sqlite3.IntegrityError):
             store._connection.execute("UPDATE project SET name = 'tampered' WHERE id = 1")
-        assert store.verify_integrity() == {
-            "ok": True,
-            "bad_event_ids": [],
-            "bad_evidence_ids": [],
+        report = store.verify_integrity()
+        assert report["ok"] is True
+        assert report["bad_event_ids"] == []
+        assert report["bad_evidence_ids"] == []
+        assert report["unverified_event_ids"] == []
+        assert report["unverified_evidence_ids"] == []
+        # Rows written by this build are signed over their full provenance, not
+        # just the payload (v8 closed exactly that hole).
+        assert report["hash_coverage"]["events"] == {
+            "v1_payload_only": 0,
+            "v2_full_provenance": 1,
+            "unknown_versions": [],
+        }
+        assert report["hash_coverage"]["evidence"] == {
+            "v1_content_only": 0,
+            "v2_full_provenance": 1,
+            "unknown_versions": [],
         }
         assert store.search_events("expected 3")[0].id == event.id
         assert store.search_events("assert result")[0].id == event.id
@@ -379,7 +393,7 @@ def test_schema_v1_is_migrated_through_the_chain_to_latest(tmp_path):
         ).fetchone()["value"]
         assert "proposal_reason" in columns
         # A v1 database is upgraded step by step to the current version.
-        assert version == "7"
+        assert version == str(SCHEMA_VERSION)
         # The taste layer introduced by v3 exists after the migration.
         taste_tables = {
             row["name"]

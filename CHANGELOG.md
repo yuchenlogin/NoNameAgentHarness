@@ -2,6 +2,29 @@
 
 > 只记录版本级变化：新功能、重大重构、架构调整、破坏性变更。不是每个 commit 都有条目。
 
+## [0.34.0] - 2026-10-08
+
+### Features
+
+- DSH 插件（noname-dsh-plugin 0.3.0）真机验收暴露的三项内核缺陷修复，schema v7 → v8：
+  - **[高] 完整性哈希不覆盖溯源字段**：`verify_integrity` 的 content_hash 只签 `{event_type, payload}`——丢掉 append-only 触发器后改写 `session_id`/`seq`/`occurred_at`/`id` 仍报 `ok: true`。账本卖的就是可溯源，却恰好没签溯源。新增 `hash_version` 列与版本化哈希（v2 覆盖整行）；v1 行按 v1 公式继续可验（append-only 不允许重写历史行），未知版本一律记入 `unverified_*_ids` 而非 `ok`。evidence_spans 同步加固（`artifact_uri`/offset 原本也在哈希之外）。
+  - **[中] 中文检索静默返回空**：FTS5 unicode61 把无空格的中文整段索引为单个 token，`"账本"` 这样的短语查询匹配不到 `项目账本`——用户搜自己刚写下的词得到 `[]`，把「查不到」读成「没有记忆」。含 CJK 的查询改走子串匹配（多词 AND），读取与 FTS 完全相同的列；子串结果是短语结果的超集，故不丢命中。
+  - **[低] 空事件被静默接受**：`{}`（CLI 省略 `--payload`）与 `{"text": ""}`（DSH 桥接空结果）都会写入一行永远无法被召回的证据——`append_event` 现在要求 payload 携带至少一个非空标量，或附带 evidence。
+- 同类问题顺带收口：LIKE 通配符未转义，查询 `100%` 会命中全库——`_like_needle` 统一 ESCAPE，两条搜索路径共用。
+- `verify` 返回值新增 `unverified_*_ids` 与 `hash_coverage`：明确报出「多少行只有 payload 级签名（v1 遗留）」，不让一个覆盖率低于读者假设的绿勾混过去。
+
+### Design Rationale
+
+- **为什么用版本化哈希而不是重算历史**：重算意味着 UPDATE append-only 表——账本自己禁止的动作。让 v1 行按 v1 校验、并如实标为 legacy coverage，是唯一不自相矛盾的方案；而「未知版本 = unverified，不是 ok」保证未来版本的库在旧二进制上不会静默降级成「校验通过」。
+- **为什么 CJK 走子串而拉丁仍走 FTS**：把全部查询降级为 LIKE 会同时丢掉分词语义与索引加速。只让 CJK 改道，是因为这类文字没有词间空格，短语语义在那里本就不成立；两条路径读同一组列，该不变式由测试锁定。
+- **为什么空事件必须在 store 层拒绝，而不只在 CLI 与插件层**：与 0.33.0 的 bytes session_id 同类——上层校验只保护走那条路的调用者，store 才是所有写入都经过的接缝。
+
+### Notes & Caveats
+
+- 6 处既有测试断言随契约更新：3 处硬编码 `"7"` 改为 `str(SCHEMA_VERSION)`（意图不变且不再随版本腐化）、1 处 verify 返回值的整字典相等改为逐字段断言并追加 coverage 断言、2 处空 payload fixture 补上内容（其原用途只是取一个事件 id）。
+- 新增 tests/test_integrity_and_search_fixes.py（23 项）：其中 19 项在修复前失败，4 项为反向对照（非 CJK 语义不变、空 payload 带 evidence 仍合法、0/False 算内容、未知哈希版本不误判为坏）。
+- 654 passed, 0 failed。
+
 ## [0.33.0] - 2026-10-08
 
 ### Features

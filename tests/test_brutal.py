@@ -150,7 +150,7 @@ def test_fts_special_characters_do_not_crash_search(tmp_path):
 def test_proposal_requires_nonempty_key_and_valid_confidence(tmp_path):
     store, _ = make_store(tmp_path)
     try:
-        event = store.append_event("s", "note", {})
+        event = store.append_event("s", "note", {"text": "fixture event"})
         with pytest.raises(ValueError):
             store.create_proposal("high", "  ", {"text": "x"}, [event.id])
         for bad_conf in (-0.1, 1.1, float("nan"), float("inf"), float("-inf"), True, "0.5"):
@@ -174,7 +174,7 @@ def test_review_unknown_proposal_and_invalid_action(tmp_path):
     try:
         with pytest.raises(KeyError):
             store.review_proposal("prp_ghost", "accept", "user")
-        event = store.append_event("s", "note", {})
+        event = store.append_event("s", "note", {"text": "fixture event"})
         proposal = store.create_proposal("high", "k", {"text": "x"}, [event.id])
         with pytest.raises(ValueError):
             store.review_proposal(proposal["id"], "explode", "user")

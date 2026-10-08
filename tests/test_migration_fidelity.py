@@ -12,7 +12,7 @@ import sqlite3
 
 import pytest
 
-from noname_harness.store import HarnessStore
+from noname_harness.store import SCHEMA_VERSION, HarnessStore
 from noname_harness.taste import TasteService
 
 
@@ -93,7 +93,7 @@ def test_real_v3_database_migrates_without_losing_data(tmp_path):
         version = store.query_one(
             "SELECT value FROM harness_meta WHERE key = 'schema_version'"
         )["value"]
-        assert version == "7"
+        assert version == str(SCHEMA_VERSION)
 
         # Bitemporal columns were added to existing rows (NULL bounds).
         columns = {row["name"] for row in store.query("PRAGMA table_info(state_revisions)")}

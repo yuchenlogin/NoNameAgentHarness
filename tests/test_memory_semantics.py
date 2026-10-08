@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 
-from noname_harness.store import HarnessStore
+from noname_harness.store import SCHEMA_VERSION, HarnessStore
 from noname_harness.taste import TasteService
 
 
@@ -165,6 +165,6 @@ def test_schema_v3_to_v4_adds_bitemporal_columns(tmp_path):
         version = store._connection.execute(
             "SELECT value FROM harness_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
-        assert version == "7"
+        assert version == str(SCHEMA_VERSION)
     finally:
         store.close()
