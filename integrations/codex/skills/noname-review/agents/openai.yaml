@@ -1,0 +1,4 @@
+interface:
+  display_name: "NoName · 审核记忆候选"
+  short_description: "按你的明确决定批准、拒绝或暂缓指定候选，并返回审核回执。"
+  default_prompt: "使用 $noname-review 展示待审候选，供我决定是否批准。"

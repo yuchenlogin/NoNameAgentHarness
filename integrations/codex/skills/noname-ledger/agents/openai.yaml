@@ -1,0 +1,4 @@
+interface:
+  display_name: "NoName · 打开交互式账本"
+  short_description: "打开离线交互账本，查看时间线、状态演进与记忆审核来源。"
+  default_prompt: "使用 $noname-ledger 打开当前项目的交互式账本。"

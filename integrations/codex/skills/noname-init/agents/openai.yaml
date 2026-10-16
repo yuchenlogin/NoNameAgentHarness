@@ -1,0 +1,4 @@
+interface:
+  display_name: "NoName · 启用项目记忆"
+  short_description: "为当前项目初始化独立账本，并检查记忆记录的接入状态。"
+  default_prompt: "使用 $noname-init 在当前项目启用 NoName 记忆账本。"

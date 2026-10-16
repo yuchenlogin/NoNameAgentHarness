@@ -1,0 +1,4 @@
+interface:
+  display_name: "NoName · 搜索账本证据"
+  short_description: "按关键词搜索项目已记录对话与工作笔记，显示可追溯证据。"
+  default_prompt: "使用 $noname-search 搜索当前项目账本中的相关记录。"

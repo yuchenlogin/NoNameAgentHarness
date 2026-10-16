@@ -1,0 +1,4 @@
+interface:
+  display_name: "NoName · 检查运行状态"
+  short_description: "检查当前项目是否启用记忆，并核实聊天捕获回执和账本完整性。"
+  default_prompt: "使用 $noname-status 检查当前聊天是否实际使用了 NoName。"

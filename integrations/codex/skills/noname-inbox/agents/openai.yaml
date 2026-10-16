@@ -1,0 +1,4 @@
+interface:
+  display_name: "NoName · 查看待审记忆"
+  short_description: "查看待审核记忆、任务与偏好，核对每条候选的内容和来源。"
+  default_prompt: "使用 $noname-inbox 列出当前项目等待我审核的记忆。"

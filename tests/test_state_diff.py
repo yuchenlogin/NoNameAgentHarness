@@ -145,7 +145,9 @@ def test_ledger_html_includes_state_diff_section(tmp_path):
         proposal = _canon(store, "rule", "x")
         store.review_proposal(proposal["id"], "accept", "user")
         page = render_ledger_html(build_ledger_model(store))
-        assert "版本演进 · 现在为何如此" in page
+        assert "来路与变化" in page and "决定如何演进" in page
+        assert 'class="diff-group"' in page
+        assert "第 1 版" in page and "user 确认" in page
     finally:
         store.close()
 
