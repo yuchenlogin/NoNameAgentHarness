@@ -14,7 +14,7 @@
 
 | 验证 | 结果 |
 |---|---|
-| 主仓 Python 全量回归 | 782 passed |
+| 主仓 Python 全量回归 | 783 passed |
 | DSH TypeScript 构建与插件回归 | 构建通过；66 passed |
 | 真正的 npm 分发边界 | npm pack → 全新 consumer 安装 → 从安装包导入，实际 Python/SQLite/HTTP 验证通过 |
 | 共享展示与服务 | 5 个文件在主仓、vendor、全新安装包中 SHA 一致 |
@@ -39,8 +39,11 @@
 | `autoIngest=false` 时描述仍称自动捕获 | 工具描述随配置变化，两种配置均有回归 |
 | QA 修改造成 DSH 临时展示漂移 | 最终重新同步，源/vendor/打包安装版比对 SHA |
 | 时间跨过有效期而没有数据库写入 | 指纹加入已跨过的生效/失效边界；用冻结时间与真实 HTTP 验证激活、包含结束瞬间、到期后失效 |
+| GitHub macOS 上服务在监听前启动超时 | 数值 loopback 绑定跳过标准 HTTPServer 的反向 DNS 查询；真实服务在 DNS 不可用时仍可启动并响应健康检查 |
 
 所有已确认问题均已修复，无未解决的高、中严重度发现。安装的 skill 缺少 `brain/principles.md` 及其关联原则文件；审查使用实际存在的 lens 定义与明确原则名，不声称已读取缺失文件。
+
+GitHub 提交后的 macOS 启动问题另经 Skeptic CLI 复查，结论为 PASS、无可操作发现。数值 loopback 的反向 DNS 阻塞也与 [GitHub runner-images #14409](https://github.com/actions/runner-images/issues/14409) 的维护者诊断一致；本项目保留原启动期限，修复无关的网络依赖。
 
 ## 重现
 

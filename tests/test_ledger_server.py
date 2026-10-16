@@ -773,3 +773,18 @@ def test_updates_detect_activation_and_expiry_without_writes(ledger, monkeypatch
     with HarnessStore(db_path) as store:
         assert not store.active_state(as_of=clock[0])
     assert durable_counts(db_path) == before
+
+
+def test_numeric_loopback_startup_never_requires_reverse_dns(tmp_path, monkeypatch):
+    db_path = tmp_path / "harness.db"
+    with HarnessStore(db_path) as store:
+        store.initialize_project(tmp_path, "numeric-loopback")
+
+    def unavailable_dns(*args, **kwargs):
+        raise AssertionError("loopback service must not depend on reverse DNS")
+
+    monkeypatch.setattr("socket.getfqdn", unavailable_dns)
+    with running_server(db_path) as server:
+        assert server.server_name == "127.0.0.1"
+        assert server.server_port == server.server_address[1]
+        assert request(server, path="api/health")[0] == 200
